@@ -1,4 +1,4 @@
 numpyro
-jax
+jax==0.4.26
 pandas
 numpyro
