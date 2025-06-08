@@ -6,7 +6,7 @@ import jax
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
-
+import xarray as xr
 from typing import Optional
 
 from ..utils import generate_seed
@@ -85,7 +85,15 @@ def dlt_model(lev_sm, slp_sm, theta, x_seas, x_glb_trend, y):
     numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y)
 
 
-def run_dlt_model(lev_sm, slp_sm, theta, x_seas, x_glb_trend, y, seed: Optional[int] = None):
+def run_dlt_model(
+    lev_sm, 
+    slp_sm, 
+    theta, 
+    x_seas, 
+    x_glb_trend, 
+    y, 
+    seed: Optional[int] = None
+):
     """Run the DLT model with the provided parameters and data.
 
     Args
@@ -121,7 +129,31 @@ def run_dlt_model(lev_sm, slp_sm, theta, x_seas, x_glb_trend, y, seed: Optional[
     )
     
     posteriors_dict = mcmc.get_samples()
-    return posteriors_dict
+
+    # transform them into xr.Dataset
+    n_samples = posteriors_dict['alpha_glb_trend'].shape[0]
+    n_steps = posteriors_dict['dlt_comp'].shape[1]
+    n_seas = posteriors_dict['beta_seas'].shape[1]
+
+    # Build Dataset
+    posteriors = xr.Dataset(
+        {
+            'alpha_glb_trend': (['sample'], posteriors_dict['alpha_glb_trend']),
+            'beta_glb_trend': (['sample'], posteriors_dict['beta_glb_trend']),
+            'beta_seas': (['sample', 'season'], posteriors_dict['beta_seas']),
+            'dlt_comp': (['sample', 'time'], posteriors_dict['dlt_comp']),
+            'mu': (['sample', 'time'], posteriors_dict['mu']),
+            'reg_comp': (['sample', 'time'], posteriors_dict['reg_comp']),
+            'sigma': (['sample'], posteriors_dict['sigma']),
+        },
+        coords={
+            'sample': np.arange(n_samples),
+            'time': np.arange(n_steps),
+            'season': np.arange(n_seas),
+        }
+    )
+
+    return posteriors
 
 def generate_in_sample_forecast(posteriors_dict, transform_callback=np.exp, q=0.05):
     mu_samples = np.array(posteriors_dict["mu"])

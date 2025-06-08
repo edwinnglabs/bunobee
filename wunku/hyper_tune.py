@@ -1,11 +1,12 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import vmap
 import logging
 
-from typing import Dict
+from typing import Dict, Tuple
 
-from models.dlt import run_dlt_model
+from .models.dlt import run_dlt_model
 
 logger = logging.getLogger("wunku")
 
@@ -94,7 +95,7 @@ def compute_log_likelihood(yhat_span, sigma, y):
 
     return log_prob
 
-def compute_wbic(loglk):
+def compute_wbic(loglk: jnp.ndarray) -> float:
     """Compute Weighted Bayesian Information Criterion (WBIC) from log likelihood.
     Args
     ----
@@ -107,37 +108,71 @@ def compute_wbic(loglk):
     nobs = loglk.shape[-1] * loglk.shape[-2] 
     beta = 1.0 / jnp.log(nobs)  
     wbic = - (1.0 / beta) * jnp.nanmean(loglk_per_sample)
+    wbic = float(wbic)
     return wbic
 
 
-def run_dlt_model_and_compute_wbic(params):
+def run_dlt_model_and_compute_wbic(
+    params: Tuple, 
+    data: Dict[str, np.ndarray],
+    h: int = 12
+) -> float:
     lev_sm, slp_sm, theta = params
-    print(f"Trying lev_sm={lev_sm:.4f}, slp_sm={slp_sm:.4f}, theta={theta:.4f}")
+    y = data["y"]
+    x_seas = data["x_seas"]
+    x_glb_trend = data["x_glb_trend"]
+    logger.info(f"Trying lev_sm={lev_sm:.4f}, slp_sm={slp_sm:.4f}, theta={theta:.4f}")
 
     posteriors_dict = run_dlt_model(
         lev_sm=lev_sm,
         slp_sm=slp_sm,
         theta=theta,
-        x_seas=params["x_seas"],
-        x_glb_trend=params["x_glb_trend"],
-        y=params["y"],
+        x_seas=x_seas,
+        x_glb_trend=x_glb_trend,
+        y=y,
     )
     
-    dlt_comp = posteriors_dict["dlt_comp"]
-    beta_glb_trend = posteriors_dict["beta_glb_trend"]
-    beta_seas = posteriors_dict["beta_seas"]
-    sigma = posteriors_dict["sigma"]
-
-    reg_comp = np.sum(x_seas * jnp.expand_dims(beta_seas, -2), axis=-1) + x_glb_trend * jnp.expand_dims(beta_glb_trend, -1)
-
-    dlt_comp_slice = dlt_comp[:, :-(h-1), None]
-    reg_comp_slice = slice_trend(reg_comp, h=h)
-    yhat_span = dlt_comp_slice + reg_comp_slice
-    y_slice = slice_trend_single(y, h=h)
-
-    loglk = compute_log_likelihood(yhat_span, sigma, y_slice)
+    yhat_span = generate_forecast_span_samples(posteriors_dict=posteriors_dict, h=h)
+    loglk = compute_log_likelihood(
+        yhat_span=yhat_span,
+        sigma=posteriors_dict["sigma"],
+        y=y,
+    )
     wbic = compute_wbic(loglk)
-    wbic = float(wbic)
 
-    print("WBIC:", wbic)
+    print(f"WBIC: {wbic:.4f}")
     return wbic
+
+def hyper_tuning_dlt_with_wbic(
+    data: Dict[str, np.ndarray],
+    # forecast horizon
+    h: int = 12,  
+    n_calls: int = 15,                   
+    random_state: int = 42,
+):
+    print("Starting hyperparameter tuning for DLT model using WBIC...")
+    # print args
+    print(f"h: {h}, n_calls: {n_calls}, random_state: {random_state}")
+    # try import skopt
+    try:
+        from skopt import gp_minimize
+        from skopt.space import Real
+    except ImportError:
+        raise ImportError("Please install scikit-optimize to run hyperparameter tuning.")
+
+    # Define the hyperparam space
+    search_space = [
+        Real(0.0001, 0.1, prior='log-uniform', name='lev_sm'),
+        Real(0.001, 0.1, prior='log-uniform', name='slp_sm'),
+        Real(0.8, 1., prior='uniform', name='theta'),
+    ]
+
+    # Run Bayesian Optimization
+    result = gp_minimize(
+        func=lambda params: run_dlt_model_and_compute_wbic(params=params, data=data, h=h),  
+        dimensions=search_space,
+        n_calls=n_calls,                   
+        random_state=random_state
+    )
+
+    return result
