@@ -128,28 +128,28 @@ def run_dlt_model(
         y=y
     )
     
-    posteriors_dict = mcmc.get_samples()
+    posteriors_dict = mcmc.get_samples(group_by_chain=True)
 
     # transform them into xr.Dataset
-    n_samples = posteriors_dict['alpha_glb_trend'].shape[0]
-    n_steps = posteriors_dict['dlt_comp'].shape[1]
-    n_seas = posteriors_dict['beta_seas'].shape[1]
+    n_chains, n_draws = posteriors_dict['alpha_glb_trend'].shape
+    n_steps = posteriors_dict['dlt_comp'].shape[-1]
+    n_seas = posteriors_dict['beta_seas'].shape[-1]
 
-    # Build Dataset
     posteriors = xr.Dataset(
         {
-            'alpha_glb_trend': (['sample'], posteriors_dict['alpha_glb_trend']),
-            'beta_glb_trend': (['sample'], posteriors_dict['beta_glb_trend']),
-            'beta_seas': (['sample', 'season'], posteriors_dict['beta_seas']),
-            'dlt_comp': (['sample', 'time'], posteriors_dict['dlt_comp']),
-            'mu': (['sample', 'time'], posteriors_dict['mu']),
-            'reg_comp': (['sample', 'time'], posteriors_dict['reg_comp']),
-            'sigma': (['sample'], posteriors_dict['sigma']),
+            'alpha_glb_trend': (['chain', 'draw'], posteriors_dict['alpha_glb_trend']),
+            'beta_glb_trend': (['chain', 'draw'], posteriors_dict['beta_glb_trend']),
+            'beta_seas': (['chain', 'draw', 'sea_regressor'], posteriors_dict['beta_seas']),
+            'dlt_comp': (['chain', 'draw', 'time'], posteriors_dict['dlt_comp']),
+            'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
+            'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
+            'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
         },
         coords={
-            'sample': np.arange(n_samples),
+            'draw': np.arange(n_draws),
+            'chain': np.arange(n_chains),
             'time': np.arange(n_steps),
-            'season': np.arange(n_seas),
+            'sea_regressor': np.arange(n_seas),
         }
     )
 
