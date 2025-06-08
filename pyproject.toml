@@ -10,6 +10,8 @@ dependencies = [
     "numpyro",
     "jax",
     "pandas",
+    "arviz",
+    "xarray",
 ]
 
 [build-system]
