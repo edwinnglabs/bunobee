@@ -1,4 +1,0 @@
-numpyro
-jax==0.4.26
-pandas
-numpyro
