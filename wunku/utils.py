@@ -9,6 +9,6 @@ def generate_seed():
 def summarize_posteriors(posteriors: xr.Dataset) -> pd.DataFrame:
     """
     """
-    idata = az.from_dict(posterior=posteriors)
-    summary_df = az.summary(idata)
+    # idata = az.from_xarray(posterior=posteriors)
+    summary_df = az.summary(posteriors)
     return summary_df
