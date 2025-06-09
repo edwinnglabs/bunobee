@@ -9,7 +9,7 @@ from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
 from typing import Optional
 
-from ..utils import generate_seed
+from ..utils import generate_seed, flatten_front_dim
 
 def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     """Damped Local Trend (DLT) transition function
@@ -155,9 +155,9 @@ def run_dlt_model(
 
     return posteriors
 
-def generate_in_sample_forecast(posteriors_dict, transform_callback=np.exp, q=0.05):
-    mu_samples = np.array(posteriors_dict["mu"])
-    sigma_samples = np.array(posteriors_dict["sigma"])
+def generate_in_sample_forecast(posteriors: xr.Dataset, transform_callback=np.exp, q=0.05):
+    mu_samples = flatten_front_dim(posteriors["mu"].to_numpy(), n=2)
+    sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
     eps_samples = np.transpose(
         np.random.normal(loc=0.0, scale=sigma_samples, size=(mu_samples.shape[-1], sigma_samples.shape[0])),
         axes=(1, 0)

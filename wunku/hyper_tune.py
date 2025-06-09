@@ -3,10 +3,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax import vmap
 import logging
+import xarray as xr
 
 from typing import Dict, Tuple
 
+from .utils import flatten_front_dim
 from .models.dlt import run_dlt_model
+
 
 logger = logging.getLogger("wunku")
 
@@ -48,10 +51,10 @@ def slice_trend(trend_comp, h):
     # trends: shape (N_samples, T)
     return vmap(lambda trend_comp: slice_trend_single(trend_comp, h))(trend_comp)
 
-def generate_forecast_span_samples(posteriors_dict: Dict[str, jnp.ndarray], h) -> jnp.ndarray:
+def generate_forecast_span_samples(posteriors: xr.Dataset, h: int) -> jnp.ndarray:
     # how to do a sliding window prediction?
-    dlt_comp = posteriors_dict["dlt_comp"]
-    reg_comp = posteriors_dict["reg_comp"]
+    dlt_comp = flatten_front_dim(posteriors["dlt_comp"].to_numpy(), n=2)
+    reg_comp = flatten_front_dim(posteriors["reg_comp"].to_numpy(), n=2)
 
     logger.debug("dlt_comp shape:", dlt_comp.shape)
     logger.debug("reg_comp shape:", reg_comp.shape)
@@ -123,7 +126,7 @@ def run_dlt_model_and_compute_wbic(
     x_glb_trend = data["x_glb_trend"]
     logger.info(f"Trying lev_sm={lev_sm:.4f}, slp_sm={slp_sm:.4f}, theta={theta:.4f}")
 
-    posteriors_dict = run_dlt_model(
+    posteriors = run_dlt_model(
         lev_sm=lev_sm,
         slp_sm=slp_sm,
         theta=theta,
@@ -132,10 +135,10 @@ def run_dlt_model_and_compute_wbic(
         y=y,
     )
     
-    yhat_span = generate_forecast_span_samples(posteriors_dict=posteriors_dict, h=h)
+    yhat_span = generate_forecast_span_samples(posteriors=posteriors, h=h)
     loglk = compute_log_likelihood(
         yhat_span=yhat_span,
-        sigma=posteriors_dict["sigma"],
+        sigma=flatten_front_dim(posteriors["sigma"].to_numpy(), n=2),
         y=y,
     )
     wbic = compute_wbic(loglk)
@@ -164,7 +167,7 @@ def hyper_tuning_dlt_with_wbic(
     search_space = [
         Real(0.0001, 0.1, prior='log-uniform', name='lev_sm'),
         Real(0.001, 0.1, prior='log-uniform', name='slp_sm'),
-        Real(0.8, 1., prior='uniform', name='theta'),
+        Real(0, 1., prior='uniform', name='theta'),
     ]
 
     # Run Bayesian Optimization
