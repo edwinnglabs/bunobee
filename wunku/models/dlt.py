@@ -47,31 +47,23 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
 
 
 
-def dlt_model(lev_sm, slp_sm, theta, x_glb_trend, y, x_ext=None):
+def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
     """Damped Local Trend (DLT) model for time series forecasting.
     Args
     ----
     lev_sm: Level smoothing factor (scalar).
     slp_sm: Slope smoothing factor (scalar).
     theta: Damping factor (scalar).
-    x_seas: Seasonal features (2D array with shape (n_steps, n_seasons))
-    x_glb_trend: Global trend feature (1D array with shape (n_steps,)).
     y: Observations (1D array with shape (n_steps,))
     """
 
     sigma = numpyro.sample("sigma", dist.HalfNormal(0.5))
-    alpha_glb_trend = numpyro.sample("alpha_glb_trend", dist.Normal(0, 1.0))
-    beta_glb_trend = numpyro.sample("beta_glb_trend", dist.Normal(0, 1.0))
-    if x_ext is not None:
-        beta_ext = numpyro.sample("beta_ext", dist.Normal(0, 0.3).expand([x_ext.shape[1]]))
+    if covariates is not None:
+        coef = numpyro.sample("coef", dist.Normal(0, 0.3).expand([covariates.shape[1]]))
         # (n_steps, )
-        reg_ext_comp = jnp.sum(x_ext * beta_ext, axis=-1)
+        reg_comp = jnp.sum(covariates * coef, axis=-1)
     else:
-        reg_ext_comp = 0
-
-    # (n_steps, )
-    glb_trend = alpha_glb_trend + x_glb_trend * beta_glb_trend
-    reg_comp = reg_ext_comp + glb_trend
+        reg_comp = 0
 
     # scan with the partial function
     _, res = lax.scan(
@@ -94,10 +86,10 @@ def run_dlt_model(
     lev_sm, 
     slp_sm, 
     theta, 
-    x_glb_trend, 
     y, 
+    mcmc_run_args: Dict[str, any],
     regression_scheme: xr.Dataset,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
 ):
     """Run the DLT model with the provided parameters and data.
 
@@ -120,39 +112,35 @@ def run_dlt_model(
         seed = generate_seed()
 
     # extract regressors matrix, coef loc and scale
-    regressor_name = regression_scheme['regressor'].to_numpy()
-    x_ext = regression_scheme['covariates'].transpose("time", "regressor").to_numpy()
+    var_name = regression_scheme['var_name'].to_numpy()
+    covariates = regression_scheme['covariates'].transpose("time", "var_name").to_numpy()
     coef_loc = regression_scheme['coef_loc'].to_numpy()
     coef_scale = regression_scheme['coef_scale'].to_numpy()
 
-    logger.info(f"regressor_name: {regressor_name}")
-    logger.info(f"x_reg shape: {x_ext.shape}")
+    logger.info(f"var_name: {var_name}")
+    logger.info(f"covariates shape: {covariates.shape}")
     logger.debug(f"coef_loc: {coef_loc}")
     logger.debug(f"coef_scale: {coef_scale}")
 
     init_strategy = init_to_median(num_samples=10)
     kernel = NUTS(dlt_model, init_strategy=init_strategy)
-    mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000, num_chains=4)
+    mcmc = MCMC(kernel, **mcmc_run_args)
     rng_key = jax.random.PRNGKey(seed)
     mcmc.run(
         rng_key, 
         lev_sm=lev_sm, 
         slp_sm=slp_sm, 
         theta=theta,
-        x_ext=x_ext,
-        x_glb_trend=x_glb_trend,
-        y=y
+        y=y,
+        covariates=covariates
     )
     
     posteriors_dict = mcmc.get_samples(group_by_chain=True)
 
     # transform them into xr.Dataset
-    n_chains, n_draws = posteriors_dict['alpha_glb_trend'].shape
-    n_steps = posteriors_dict['dlt_comp'].shape[-1]
+    n_chains, n_draws, n_steps = posteriors_dict['dlt_comp'].shape
 
     data_vars = {
-        'alpha_glb_trend': (['chain', 'draw'], posteriors_dict['alpha_glb_trend']),
-        'beta_glb_trend': (['chain', 'draw'], posteriors_dict['beta_glb_trend']),
         'dlt_comp': (['chain', 'draw', 'time'], posteriors_dict['dlt_comp']),
         'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
         'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
@@ -167,10 +155,10 @@ def run_dlt_model(
     if regression_scheme is not None:
         # add seasonal regressors posteriors
         data_vars.update({
-            'beta_ext': (['chain', 'draw', 'regressor'], posteriors_dict['beta_ext']),
+            'coef': (['chain', 'draw', 'var_name'], posteriors_dict['coef']),
         })
         coords.update({
-            'regressor': regressor_name,
+            'var_name': var_name,
         })
         
     posteriors = xr.Dataset(data_vars=data_vars, coords=coords)
