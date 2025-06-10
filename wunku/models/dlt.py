@@ -39,12 +39,23 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     # forecast
     dlt_comp_t = lev_prev + theta * slp_prev
 
+    def update_state(_):
+        new_lev = lev_sm * y_t + (1 - lev_sm) * (lev_prev + theta * slp_prev)
+        new_slp = slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev
+        return new_lev, new_slp
+
+    def keep_state(_):
+        return lev_prev, slp_prev
+
     # update
-    new_lev = lev_sm * y_t + (1 - lev_sm) * (lev_prev + theta * slp_prev)
-    new_slp = slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev
+    new_lev, new_slp = lax.cond(
+        jnp.isfinite(y_t),
+        update_state,
+        keep_state,
+        operand=None
+    )
 
     return (new_lev, new_slp), (new_lev, new_slp, dlt_comp_t)
-
 
 
 def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
@@ -68,7 +79,7 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
     # scan with the partial function
     _, res = lax.scan(
         lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta), 
-        (y[0] - reg_comp[0], 0), y - reg_comp
+        (y[0] - reg_comp[0], 0.), y - reg_comp
     )
     _, _, dlt_comp = res
     # mid point estimation
@@ -79,7 +90,7 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
     numpyro.deterministic("reg_comp", reg_comp)
 
     # likelihood
-    numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y)
+    numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
 
 
 def run_dlt_model(
