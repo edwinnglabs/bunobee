@@ -1,4 +1,4 @@
-
+import logging
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
@@ -7,9 +7,11 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
-from typing import Optional
+from typing import Optional, Dict
 
 from ..utils import generate_seed, flatten_front_dim
+
+logger = logging.getLogger("wunku")
 
 def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     """Damped Local Trend (DLT) transition function
@@ -45,7 +47,7 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
 
 
 
-def dlt_model(lev_sm, slp_sm, theta, x_seas, x_glb_trend, y):
+def dlt_model(lev_sm, slp_sm, theta, x_glb_trend, y, x_ext=None):
     """Damped Local Trend (DLT) model for time series forecasting.
     Args
     ----
@@ -60,13 +62,16 @@ def dlt_model(lev_sm, slp_sm, theta, x_seas, x_glb_trend, y):
     sigma = numpyro.sample("sigma", dist.HalfNormal(0.5))
     alpha_glb_trend = numpyro.sample("alpha_glb_trend", dist.Normal(0, 1.0))
     beta_glb_trend = numpyro.sample("beta_glb_trend", dist.Normal(0, 1.0))
-    beta_seas = numpyro.sample("beta_seas", dist.Normal(0, 0.3).expand([x_seas.shape[1]]))
+    if x_ext is not None:
+        beta_ext = numpyro.sample("beta_ext", dist.Normal(0, 0.3).expand([x_ext.shape[1]]))
+        # (n_steps, )
+        reg_ext_comp = jnp.sum(x_ext * beta_ext, axis=-1)
+    else:
+        reg_ext_comp = 0
 
     # (n_steps, )
-    seas = jnp.sum(x_seas * beta_seas, axis=-1)
-    # (n_steps, )
     glb_trend = alpha_glb_trend + x_glb_trend * beta_glb_trend
-    reg_comp = seas + glb_trend
+    reg_comp = reg_ext_comp + glb_trend
 
     # scan with the partial function
     _, res = lax.scan(
@@ -89,9 +94,9 @@ def run_dlt_model(
     lev_sm, 
     slp_sm, 
     theta, 
-    x_seas, 
     x_glb_trend, 
     y, 
+    regression_scheme: xr.Dataset,
     seed: Optional[int] = None
 ):
     """Run the DLT model with the provided parameters and data.
@@ -114,6 +119,17 @@ def run_dlt_model(
     if seed is None:
         seed = generate_seed()
 
+    # extract regressors matrix, coef loc and scale
+    regressor_name = regression_scheme['regressor'].to_numpy()
+    x_ext = regression_scheme['covariates'].transpose("time", "regressor").to_numpy()
+    coef_loc = regression_scheme['coef_loc'].to_numpy()
+    coef_scale = regression_scheme['coef_scale'].to_numpy()
+
+    logger.info(f"regressor_name: {regressor_name}")
+    logger.info(f"x_reg shape: {x_ext.shape}")
+    logger.debug(f"coef_loc: {coef_loc}")
+    logger.debug(f"coef_scale: {coef_scale}")
+
     init_strategy = init_to_median(num_samples=10)
     kernel = NUTS(dlt_model, init_strategy=init_strategy)
     mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000, num_chains=4)
@@ -123,7 +139,7 @@ def run_dlt_model(
         lev_sm=lev_sm, 
         slp_sm=slp_sm, 
         theta=theta,
-        x_seas=x_seas,
+        x_ext=x_ext,
         x_glb_trend=x_glb_trend,
         y=y
     )
@@ -133,27 +149,34 @@ def run_dlt_model(
     # transform them into xr.Dataset
     n_chains, n_draws = posteriors_dict['alpha_glb_trend'].shape
     n_steps = posteriors_dict['dlt_comp'].shape[-1]
-    n_seas = posteriors_dict['beta_seas'].shape[-1]
 
-    posteriors = xr.Dataset(
-        {
-            'alpha_glb_trend': (['chain', 'draw'], posteriors_dict['alpha_glb_trend']),
-            'beta_glb_trend': (['chain', 'draw'], posteriors_dict['beta_glb_trend']),
-            'beta_seas': (['chain', 'draw', 'sea_regressor'], posteriors_dict['beta_seas']),
-            'dlt_comp': (['chain', 'draw', 'time'], posteriors_dict['dlt_comp']),
-            'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
-            'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
-            'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
-        },
-        coords={
-            'draw': np.arange(n_draws),
-            'chain': np.arange(n_chains),
-            'time': np.arange(n_steps),
-            'sea_regressor': np.arange(n_seas),
-        }
-    )
+    data_vars = {
+        'alpha_glb_trend': (['chain', 'draw'], posteriors_dict['alpha_glb_trend']),
+        'beta_glb_trend': (['chain', 'draw'], posteriors_dict['beta_glb_trend']),
+        'dlt_comp': (['chain', 'draw', 'time'], posteriors_dict['dlt_comp']),
+        'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
+        'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
+        'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
+    }
+    coords={
+        'draw': np.arange(n_draws),
+        'chain': np.arange(n_chains),
+        'time': np.arange(n_steps),
+    }
+
+    if regression_scheme is not None:
+        # add seasonal regressors posteriors
+        data_vars.update({
+            'beta_ext': (['chain', 'draw', 'regressor'], posteriors_dict['beta_ext']),
+        })
+        coords.update({
+            'regressor': regressor_name,
+        })
+        
+    posteriors = xr.Dataset(data_vars=data_vars, coords=coords)
 
     return posteriors
+
 
 def generate_in_sample_forecast(posteriors: xr.Dataset, transform_callback=np.exp, q=0.05):
     mu_samples = flatten_front_dim(posteriors["mu"].to_numpy(), n=2)
