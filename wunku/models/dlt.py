@@ -39,20 +39,31 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     # forecast
     dlt_comp_t = lev_prev + theta * slp_prev
 
-    def update_state(_):
-        new_lev = lev_sm * y_t + (1 - lev_sm) * (lev_prev + theta * slp_prev)
-        new_slp = slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev
-        return new_lev, new_slp
+    # def update_state(_):
+    #     new_lev = lev_sm * y_t + (1 - lev_sm) * (lev_prev + theta * slp_prev)
+    #     new_slp = slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev
+    #     return new_lev, new_slp
 
-    def keep_state(_):
-        return lev_prev, slp_prev
+    # def keep_state(_):
+    #     return lev_prev, slp_prev
 
-    # update
-    new_lev, new_slp = lax.cond(
+    # # update
+    # new_lev, new_slp = lax.cond(
+    #     jnp.isfinite(y_t),
+    #     update_state,
+    #     keep_state,
+    #     operand=None
+    # )
+
+    new_lev = jnp.where(
         jnp.isfinite(y_t),
-        update_state,
-        keep_state,
-        operand=None
+        lev_sm * y_t + (1 - lev_sm) * (dlt_comp_t),
+        lev_prev,
+    )
+    new_slp = jnp.where(
+        jnp.isfinite(y_t),
+        slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev,
+        slp_prev,
     )
 
     return (new_lev, new_slp), (new_lev, new_slp, dlt_comp_t)
@@ -77,21 +88,31 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
         reg_comp = 0
 
     # scan with the partial function
-    _, res = lax.scan(
+    final_states, all_states = lax.scan(
         lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta), 
         (y[0] - reg_comp[0], 0.), y - reg_comp
     )
-    _, _, dlt_comp = res
+    _, _, dlt_comp = all_states
+    last_lev, last_slp = final_states
     # mid point estimation
     mu = dlt_comp + reg_comp
 
     numpyro.deterministic("mu", mu)
+    # use for in-sample
     numpyro.deterministic("dlt_comp", dlt_comp)
     numpyro.deterministic("reg_comp", reg_comp)
+    # use for out-of-sample
+    numpyro.deterministic("last_lev", last_lev)
+    numpyro.deterministic("last_slp", last_slp)
 
     # likelihood
     numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
 
+
+# def generate_oos_forecast(
+#     posteriors: xr.Dataset,
+# ) -> xr.Dataset:
+    
 
 def run_dlt_model(
     lev_sm, 
@@ -156,6 +177,8 @@ def run_dlt_model(
         'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
         'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
         'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
+        'last_lev': (['chain', 'draw'], posteriors_dict['last_lev']),
+        'last_slp': (['chain', 'draw'], posteriors_dict['last_slp']),
     }
     coords={
         'draw': np.arange(n_draws),
