@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 import jax
+import pandas as pd
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
@@ -10,6 +11,7 @@ import xarray as xr
 from typing import Optional, Dict
 
 from ..utils import generate_seed, flatten_front_dim
+from ..regression import RegressionScheme
 
 logger = logging.getLogger("wunku")
 
@@ -38,22 +40,6 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
 
     # forecast
     dlt_comp_t = lev_prev + theta * slp_prev
-
-    # def update_state(_):
-    #     new_lev = lev_sm * y_t + (1 - lev_sm) * (lev_prev + theta * slp_prev)
-    #     new_slp = slp_sm * (new_lev - lev_prev) + (1 - slp_sm) * slp_prev
-    #     return new_lev, new_slp
-
-    # def keep_state(_):
-    #     return lev_prev, slp_prev
-
-    # # update
-    # new_lev, new_slp = lax.cond(
-    #     jnp.isfinite(y_t),
-    #     update_state,
-    #     keep_state,
-    #     operand=None
-    # )
 
     new_lev = jnp.where(
         jnp.isfinite(y_t),
@@ -109,10 +95,6 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
     numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
 
 
-# def generate_oos_forecast(
-#     posteriors: xr.Dataset,
-# ) -> xr.Dataset:
-    
 
 def run_dlt_model(
     lev_sm, 
@@ -120,7 +102,8 @@ def run_dlt_model(
     theta, 
     y, 
     mcmc_run_args: Dict[str, any],
-    regression_scheme: xr.Dataset,
+    regression_scheme: RegressionScheme,
+    covariates_df: pd.DataFrame = None,
     seed: Optional[int] = None,
 ):
     """Run the DLT model with the provided parameters and data.
@@ -144,10 +127,10 @@ def run_dlt_model(
         seed = generate_seed()
 
     # extract regressors matrix, coef loc and scale
-    var_name = regression_scheme['var_name'].to_numpy()
-    covariates = regression_scheme['covariates'].transpose("time", "var_name").to_numpy()
-    coef_loc = regression_scheme['coef_loc'].to_numpy()
-    coef_scale = regression_scheme['coef_scale'].to_numpy()
+    var_name = regression_scheme.scheme.index.to_numpy()
+    coef_loc = regression_scheme.scheme['loc_prior'].to_numpy()
+    coef_scale = regression_scheme.scheme['scale_prior'].to_numpy()
+    covariates = covariates_df.loc[:, var_name].values if covariates_df is not None else None
 
     logger.info(f"var_name: {var_name}")
     logger.info(f"covariates shape: {covariates.shape}")
