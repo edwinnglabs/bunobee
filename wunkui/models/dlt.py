@@ -8,14 +8,14 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 from ..utils import generate_seed, flatten_front_dim
 from ..regression import RegressionScheme
 
-logger = logging.getLogger("wunku")
+logger = logging.getLogger("wunkui")
 
-def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
+def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: float, oos: bool = False):
     """Damped Local Trend (DLT) transition function
     Args
     ----
@@ -23,7 +23,9 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     inputs: tuple containing the current observation, growth, trend, and seasonality
     lev_sm: level smoothing factor
     slp_sm: slope smoothing factor
-    theta: damping factor
+    theta: damping factor where each step is computed as:
+        dlt_comp_t = lev_prev + theta * slp_prev
+    oos: boolean indicating whether the function is used for out-of-sample forecasting
 
     
     Examples
@@ -36,10 +38,15 @@ def dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta):
     levs, slps, dlt_comp = res
     """
     lev_prev, slp_prev = carry
-    y_t = inputs
 
     # forecast
     dlt_comp_t = lev_prev + theta * slp_prev
+
+    if oos:
+        eps_t = inputs
+        y_t = dlt_comp_t + eps_t
+    else:
+        y_t = inputs
 
     new_lev = jnp.where(
         jnp.isfinite(y_t),
@@ -97,6 +104,7 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
 
 
 def run_dlt_model(
+    rng_key: jnp.ndarray,
     lev_sm, 
     slp_sm, 
     theta, 
@@ -104,8 +112,8 @@ def run_dlt_model(
     mcmc_run_args: Dict[str, any],
     regression_scheme: RegressionScheme,
     covariates_df: pd.DataFrame = None,
-    seed: Optional[int] = None,
-):
+    # seed: Optional[int] = None,
+) -> xr.Dataset:
     """Run the DLT model with the provided parameters and data.
 
     Args
@@ -122,9 +130,9 @@ def run_dlt_model(
     -------
     posteriors_dict: Dictionary containing the posterior samples of the model parameters.
     """
-    # generate seed based on current time stamp
-    if seed is None:
-        seed = generate_seed()
+    # # generate seed based on current time stamp
+    # if seed is None:
+    #     seed = generate_seed()
 
     # extract regressors matrix, coef loc and scale
     var_name = regression_scheme.scheme.index.to_numpy()
@@ -140,7 +148,7 @@ def run_dlt_model(
     init_strategy = init_to_median(num_samples=10)
     kernel = NUTS(dlt_model, init_strategy=init_strategy)
     mcmc = MCMC(kernel, **mcmc_run_args)
-    rng_key = jax.random.PRNGKey(seed)
+
     mcmc.run(
         rng_key, 
         lev_sm=lev_sm, 
@@ -183,13 +191,59 @@ def run_dlt_model(
     return posteriors
 
 
-def generate_in_sample_forecast(posteriors: xr.Dataset, transform_callback=np.exp, q=0.05):
-    mu_samples = flatten_front_dim(posteriors["mu"].to_numpy(), n=2)
+# TODO: move the quantile function out
+# add seed to generate noise where we can replicate
+def generate_dlt_comp_samples(
+    rng_key: jnp.ndarray,
+    posteriors: xr.Dataset, 
+    end_step: int, 
+    lev_sm: float,
+    slp_sm: float,
+    theta: float,
+) -> jnp.ndarray:
+    if posteriors.get("dlt_comp") is None: 
+        raise ValueError("Posteriors must contain 'dlt_comp' variable.")
+    else:
+        # in-sample forecast
+        # (n_samples, n__train_steps)
+        dlt_comp_is_samples = flatten_front_dim(posteriors["dlt_comp"].to_numpy(), n=2)
+
+    # (n_samples, )
     sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
-    eps_samples = np.transpose(
-        np.random.normal(loc=0.0, scale=sigma_samples, size=(mu_samples.shape[-1], sigma_samples.shape[0])),
-        axes=(1, 0)
+    last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
+    last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
+
+    n_samples, n_train_steps = dlt_comp_is_samples.shape
+
+    # log the shapes
+    logger.debug(f"dlt_comp_is_samples shape: {dlt_comp_is_samples.shape}")
+    logger.debug(f"sigma_samples shape: {sigma_samples.shape}")
+    logger.debug(f"last_lev shape: {last_lev.shape}")
+    logger.debug(f"last_slp shape: {last_slp.shape}")
+
+    # (n_steps, n_samples)
+    eps_samples = jax.random.normal(rng_key, shape=(end_step, n_samples)) * sigma_samples
+
+    if end_step > n_train_steps:
+        # scan with the partial function
+        _, all_states = lax.scan(
+            lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta, oos=True), 
+            (last_lev, last_slp), eps_samples[n_train_steps:end_step, :],
+        )
+        # out-of-sample forecast
+        # (n_forecast_steps, n_samples)
+        _, _, dlt_comp_oos_samples = all_states
+
+    dlt_comp_oos_samples = jnp.transpose(dlt_comp_oos_samples, axes=(-1, -2))
+    
+    dlt_comp_samples = jnp.concatenate(
+        (dlt_comp_is_samples, dlt_comp_oos_samples), axis=-1
     )
-    yhat_samples = transform_callback(mu_samples + eps_samples)
-    yhat_lower, yhat_mid, yhat_upper = np.quantile(yhat_samples, q=[q, 0.5, 1 - q], axis=0)
-    return yhat_lower, yhat_mid, yhat_upper
+
+    logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
+
+    return dlt_comp_samples
+
+
+
+

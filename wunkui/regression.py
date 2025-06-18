@@ -106,6 +106,10 @@ class RegressionScheme:
 
         self.update_scheme(new_scheme_to_combine)
 
+    def get_regressors(self) -> List[str]:
+        """Get a list of regressors in the scheme"""
+        return deepcopy(self.scheme.index.tolist())
+
 
 def make_fourier_series_with_index(n: int, period: Union[int, float], order: int = 3, shift: int = 0) -> np.ndarray:
     """Given time series length, cyclical period and order, return a set of fourier series.
