@@ -12,6 +12,7 @@ dependencies = [
     "pandas",
     "arviz",
     "xarray",
+    "ipywidgets",
 ]
 
 [build-system]
