@@ -8,9 +8,9 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Callable
 
-from ..utils import generate_seed, flatten_front_dim
+from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
 
 logger = logging.getLogger("wunkui")
@@ -105,10 +105,10 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
 
 def run_dlt_model(
     rng_key: jnp.ndarray,
-    lev_sm, 
-    slp_sm, 
-    theta, 
-    y, 
+    lev_sm: float, 
+    slp_sm: float, 
+    theta: float, 
+    y: np.ndarray, 
     mcmc_run_args: Dict[str, any],
     regression_scheme: RegressionScheme,
     covariates_df: pd.DataFrame = None,
@@ -191,8 +191,7 @@ def run_dlt_model(
     return posteriors
 
 
-# TODO: move the quantile function out
-# add seed to generate noise where we can replicate
+
 def generate_dlt_comp_samples(
     rng_key: jnp.ndarray,
     posteriors: xr.Dataset, 
@@ -225,6 +224,8 @@ def generate_dlt_comp_samples(
     eps_samples = jax.random.normal(rng_key, shape=(end_step, n_samples)) * sigma_samples
 
     if end_step > n_train_steps:
+        logger.info(f"Collected in-sample forecasts from step 0 to {n_train_steps}.")
+        logger.info(f"Generating out-of-sample forecasts from step {n_train_steps} to {end_step}.")
         # scan with the partial function
         _, all_states = lax.scan(
             lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta, oos=True), 
@@ -245,5 +246,64 @@ def generate_dlt_comp_samples(
     return dlt_comp_samples
 
 
+def generate_forecast_samples(
+    rng_key: jnp.ndarray,
+    posteriors: xr.Dataset, 
+    lev_sm: float,
+    slp_sm: float,
+    theta: float,
+    end_step: Optional[int] = None, 
+    covariates: Optional[np.ndarray] = None,
+    transform_callback: Optional[Callable] = None,
+) -> jnp.ndarray:
+    """Generate forecast samples from the DLT model posteriors.
 
+    Args
+    ----
+    rng_key: JAX random key for reproducibility.
+    posteriors: xr.Dataset containing the posterior samples of the DLT model.
+    end_step: The step at which to stop generating forecasts.
+    lev_sm: Level smoothing factor.
+    slp_sm: Slope smoothing factor.
+    theta: Damping factor.
+    covariates: Optional; 2D array of covariates with shape (n_steps, n_var). If provided, the model will include 
+    regression components.
+    transform_callback: Optional; a callable function to transform the forecast samples.
+
+    Returns
+    -------
+    forecast_samples: (n_samples, n_steps) array of forecast samples.
+    """
+    if "coef" in posteriors and covariates is not None:
+        # (n_samples, n_var)
+        coef = flatten_front_dim(posteriors["coef"].to_numpy(), n=2) 
+        logger.debug(f"coef shape: {coef.shape}")
+        # (n_samples, n_var) * (n_steps, n_var) -> (n_samples, n_steps)
+        reg_comp_samples = np.einsum("ik,jk->ij", coef, covariates)
+        logger.debug(f"reg_comp_samples shape: {reg_comp_samples.shape}")
+        end_step = reg_comp_samples.shape[-1]
+        logger.info(f"Overriding end_step to {end_step} based on regression components.")
+    else:
+        if end_step is None:
+            raise ValueError("end_step must be provided if covariates are not provided.")
+        logger.debug(f"end_step: {end_step}")
+        reg_comp_samples = 0
+
+    dlt_comp_samples = generate_dlt_comp_samples(
+        rng_key, 
+        posteriors, 
+        end_step, 
+        lev_sm, 
+        slp_sm, 
+        theta
+    )
+
+    logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
+
+    forecast_samples = dlt_comp_samples + reg_comp_samples
+    if transform_callback is not None:
+        forecast_samples = transform_callback(forecast_samples)
+
+    logger.debug(f"forecast_samples shape: {forecast_samples.shape}")
+    return forecast_samples
 
