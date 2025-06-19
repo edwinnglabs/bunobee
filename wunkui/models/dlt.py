@@ -62,7 +62,7 @@ def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: floa
     return (new_lev, new_slp), (new_lev, new_slp, dlt_comp_t)
 
 
-def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
+def dlt_model(lev_sm, slp_sm, theta, y, reg_input=None):
     """Damped Local Trend (DLT) model for time series forecasting.
     Args
     ----
@@ -72,13 +72,75 @@ def dlt_model(lev_sm, slp_sm, theta, y, covariates=None):
     y: Observations (1D array with shape (n_steps,))
     """
 
-    sigma = numpyro.sample("sigma", dist.HalfNormal(0.5))
-    if covariates is not None:
-        coef = numpyro.sample("coef", dist.Normal(0, 0.3).expand([covariates.shape[1]]))
+    # sigma = numpyro.sample(
+    #     "sigma", 
+    #     dist.TruncatedCauchy(
+    #         loc=1e-3, scale=cauchy_sd, 
+    #         low=1e-3, high=5 * cauchy_sd
+    #     )
+    # )
+
+    # sigma = numpyro.sample(
+    #     "sigma", 
+    #     dist.HalfCauchy(scale=cauchy_sd)
+    # )
+    sigma = numpyro.sample(
+        "sigma",
+        dist.HalfNormal(0.1)
+    )
+
+    if reg_input is not None:
+        coefs = []
+        neu_reg_input = reg_input.get("=", None)
+        if neu_reg_input is not None:
+            neu_coef_loc_prior = neu_reg_input["coef_loc"]
+            neu_coef_scale_prior = neu_reg_input["coef_scale"]
+            neu_covariates = neu_reg_input["covariates"]
+            neu_coef = numpyro.sample("neu_coef", 
+                dist.Normal(
+                loc=neu_coef_loc_prior, 
+                scale=neu_coef_scale_prior
+            ))
+            coefs.append(neu_coef)
+            neu_reg_comp = jnp.sum(neu_covariates * neu_coef, axis=-1)
+        else:
+            neu_reg_comp = 0.
+        neg_reg_input = reg_input.get("-", None)
+        if neg_reg_input is not None:
+            neg_coef_loc_prior = neg_reg_input["coef_loc"]
+            neg_coef_scale_prior = neg_reg_input["coef_scale"]
+            neg_covariates = neg_reg_input["covariates"]
+            neg_coef = numpyro.sample("neg_coef", 
+                dist.TruncatedNormal(
+                loc=neg_coef_loc_prior, 
+                scale=neg_coef_scale_prior,
+                high=0.0,
+            ))
+            coefs.append(neg_coef)
+            neg_reg_comp = jnp.sum(neg_covariates * neg_coef, axis=-1)
+        else:
+            neg_reg_comp = 0.
+        pos_reg_input = reg_input.get("+", None)
+        if pos_reg_input is not None:
+            pos_coef_loc_prior = pos_reg_input["coef_loc"]
+            pos_coef_scale_prior = pos_reg_input["coef_scale"]
+            pos_covariates = pos_reg_input["covariates"]
+            pos_coef = numpyro.sample("pos_coef",
+                dist.TruncatedNormal(
+                loc=pos_coef_loc_prior, 
+                scale=pos_coef_scale_prior,
+                low=0.0,
+            ))
+            coefs.append(pos_coef)
+            pos_reg_comp = jnp.sum(pos_covariates * pos_coef, axis=-1)
+        else:
+            pos_reg_comp = 0.
         # (n_steps, )
-        reg_comp = jnp.sum(covariates * coef, axis=-1)
+        reg_comp = neu_reg_comp + neg_reg_comp + pos_reg_comp
+        coef = jnp.concatenate(coefs, axis=-1)
+        numpyro.deterministic("coef", coef)
     else:
-        reg_comp = 0
+        reg_comp = 0.
 
     # scan with the partial function
     final_states, all_states = lax.scan(
@@ -110,9 +172,8 @@ def run_dlt_model(
     theta: float, 
     y: np.ndarray, 
     mcmc_run_args: Dict[str, any],
-    regression_scheme: RegressionScheme,
+    regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: pd.DataFrame = None,
-    # seed: Optional[int] = None,
 ) -> xr.Dataset:
     """Run the DLT model with the provided parameters and data.
 
@@ -130,20 +191,33 @@ def run_dlt_model(
     -------
     posteriors_dict: Dictionary containing the posterior samples of the model parameters.
     """
-    # # generate seed based on current time stamp
-    # if seed is None:
-    #     seed = generate_seed()
+    if regression_scheme is not None and covariates_df is not None:
+        # extract regressors matrix, coef loc and scale
+        # separate three groups of regressors with the sign: "=", "+", "-"
+        reg_input = {}
+        var_name = []
+        for sign in ["=", "+", "-"]:
+            regressors = regression_scheme.scheme.loc[regression_scheme.scheme['sign'] == sign, :].index.to_list()
+            if len(regressors) > 0:
+                coef_loc = regression_scheme.scheme.loc[regressors, 'loc_prior'].values
+                coef_loc = jnp.asarray(coef_loc, dtype=jnp.float32)
+                coef_scale = regression_scheme.scheme.loc[regressors, 'scale_prior'].values
+                coef_scale = jnp.asarray(coef_scale, dtype=jnp.float32)
+                covariates = covariates_df.loc[:, regressors].values if len(regressors) > 0 else None
+                reg_input[sign] = {
+                    "coef_loc": coef_loc,
+                    "coef_scale": coef_scale,
+                    "covariates": covariates,
+                }
+                var_name += regressors
 
-    # extract regressors matrix, coef loc and scale
-    var_name = regression_scheme.scheme.index.to_numpy()
-    coef_loc = regression_scheme.scheme['loc_prior'].to_numpy()
-    coef_scale = regression_scheme.scheme['scale_prior'].to_numpy()
-    covariates = covariates_df.loc[:, var_name].values if covariates_df is not None else None
-
-    logger.info(f"var_name: {var_name}")
-    logger.info(f"covariates shape: {covariates.shape}")
-    logger.debug(f"coef_loc: {coef_loc}")
-    logger.debug(f"coef_scale: {coef_scale}")
+                logger.debug(f"sign: {sign}")
+                logger.debug(f"regressors: {regressors}")
+                logger.debug(f"covariates shape: {covariates.shape}")
+                logger.debug(f"coef_loc: {coef_loc}")
+                logger.debug(f"coef_scale: {coef_scale}")
+    else:
+        covariates = None
 
     init_strategy = init_to_median(num_samples=10)
     kernel = NUTS(dlt_model, init_strategy=init_strategy)
@@ -155,7 +229,7 @@ def run_dlt_model(
         slp_sm=slp_sm, 
         theta=theta,
         y=y,
-        covariates=covariates
+        reg_input=reg_input
     )
     
     posteriors_dict = mcmc.get_samples(group_by_chain=True)
