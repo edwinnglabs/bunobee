@@ -1,2 +1,2 @@
 name = "wunku"
-__version__ = "0.0.1dev0"
+__version__ = "0.0.1dev1"
