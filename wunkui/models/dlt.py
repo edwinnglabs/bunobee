@@ -67,7 +67,7 @@ def dlt_model(
     slp_sm: float, 
     theta: float, 
     y: jnp.ndarray, 
-    reg_input=Optional[Dict[str, any]] = None,  
+    reg_input: Optional[Dict[str, any]] = None,  
 ):
     """Damped Local Trend (DLT) model for time series forecasting.
     
@@ -170,7 +170,7 @@ def run_dlt_model(
     y: np.ndarray, 
     mcmc_run_args: Dict[str, any],
     regression_scheme: Optional[RegressionScheme] = None,
-    covariates_df: pd.DataFrame = None,
+    covariates_df: Optional[pd.DataFrame] = None,
 ) -> xr.Dataset:
     """Run the DLT model with the provided parameters and data.
 
@@ -327,7 +327,7 @@ def generate_forecast_samples(
     slp_sm: float,
     theta: float,
     end_step: Optional[int] = None, 
-    covariates_df: Optional[np.ndarray] = None,
+    covariates_df: Optional[pd.DataFrame] = None,
     transform_callback: Optional[Callable] = None,
 ) -> jnp.ndarray:
     """Generate forecast samples from the DLT model posteriors.
