@@ -1,6 +1,6 @@
 [project]
 name = "wunkui"
-version = "0.0.1dev2"
+version = "0.0.1dev3"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
