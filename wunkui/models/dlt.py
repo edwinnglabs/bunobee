@@ -62,31 +62,29 @@ def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: floa
     return (new_lev, new_slp), (new_lev, new_slp, dlt_comp_t)
 
 
-def dlt_model(lev_sm, slp_sm, theta, y, reg_input=None):
+def dlt_model(
+    lev_sm: float, 
+    slp_sm: float, 
+    theta: float, 
+    y: jnp.ndarray, 
+    reg_input=Optional[Dict[str, any]] = None,  
+):
     """Damped Local Trend (DLT) model for time series forecasting.
+    
     Args
     ----
     lev_sm: Level smoothing factor (scalar).
     slp_sm: Slope smoothing factor (scalar).
     theta: Damping factor (scalar).
+    y: Observations (1D array with shape (n_steps,)).
+    reg_input: Optional; a dictionary containing regression inputs.
+    
     y: Observations (1D array with shape (n_steps,))
     """
 
-    # sigma = numpyro.sample(
-    #     "sigma", 
-    #     dist.TruncatedCauchy(
-    #         loc=1e-3, scale=cauchy_sd, 
-    #         low=1e-3, high=5 * cauchy_sd
-    #     )
-    # )
-
-    # sigma = numpyro.sample(
-    #     "sigma", 
-    #     dist.HalfCauchy(scale=cauchy_sd)
-    # )
     sigma = numpyro.sample(
         "sigma",
-        dist.HalfNormal(0.1)
+        dist.HalfNormal(5.0)
     )
 
     if reg_input is not None:
@@ -164,7 +162,6 @@ def dlt_model(lev_sm, slp_sm, theta, y, reg_input=None):
     numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
 
 
-
 def run_dlt_model(
     rng_key: jnp.ndarray,
     lev_sm: float, 
@@ -179,13 +176,15 @@ def run_dlt_model(
 
     Args
     ----
-    lev_sm: Level smoothing factor (scalar).
-    slp_sm: Slope smoothing factor (scalar).
-    theta: Damping factor (scalar).
-    x_seas: Seasonal features (2D array with shape (n_steps, n_seasons)).
-    x_glb_trend: Global trend feature (1D array with shape (n_steps,)).
+    rng_key: JAX random key for reproducibility.
+    lev_sm: Level smoothing factor.
+    slp_sm: Slope smoothing factor.
+    theta: Damping factor.
     y: Observations (1D array with shape (n_steps,)).
-    seed: Optional; random seed for reproducibility.
+    mcmc_run_args: Dictionary containing the arguments for MCMC run.
+    regression_scheme: Optional; a RegressionScheme object containing the regression scheme.
+    covariates_df: Optional; a pandas DataFrame containing the covariates with shape (n_steps, n_var).
+
 
     Returns 
     -------
@@ -242,6 +241,7 @@ def run_dlt_model(
         'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
         'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
         'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
+        # "slp_sm": (['chain', 'draw'], posteriors_dict['slp_sm']),
         'last_lev': (['chain', 'draw'], posteriors_dict['last_lev']),
         'last_slp': (['chain', 'draw'], posteriors_dict['last_slp']),
     }
@@ -327,7 +327,7 @@ def generate_forecast_samples(
     slp_sm: float,
     theta: float,
     end_step: Optional[int] = None, 
-    covariates: Optional[np.ndarray] = None,
+    covariates_df: Optional[np.ndarray] = None,
     transform_callback: Optional[Callable] = None,
 ) -> jnp.ndarray:
     """Generate forecast samples from the DLT model posteriors.
@@ -348,10 +348,14 @@ def generate_forecast_samples(
     -------
     forecast_samples: (n_samples, n_steps) array of forecast samples.
     """
-    if "coef" in posteriors and covariates is not None:
+    if "coef" in posteriors and covariates_df is not None:
         # (n_samples, n_var)
         coef = flatten_front_dim(posteriors["coef"].to_numpy(), n=2) 
+        var_names = posteriors["coef"].var_name.values
+        covariates = covariates_df[var_names].values
+        logger.debug(f"var_names: {var_names}")
         logger.debug(f"coef shape: {coef.shape}")
+        logger.debug(f"covariates shape: {covariates.shape}")
         # (n_samples, n_var) * (n_steps, n_var) -> (n_samples, n_steps)
         reg_comp_samples = np.einsum("ik,jk->ij", coef, covariates)
         logger.debug(f"reg_comp_samples shape: {reg_comp_samples.shape}")
