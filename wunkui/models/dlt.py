@@ -280,16 +280,18 @@ def generate_dlt_comp_samples(
         # in-sample forecast
         # (n_samples, n__train_steps)
         dlt_comp_is_samples = flatten_front_dim(posteriors["dlt_comp"].to_numpy(), n=2)
+        n_samples, n_train_steps = dlt_comp_is_samples.shape
+        logger.debug(f"dlt_comp_is_samples shape: {dlt_comp_is_samples.shape}")
+        logger.info(f"Collecting in-sample forecasts from step 0 to {n_train_steps}.")
 
     # (n_samples, )
     sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
     last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
     last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
 
-    n_samples, n_train_steps = dlt_comp_is_samples.shape
+
 
     # log the shapes
-    logger.debug(f"dlt_comp_is_samples shape: {dlt_comp_is_samples.shape}")
     logger.debug(f"sigma_samples shape: {sigma_samples.shape}")
     logger.debug(f"last_lev shape: {last_lev.shape}")
     logger.debug(f"last_slp shape: {last_slp.shape}")
@@ -298,7 +300,6 @@ def generate_dlt_comp_samples(
     eps_samples = jax.random.normal(rng_key, shape=(end_step, n_samples)) * sigma_samples
 
     if end_step > n_train_steps:
-        logger.info(f"Collected in-sample forecasts from step 0 to {n_train_steps}.")
         logger.info(f"Generating out-of-sample forecasts from step {n_train_steps} to {end_step}.")
         # scan with the partial function
         _, all_states = lax.scan(
@@ -309,11 +310,13 @@ def generate_dlt_comp_samples(
         # (n_forecast_steps, n_samples)
         _, _, dlt_comp_oos_samples = all_states
 
-    dlt_comp_oos_samples = jnp.transpose(dlt_comp_oos_samples, axes=(-1, -2))
-    
-    dlt_comp_samples = jnp.concatenate(
-        (dlt_comp_is_samples, dlt_comp_oos_samples), axis=-1
-    )
+        dlt_comp_oos_samples = jnp.transpose(dlt_comp_oos_samples, axes=(-1, -2))
+        dlt_comp_samples = jnp.concatenate(
+            (dlt_comp_is_samples, dlt_comp_oos_samples), axis=-1
+        )
+    else:
+        # logger.debug("No out-of-sample forecast needed.")
+        dlt_comp_samples = dlt_comp_is_samples
 
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
