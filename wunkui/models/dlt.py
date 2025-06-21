@@ -148,9 +148,9 @@ def dlt_model(
     _, _, dlt_comp = all_states
     last_lev, last_slp = final_states
     # mid point estimation
-    mu = dlt_comp + reg_comp
+    yhat = dlt_comp + reg_comp
 
-    numpyro.deterministic("mu", mu)
+    numpyro.deterministic("yhat", yhat)
     # use for in-sample
     numpyro.deterministic("dlt_comp", dlt_comp)
     numpyro.deterministic("reg_comp", reg_comp)
@@ -159,7 +159,7 @@ def dlt_model(
     numpyro.deterministic("last_slp", last_slp)
 
     # likelihood
-    numpyro.sample("observations", dist.Normal(loc=mu, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
+    numpyro.sample("observations", dist.Normal(loc=yhat, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
 
 
 def run_dlt_model(
@@ -230,18 +230,22 @@ def run_dlt_model(
         y=y,
         reg_input=reg_input
     )
-    
+
     posteriors_dict = mcmc.get_samples(group_by_chain=True)
 
     # transform them into xr.Dataset
     n_chains, n_draws, n_steps = posteriors_dict['dlt_comp'].shape
 
+    dlt_comp_p50 = jnp.median(posteriors_dict['dlt_comp'], axis=(0, 1))
+
     data_vars = {
         'dlt_comp': (['chain', 'draw', 'time'], posteriors_dict['dlt_comp']),
-        'mu': (['chain', 'draw', 'time'], posteriors_dict['mu']),
+        'dlt_comp_p50': (['time'], dlt_comp_p50),  # median of in-sample forecast
+        # in-sample prediction before reverse transform with original covariates
+        'yhat': (['chain', 'draw', 'time'], posteriors_dict['yhat']),
+        "resid": (['chain', 'draw', 'time'], y - posteriors_dict['yhat']),
         'reg_comp': (['chain', 'draw', 'time'], posteriors_dict['reg_comp']),
         'sigma': (['chain', 'draw'], posteriors_dict['sigma']),
-        # "slp_sm": (['chain', 'draw'], posteriors_dict['slp_sm']),
         'last_lev': (['chain', 'draw'], posteriors_dict['last_lev']),
         'last_slp': (['chain', 'draw'], posteriors_dict['last_slp']),
     }
@@ -253,17 +257,34 @@ def run_dlt_model(
 
     if regression_scheme is not None:
         # add seasonal regressors posteriors
+        coef_p50 = jnp.median(posteriors_dict['coef'], axis=(0, 1))
+        # (n_steps, )
+        reg_comp_p50 = np.sum(coef_p50 * covariates_df[var_name].values, axis=-1)
+        # (n_steps, )
+        yhat_p50 = dlt_comp_p50 + reg_comp_p50
         data_vars.update({
             'coef': (['chain', 'draw', 'var_name'], posteriors_dict['coef']),
+            "coef_p50": (['var_name'], coef_p50),
+            'reg_comp_p50': (['time'], reg_comp_p50),
+            'yhat_p50': (['time'], yhat_p50),
         })
         coords.update({
             'var_name': var_name,
         })
-        
+    else:
+        # (n_steps, )
+        yhat_p50 = dlt_comp_p50
+        data_vars.update({
+            'yhat_p50': (['time'], yhat_p50),
+        })
+
+    data_vars.update({
+        "resid_p50": (['time'], y - yhat_p50),
+    })
+
     posteriors = xr.Dataset(data_vars=data_vars, coords=coords)
 
     return posteriors
-
 
 
 def generate_dlt_comp_samples(
@@ -288,8 +309,6 @@ def generate_dlt_comp_samples(
     sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
     last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
     last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
-
-
 
     # log the shapes
     logger.debug(f"sigma_samples shape: {sigma_samples.shape}")
@@ -343,8 +362,7 @@ def generate_forecast_samples(
     lev_sm: Level smoothing factor.
     slp_sm: Slope smoothing factor.
     theta: Damping factor.
-    covariates: Optional; 2D array of covariates with shape (n_steps, n_var). If provided, the model will include 
-    regression components.
+    covariates_df: Optional; a pandas DataFrame containing the covariates with shape (n_steps, n_var).
     transform_callback: Optional; a callable function to transform the forecast samples.
 
     Returns
