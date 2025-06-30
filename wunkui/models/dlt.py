@@ -1,4 +1,6 @@
 import logging
+import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
@@ -81,7 +83,7 @@ def dlt_model(
     
     y: Observations (1D array with shape (n_steps,))
     """
-
+    y = jnp.assay(y, dtype=y.dtype)
     sigma = numpyro.sample(
         "sigma",
         dist.HalfNormal(5.0)
@@ -309,6 +311,11 @@ def generate_dlt_comp_samples(
     sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
     last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
     last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
+
+
+    # float64 to make sure it works with both 32 or 64 bit
+    last_lev = jnp.asarray(last_lev, dtype=jnp.float64)
+    last_slp = jnp.asarray(last_slp, dtype=jnp.float64)
 
     # log the shapes
     logger.debug(f"sigma_samples shape: {sigma_samples.shape}")
