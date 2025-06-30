@@ -83,7 +83,7 @@ def dlt_model(
     
     y: Observations (1D array with shape (n_steps,))
     """
-    y = jnp.assay(y, dtype=y.dtype)
+    y = jnp.asarray(y, dtype=y.dtype)
     sigma = numpyro.sample(
         "sigma",
         dist.HalfNormal(5.0)
