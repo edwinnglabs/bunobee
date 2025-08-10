@@ -1,6 +1,6 @@
 [project]
 name = "wunkui"
-version = "0.0.1dev4"
+version = "0.0.1dev5"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
@@ -19,10 +19,8 @@ dependencies = [
 requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-package-dir = { "wunkui" = "wunkui" }
-packages = ["wunkui"]
-include-package-data = true
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.black]
 line-length = 120
