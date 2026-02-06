@@ -351,14 +351,14 @@ def generate_dlt_comp_samples(
 
 def generate_forecast_samples(
     rng_key: jnp.ndarray,
-    posteriors: xr.Dataset, 
+    posteriors: xr.Dataset,
     lev_sm: float,
     slp_sm: float,
     theta: float,
-    end_step: Optional[int] = None, 
+    end_step: Optional[int] = None,
     covariates_df: Optional[pd.DataFrame] = None,
     transform_callback: Optional[Callable] = None,
-) -> jnp.ndarray:
+) -> xr.Dataset:
     """Generate forecast samples from the DLT model posteriors.
 
     Args
@@ -374,42 +374,72 @@ def generate_forecast_samples(
 
     Returns
     -------
-    forecast_samples: (n_samples, n_steps) array of forecast samples.
+    xr.Dataset containing:
+        - dlt_comp_samples: (sample, time) DLT component samples
+        - reg_comp_samples: (sample, time, var_name) regression component samples per covariate (if covariates provided)
+        - forecast_samples: (sample, time) combined forecast samples
     """
     if "coef" in posteriors and covariates_df is not None:
         # (n_samples, n_var)
-        coef = flatten_front_dim(posteriors["coef"].to_numpy(), n=2) 
-        var_names = posteriors["coef"].var_name.values
+        coef = flatten_front_dim(posteriors["coef"].to_numpy(), n=2)
+        var_names = list(posteriors["coef"].var_name.values)
         covariates = covariates_df[var_names].values
         logger.debug(f"var_names: {var_names}")
         logger.debug(f"coef shape: {coef.shape}")
         logger.debug(f"covariates shape: {covariates.shape}")
-        # (n_samples, n_var) * (n_steps, n_var) -> (n_samples, n_steps)
-        reg_comp_samples = np.einsum("ik,jk->ij", coef, covariates)
-        logger.debug(f"reg_comp_samples shape: {reg_comp_samples.shape}")
-        end_step = reg_comp_samples.shape[-1]
+        # Keep individual variable contributions: (n_samples, n_var) * (n_steps, n_var) -> (n_samples, n_steps, n_var)
+        # coef[:, None, :] is (n_samples, 1, n_var), covariates[None, :, :] is (1, n_steps, n_var)
+        reg_comp_samples_per_var = coef[:, None, :] * covariates[None, :, :]
+        logger.debug(f"reg_comp_samples_per_var shape: {reg_comp_samples_per_var.shape}")
+        # Sum over variables to get total reg component: (n_samples, n_steps)
+        reg_comp_samples_total = np.sum(reg_comp_samples_per_var, axis=-1)
+        logger.debug(f"reg_comp_samples_total shape: {reg_comp_samples_total.shape}")
+        end_step = reg_comp_samples_total.shape[-1]
         logger.info(f"Overriding end_step to {end_step} based on regression components.")
+        has_regression = True
     else:
         if end_step is None:
             raise ValueError("end_step must be provided if covariates are not provided.")
         logger.debug(f"end_step: {end_step}")
-        reg_comp_samples = 0
+        reg_comp_samples_total = 0
+        has_regression = False
 
     dlt_comp_samples = generate_dlt_comp_samples(
-        rng_key, 
-        posteriors, 
-        end_step, 
-        lev_sm, 
-        slp_sm, 
+        rng_key,
+        posteriors,
+        end_step,
+        lev_sm,
+        slp_sm,
         theta
     )
 
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
-    forecast_samples = dlt_comp_samples + reg_comp_samples
+    forecast_samples = dlt_comp_samples + reg_comp_samples_total
     if transform_callback is not None:
         forecast_samples = transform_callback(forecast_samples)
 
     logger.debug(f"forecast_samples shape: {forecast_samples.shape}")
-    return forecast_samples
+
+    # Build xr.Dataset
+    n_samples, n_steps = dlt_comp_samples.shape
+
+    data_vars = {
+        'dlt_comp_samples': (['sample', 'time'], np.asarray(dlt_comp_samples)),
+        'forecast_samples': (['sample', 'time'], np.asarray(forecast_samples)),
+    }
+
+    coords = {
+        'sample': np.arange(n_samples),
+        'time': np.arange(n_steps),
+    }
+
+    if has_regression:
+        # Add reg_comp_samples with var_name dimension
+        data_vars['reg_comp_samples'] = (['sample', 'time', 'var_name'], reg_comp_samples_per_var)
+        coords['var_name'] = var_names
+
+    result = xr.Dataset(data_vars=data_vars, coords=coords)
+
+    return result
 
