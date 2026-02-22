@@ -18,26 +18,35 @@ from ..regression import RegressionScheme
 logger = logging.getLogger("wunkui")
 
 def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: float, oos: bool = False):
-    """Damped Local Trend (DLT) transition function
+    """Single transition step for the Damped Local Trend (DLT) model, compatible with `lax.scan`.
+
+    Computes the one-step-ahead forecast (`dlt_comp_t = lev_prev + theta * slp_prev`),
+    then updates the level and slope via exponential smoothing. NaN observations are
+    skipped — the state is carried forward unchanged.
+
     Args
     ----
-    carry: tuple containing the previous level and bias
-    inputs: tuple containing the current observation, growth, trend, and seasonality
-    lev_sm: level smoothing factor
-    slp_sm: slope smoothing factor
-    theta: damping factor where each step is computed as:
-        dlt_comp_t = lev_prev + theta * slp_prev
-    oos: boolean indicating whether the function is used for out-of-sample forecasting
+    carry: Tuple ``(lev_prev, slp_prev)`` — the level and slope from the previous step.
+    inputs: In-sample mode: the scalar observation ``y_t``.
+            Out-of-sample mode (``oos=True``): a noise draw ``eps_t`` added to the forecast.
+    lev_sm: Level smoothing factor in ``[0, 1]``.
+    slp_sm: Slope smoothing factor in ``[0, 1]``.
+    theta: Damping factor applied to the slope each step.
+    oos: If ``True``, treats ``inputs`` as noise rather than observed values.
 
-    
+    Returns
+    -------
+    carry: Updated ``(new_lev, new_slp)`` tuple for the next step.
+    outputs: Tuple ``(new_lev, new_slp, dlt_comp_t)`` stacked by ``lax.scan``.
+
     Examples
     --------
-    >>> import jax.numpy as jnp
     >>> from jax import lax
-    >>> from wunku.models import dlt_transition_step
-
-    _, res = lax.scan(lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta), (y[0], 0), y)
-    levs, slps, dlt_comp = res
+    >>> from wunkui.models.dlt import dlt_transition_step
+    >>> _, (levs, slps, dlt_comp) = lax.scan(
+    ...     lambda carry, y_t: dlt_transition_step(carry, y_t, lev_sm, slp_sm, theta),
+    ...     (y[0], 0.0), y
+    ... )
     """
     lev_prev, slp_prev = carry
 
@@ -71,17 +80,24 @@ def dlt_model(
     y: jnp.ndarray, 
     reg_input: Optional[Dict[str, any]] = None,  
 ):
-    """Damped Local Trend (DLT) model for time series forecasting.
-    
+    """NumPyro probabilistic model for Damped Local Trend (DLT) time series.
+
+    Samples ``sigma`` from a ``HalfNormal`` prior, optionally adds a regression
+    component (neutral / negative-constrained / positive-constrained coefficients),
+    runs the DLT recursion via ``lax.scan``, and registers a Normal likelihood.
+
+    Deterministic sites registered: ``yhat``, ``dlt_comp``, ``reg_comp``,
+    ``last_lev``, ``last_slp``, and ``coef`` (when regression is used).
+
     Args
     ----
     lev_sm: Level smoothing factor (scalar).
     slp_sm: Slope smoothing factor (scalar).
     theta: Damping factor (scalar).
-    y: Observations (1D array with shape (n_steps,)).
-    reg_input: Optional; a dictionary containing regression inputs.
-    
-    y: Observations (1D array with shape (n_steps,))
+    y: Observations, shape ``(n_steps,)``. NaN values are masked in the likelihood.
+    reg_input: Optional dict keyed by sign (``"="``, ``"+"``, ``"-"``), each mapping
+        to a sub-dict with ``"covariates"`` (array), ``"coef_loc"``, and
+        ``"coef_scale"`` for the coefficient prior.
     """
     y = jnp.asarray(y, dtype=y.dtype)
     sigma = numpyro.sample(
@@ -174,7 +190,7 @@ def run_dlt_model(
     regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: Optional[pd.DataFrame] = None,
 ) -> xr.Dataset:
-    """Run the DLT model with the provided parameters and data.
+    """Run NUTS/MCMC on the DLT model and return posterior samples as an ``xr.Dataset``.
 
     Args
     ----
@@ -182,15 +198,20 @@ def run_dlt_model(
     lev_sm: Level smoothing factor.
     slp_sm: Slope smoothing factor.
     theta: Damping factor.
-    y: Observations (1D array with shape (n_steps,)).
-    mcmc_run_args: Dictionary containing the arguments for MCMC run.
-    regression_scheme: Optional; a RegressionScheme object containing the regression scheme.
-    covariates_df: Optional; a pandas DataFrame containing the covariates with shape (n_steps, n_var).
+    y: Observations, shape ``(n_steps,)``.
+    mcmc_run_args: Keyword arguments forwarded to ``numpyro.infer.MCMC`` (e.g.
+        ``num_warmup``, ``num_samples``, ``num_chains``).
+    regression_scheme: Optional ``RegressionScheme`` defining regressor signs and
+        coefficient priors.
+    covariates_df: Optional DataFrame of covariates, shape ``(n_steps, n_var)``.
+        Required when ``regression_scheme`` is provided.
 
-
-    Returns 
+    Returns
     -------
-    posteriors_dict: Dictionary containing the posterior samples of the model parameters.
+    xr.Dataset with dimensions ``(chain, draw, time)`` containing:
+        ``dlt_comp``, ``dlt_comp_p50``, ``yhat``, ``yhat_p50``, ``resid``,
+        ``resid_p50``, ``reg_comp``, ``sigma``, ``last_lev``, ``last_slp``,
+        and (if regression) ``coef``, ``coef_p50``, ``reg_comp_p50``.
     """
     if regression_scheme is not None and covariates_df is not None:
         # extract regressors matrix, coef loc and scale
@@ -289,15 +310,37 @@ def run_dlt_model(
     return posteriors
 
 
-def generate_dlt_comp_samples(
+def generate_dlt_components(
     rng_key: jnp.ndarray,
-    posteriors: xr.Dataset, 
-    end_step: int, 
+    posteriors: xr.Dataset,
+    end_step: int,
     lev_sm: float,
     slp_sm: float,
     theta: float,
 ) -> jnp.ndarray:
-    if posteriors.get("dlt_comp") is None: 
+    """Generate DLT component samples for in-sample and (optionally) out-of-sample steps.
+
+    For steps already covered by the fitted model (``step < n_train_steps``), the
+    in-sample ``dlt_comp`` draws are returned directly.  For additional steps
+    (``end_step > n_train_steps``), the DLT recursion is continued from the last
+    posterior level/slope using sampled noise.
+
+    Args
+    ----
+    rng_key: JAX random key used to draw noise for out-of-sample steps.
+    posteriors: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
+        ``dlt_comp``, ``sigma``, ``last_lev``, and ``last_slp``.
+    end_step: Total number of time steps to generate (in-sample + out-of-sample).
+    lev_sm: Level smoothing factor.
+    slp_sm: Slope smoothing factor.
+    theta: Damping factor.
+
+    Returns
+    -------
+    jnp.ndarray of shape ``(n_samples, end_step)`` containing the DLT component
+    draws across all requested time steps.
+    """
+    if posteriors.get("dlt_comp") is None:
         raise ValueError("Posteriors must contain 'dlt_comp' variable.")
     else:
         # in-sample forecast
@@ -349,7 +392,7 @@ def generate_dlt_comp_samples(
     return dlt_comp_samples
 
 
-def generate_forecast_samples(
+def make_inference(
     rng_key: jnp.ndarray,
     posteriors: xr.Dataset,
     lev_sm: float,
@@ -359,25 +402,34 @@ def generate_forecast_samples(
     covariates_df: Optional[pd.DataFrame] = None,
     transform_callback: Optional[Callable] = None,
 ) -> xr.Dataset:
-    """Generate forecast samples from the DLT model posteriors.
+    """Generate full forecast samples by combining DLT and regression components.
+
+    Calls ``generate_dlt_comp_samples`` for the trend, adds the regression component
+    (when covariates are provided), and optionally applies a back-transform.
+
+    When ``covariates_df`` is supplied and ``"coef"`` is present in ``posteriors``,
+    ``end_step`` is inferred from the length of the covariates and must not be set
+    manually.  Without covariates, ``end_step`` is required.
 
     Args
     ----
     rng_key: JAX random key for reproducibility.
-    posteriors: xr.Dataset containing the posterior samples of the DLT model.
-    end_step: The step at which to stop generating forecasts.
+    posteriors: ``xr.Dataset`` returned by ``run_dlt_model``.
     lev_sm: Level smoothing factor.
     slp_sm: Slope smoothing factor.
     theta: Damping factor.
-    covariates_df: Optional; a pandas DataFrame containing the covariates with shape (n_steps, n_var).
-    transform_callback: Optional; a callable function to transform the forecast samples.
+    end_step: Total steps to forecast. Ignored (overridden) when covariates are given;
+        required otherwise.
+    covariates_df: Optional DataFrame of covariates, shape ``(n_steps, n_var)``.
+        Column names must match the ``var_name`` coordinate in ``posteriors``.
+    transform_callback: Optional callable applied element-wise to ``forecast_samples``
+        (e.g. to reverse a log transform).
 
     Returns
     -------
-    xr.Dataset containing:
-        - dlt_comp_samples: (sample, time) DLT component samples
-        - reg_comp_samples: (sample, time, var_name) regression component samples per covariate (if covariates provided)
-        - forecast_samples: (sample, time) combined forecast samples
+    xr.Dataset with dimensions ``(sample, time)`` containing:
+        ``dlt_comp_samples``, ``forecast_samples``, and (if regression)
+        ``reg_comp_samples`` with an additional ``var_name`` dimension.
     """
     if "coef" in posteriors and covariates_df is not None:
         # (n_samples, n_var)
@@ -404,7 +456,7 @@ def generate_forecast_samples(
         reg_comp_samples_total = 0
         has_regression = False
 
-    dlt_comp_samples = generate_dlt_comp_samples(
+    dlt_comp_samples = generate_dlt_components(
         rng_key,
         posteriors,
         end_step,
