@@ -10,7 +10,6 @@ from typing import Dict, Tuple
 from .utils import flatten_front_dim
 from .models.dlt import run_dlt_model
 
-
 logger = logging.getLogger("wunku")
 
 

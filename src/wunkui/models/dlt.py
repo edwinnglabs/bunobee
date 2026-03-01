@@ -11,7 +11,7 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
-from typing import Optional, Dict, Callable
+from typing import Any, Callable, Dict, Optional
 
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
@@ -29,12 +29,13 @@ def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: floa
     Args
     ----
     carry: Tuple ``(lev_prev, slp_prev)`` — the level and slope from the previous step.
-    inputs: In-sample mode: the scalar observation ``y_t``.
-            Out-of-sample mode (``oos=True``): a noise draw ``eps_t`` added to the forecast.
+    inputs: Tuple ``(y_t, eps_t)`` where ``y_t`` is the observation (use ``jnp.nan``
+        for out-of-sample steps) and ``eps_t`` is a noise draw.  When ``y_t`` is NaN
+        the forecast ``dlt_comp_t + eps_t`` is substituted as the pseudo-observation
+        so that the level and slope evolve stochastically out-of-sample.
     lev_sm: Level smoothing factor in ``[0, 1]``.
     slp_sm: Slope smoothing factor in ``[0, 1]``.
     theta: Damping factor applied to the slope each step.
-    oos: If ``True``, treats ``inputs`` as noise rather than observed values.
 
     Returns
     -------
@@ -78,7 +79,7 @@ def dlt_model(
     slp_sm: float,
     theta: float,
     y: jnp.ndarray,
-    reg_input: Optional[Dict[str, any]] = None,
+    reg_input: Optional[Dict[str, Any]] = None,
 ):
     """NumPyro probabilistic model for Damped Local Trend (DLT) time series.
 
@@ -180,7 +181,7 @@ def run_dlt_model(
     slp_sm: float,
     theta: float,
     y: np.ndarray,
-    mcmc_run_args: Dict[str, any],
+    mcmc_run_args: Dict[str, Any],
     regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: Optional[pd.DataFrame] = None,
 ) -> xr.Dataset:
@@ -320,7 +321,12 @@ def generate_dlt_components(
     For steps already covered by the fitted model (``step < n_train_steps``), the
     in-sample ``dlt_comp`` draws are returned directly.  For additional steps
     (``end_step > n_train_steps``), the DLT recursion is continued from the last
-    posterior level/slope using sampled noise.
+    posterior level/slope, with noise sampled from ``sigma`` posteriors driving
+    stochastic state evolution.
+
+    Note: the returned ``dlt_comp`` values are the *deterministic* one-step-ahead
+    forecasts (``lev + theta * slp``).  Noise only affects the level/slope trajectory
+    for subsequent steps, not the component values themselves.
 
     Args
     ----
@@ -331,6 +337,11 @@ def generate_dlt_components(
     lev_sm: Level smoothing factor.
     slp_sm: Slope smoothing factor.
     theta: Damping factor.
+    oos_y: Optional observed values for out-of-sample steps, shape
+        ``(n_oos_steps,)`` or ``(n_oos_steps, n_samples)``.  When provided,
+        actual observations replace the NaN pseudo-observations so the state
+        updates are conditioned on them (useful for out-of-sample evaluation).  Defaults to
+        all-NaN, meaning fully generative OOS simulation.
 
     Returns
     -------
@@ -346,34 +357,31 @@ def generate_dlt_components(
         n_samples, n_train_steps = dlt_comp_is_samples.shape
         logger.debug(f"dlt_comp_is_samples shape: {dlt_comp_is_samples.shape}")
         logger.info(f"Collecting in-sample forecasts from step 0 to {n_train_steps}.")
-        # (n_samples, )
-        sigma_samples = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
-        eps_samples = jax.random.normal(rng_key, shape=(n_samples, n_train_steps)) * sigma_samples[:, None]
-        # can noise for in sample dlt comp
-        dlt_comp_is_samples += eps_samples
-
-    # (n_samples, )
-    last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
-    last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
-
-    # float64 to make sure it works with both 32 or 64 bit
-    last_lev = jnp.asarray(last_lev, dtype=jnp.float64)
-    last_slp = jnp.asarray(last_slp, dtype=jnp.float64)
-
-    # log the shapes
-    logger.debug(f"sigma_samples shape: {sigma_samples.shape}")
-    logger.debug(f"last_lev shape: {last_lev.shape}")
-    logger.debug(f"last_slp shape: {last_slp.shape}")
 
     if end_step > n_train_steps:
         n_oos_steps = end_step - n_train_steps
+
+        # (n_samples, )
+        last_lev = flatten_front_dim(posteriors["last_lev"].to_numpy(), n=2)
+        last_slp = flatten_front_dim(posteriors["last_slp"].to_numpy(), n=2)
+
+        # float64 to make sure it works with both 32 or 64 bit
+        last_lev = jnp.asarray(last_lev, dtype=jnp.float64)
+        last_slp = jnp.asarray(last_slp, dtype=jnp.float64)
+
+        # log the shapes
+        logger.debug(f"last_lev shape: {last_lev.shape}")
+        logger.debug(f"last_slp shape: {last_slp.shape}")
 
         if oos_y is None:
             oos_y = jnp.full((n_oos_steps, n_samples), jnp.nan)
 
         logger.info(f"Generating out-of-sample forecasts from step {n_train_steps} to {end_step}.")
-        # (n_oos_steps, n_samples) — only draw for oos steps
-        eps_samples = jax.random.normal(rng_key, shape=(n_oos_steps, n_samples)) * sigma_samples
+
+        oos_steps = end_step - n_train_steps
+        # (n_oos_steps, n_samples)
+        eps_samples = generate_noise_components(rng_key, posteriors, oos_steps).transpose()
+
         # scan with the partial function
         _, all_states = lax.scan(
             lambda carry, inputs: dlt_transition_step(carry, inputs, lev_sm, slp_sm, theta),
@@ -396,6 +404,32 @@ def generate_dlt_components(
     return dlt_comp_samples
 
 
+def generate_noise_components(
+    rng_key: jnp.ndarray,
+    posteriors: xr.Dataset,
+    steps: int,
+) -> jnp.ndarray:
+    """Draw observation-noise samples scaled by posterior ``sigma``.
+
+    Args
+    ----
+    rng_key: JAX random key.
+    posteriors: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
+        ``sigma`` with dimensions ``(chain, draw)``.
+    steps: Number of time steps to generate noise for.
+
+    Returns
+    -------
+    jnp.ndarray of shape ``(n_samples, steps)`` where each row is an
+    independent draw from ``Normal(0, sigma_i)`` for posterior sample ``i``.
+    """
+    # (n_samples, )
+    sigma = flatten_front_dim(posteriors["sigma"].to_numpy(), n=2)
+    # samples with broadcasting sigma from (n_samples, ) to (n_samples, steps)
+    eps_samples = jax.random.normal(rng_key, shape=(sigma.shape[0], steps)) * sigma[:, None]
+    return eps_samples
+
+
 def make_inference(
     rng_key: jnp.ndarray,
     posteriors: xr.Dataset,
@@ -405,6 +439,7 @@ def make_inference(
     end_step: Optional[int] = None,
     covariates_df: Optional[pd.DataFrame] = None,
     transform_callback: Optional[Callable] = None,
+    noise_embed: bool = False,
 ) -> xr.Dataset:
     """Generate full forecast samples by combining DLT and regression components.
 
@@ -428,12 +463,19 @@ def make_inference(
         Column names must match the ``var_name`` coordinate in ``posteriors``.
     transform_callback: Optional callable applied element-wise to ``forecast_samples``
         (e.g. to reverse a log transform).
+    noise_embed: If ``True``, adds a draw from ``Normal(0, sigma)`` to
+        ``forecast_samples`` to represent observation-level uncertainty.  The
+        noise is sampled independently from the noise already used inside
+        ``generate_dlt_components`` for stochastic state evolution.
+        Defaults to ``False`` (return the deterministic trend + regression).
 
     Returns
     -------
     xr.Dataset with dimensions ``(sample, time)`` containing:
-        ``dlt_comp_samples``, ``forecast_samples``, and (if regression)
-        ``reg_comp_samples`` with an additional ``var_name`` dimension.
+        ``dlt_comp_samples``, ``eps_samples``, ``forecast_samples``, and
+        (if regression) ``reg_comp_samples`` with an additional ``var_name``
+        dimension.  ``forecast_samples`` equals
+        ``dlt_comp + reg_comp [+ eps]`` depending on ``noise_embed``.
     """
     if "coef" in posteriors and covariates_df is not None:
         # (n_samples, n_var)
@@ -460,11 +502,16 @@ def make_inference(
         reg_comp_samples_total = 0
         has_regression = False
 
+    rng_key = jax.random.split(rng_key, num=1)[0]
     dlt_comp_samples = generate_dlt_components(rng_key, posteriors, end_step, lev_sm, slp_sm, theta)
-
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
+    rng_key = jax.random.split(rng_key, num=1)[0]
+    eps_samples = generate_noise_components(rng_key, posteriors, end_step)
+
     forecast_samples = dlt_comp_samples + reg_comp_samples_total
+    if noise_embed:
+        forecast_samples = forecast_samples + eps_samples
     if transform_callback is not None:
         forecast_samples = transform_callback(forecast_samples)
 
@@ -475,6 +522,7 @@ def make_inference(
 
     data_vars = {
         "dlt_comp_samples": (["sample", "time"], np.asarray(dlt_comp_samples)),
+        "eps_samples": (["sample", "time"], np.asarray(eps_samples)),
         "forecast_samples": (["sample", "time"], np.asarray(forecast_samples)),
     }
 

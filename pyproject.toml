@@ -1,6 +1,6 @@
 [project]
 name = "wunkui"
-version = "0.0.1dev7"
+version = "0.0.1dev8"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
@@ -24,7 +24,7 @@ where = ["src"]
 
 [tool.black]
 line-length = 120
-target-version = ['py39', 'py310', 'py311']
+target-version = ['py311']
 include = '\.pyi?$'
 extend-exclude = ""
 
