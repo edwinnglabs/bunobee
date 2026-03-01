@@ -8,7 +8,6 @@ jax.config.update("jax_enable_x64", True)
 
 from wunkui.models.dlt import dlt_transition_step, run_dlt_model, make_inference
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
