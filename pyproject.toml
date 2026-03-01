@@ -1,14 +1,14 @@
 [project]
 name = "wunkui"
-version = "0.0.1dev6"
+version = "0.0.1dev7"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT License" }
 dependencies = [
-    "numpyro>=0.18.0",
-    "jax>=0.6.2",
+    "numpyro>=0.20.0",
+    "jax>=0.8.0",
     "pandas>=2.0",
     "arviz",
     "xarray",
@@ -27,3 +27,7 @@ line-length = 120
 target-version = ['py39', 'py310', 'py311']
 include = '\.pyi?$'
 extend-exclude = ""
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"

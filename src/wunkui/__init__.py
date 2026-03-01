@@ -1,2 +1,4 @@
+from importlib.metadata import version
+
 name = "wunku"
-__version__ = "0.0.1dev6"
+__version__ = version("wunkui")

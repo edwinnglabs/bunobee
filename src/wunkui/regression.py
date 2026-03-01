@@ -128,8 +128,8 @@ def make_fourier_series_with_index(n: int, period: Union[int, float], order: int
     Returns
     -------
     2D array-like
-        2D array in shape (n, 2 * order) where each column represents the series with a specific order 
-        fourier constructed by cos(i) for i = 1, 2, ... order then sin(j) for j = 1, 2, ... order. 
+        2D array in shape (n, 2 * order) where each column represents the series with a specific order
+        fourier constructed by cos(i) for i = 1, 2, ... order then sin(j) for j = 1, 2, ... order.
     Notes
     -----
         1. See https://otexts.com/fpp2/complexseasonality.html
@@ -139,11 +139,11 @@ def make_fourier_series_with_index(n: int, period: Union[int, float], order: int
     # (n, 1)
     t = np.expand_dims(np.arange(1, n + 1) + shift, -1)
     # shape (order,)
-    i = np.arange(1, order + 1)  
+    i = np.arange(1, order + 1)
     # shape (n, order)
-    x = 2.0 * np.pi * t * i / period  
-     # shape (n, 2 * order)
-    out = np.concatenate([np.cos(x), np.sin(x)], axis=1) 
+    x = 2.0 * np.pi * t * i / period
+    # shape (n, 2 * order)
+    out = np.concatenate([np.cos(x), np.sin(x)], axis=1)
     return out
 
 
@@ -177,9 +177,9 @@ def make_fourier_series_with_ts(dt_arr: pd.Series, period: Union[int, float], or
     t = np.expand_dims(t, -1)
 
     # shape (order,)
-    i = np.arange(1, order + 1)  
+    i = np.arange(1, order + 1)
     # shape (n, order)
-    x = 2.0 * np.pi * t * i / period  
-     # shape (n, 2 * order)
-    out = np.concatenate([np.cos(x), np.sin(x)], axis=1) 
+    x = 2.0 * np.pi * t * i / period
+    # shape (n, 2 * order)
+    out = np.concatenate([np.cos(x), np.sin(x)], axis=1)
     return out
