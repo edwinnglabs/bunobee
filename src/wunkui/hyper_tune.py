@@ -13,6 +13,7 @@ from .models.dlt import run_dlt_model
 
 logger = logging.getLogger("wunku")
 
+
 def slice_trend_single(trend_comp: jnp.ndarray, h: int) -> jnp.ndarray:
     """Slices a single trend into overlapping windows of size h.
 
@@ -36,6 +37,7 @@ def slice_trend_single(trend_comp: jnp.ndarray, h: int) -> jnp.ndarray:
     # (n_windows, h)
     return vmap(get_window)(t_indices)
 
+
 def slice_trend(trend_comp, h):
     """Slices multiple trends into overlapping windows of size h.
     Args
@@ -51,6 +53,7 @@ def slice_trend(trend_comp, h):
     # trends: shape (N_samples, T)
     return vmap(lambda trend_comp: slice_trend_single(trend_comp, h))(trend_comp)
 
+
 def generate_forecast_span_samples(posteriors: xr.Dataset, h: int) -> jnp.ndarray:
     # how to do a sliding window prediction?
     dlt_comp = flatten_front_dim(posteriors["dlt_comp"].to_numpy(), n=2)
@@ -59,16 +62,17 @@ def generate_forecast_span_samples(posteriors: xr.Dataset, h: int) -> jnp.ndarra
     logger.debug("dlt_comp shape:", dlt_comp.shape)
     logger.debug("reg_comp shape:", reg_comp.shape)
 
-    dlt_comp_slice = dlt_comp[:, :-(h-1), None]
+    dlt_comp_slice = dlt_comp[:, : -(h - 1), None]
     reg_comp_slice = slice_trend(reg_comp, h=h)
 
     # (n_samples, n_windows, h)
     yhat_span = dlt_comp_slice + reg_comp_slice
     return yhat_span
-    
+
+
 def compute_log_likelihood(yhat_span, sigma, y):
     """Computes the log likelihood of the forecasted span given the observations.
-    
+
     Args
     ----
     yhat_span: Forecasted span of shape (n_samples, n_windows, h).
@@ -92,11 +96,10 @@ def compute_log_likelihood(yhat_span, sigma, y):
     sq_error = (y_slice_broadcast - yhat_span) ** 2
 
     # compute log likelihood per (s, t, h)
-    log_prob = -0.5 * jnp.log(2 * jnp.pi) \
-               - jnp.log(sigma_broadcast) \
-               - 0.5 * sq_error / (sigma_broadcast ** 2)
+    log_prob = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_broadcast) - 0.5 * sq_error / (sigma_broadcast**2)
 
     return log_prob
+
 
 def compute_wbic(loglk: jnp.ndarray) -> float:
     """Compute Weighted Bayesian Information Criterion (WBIC) from log likelihood.
@@ -106,20 +109,16 @@ def compute_wbic(loglk: jnp.ndarray) -> float:
     """
     # in original paper, they use sum but it leads to unstable scale due to different size of datasets
     # we use mean instead
-    loglk_per_sample = jnp.nanmean(loglk, axis=(-1, -2)) 
+    loglk_per_sample = jnp.nanmean(loglk, axis=(-1, -2))
     # (n_steps * h, )
-    nobs = loglk.shape[-1] * loglk.shape[-2] 
-    beta = 1.0 / jnp.log(nobs)  
-    wbic = - (1.0 / beta) * jnp.nanmean(loglk_per_sample)
+    nobs = loglk.shape[-1] * loglk.shape[-2]
+    beta = 1.0 / jnp.log(nobs)
+    wbic = -(1.0 / beta) * jnp.nanmean(loglk_per_sample)
     wbic = float(wbic)
     return wbic
 
 
-def run_dlt_model_and_compute_wbic(
-    params: Tuple, 
-    data: Dict[str, np.ndarray],
-    h: int = 12
-) -> float:
+def run_dlt_model_and_compute_wbic(params: Tuple, data: Dict[str, np.ndarray], h: int = 12) -> float:
     lev_sm, slp_sm, theta = params
     y = data["y"]
     x_seas = data["x_seas"]
@@ -134,7 +133,7 @@ def run_dlt_model_and_compute_wbic(
         x_glb_trend=x_glb_trend,
         y=y,
     )
-    
+
     yhat_span = generate_forecast_span_samples(posteriors=posteriors, h=h)
     loglk = compute_log_likelihood(
         yhat_span=yhat_span,
@@ -146,11 +145,12 @@ def run_dlt_model_and_compute_wbic(
     print(f"WBIC: {wbic:.4f}")
     return wbic
 
+
 def hyper_tuning_dlt_with_wbic(
     data: Dict[str, np.ndarray],
     # forecast horizon
-    h: int = 12,  
-    n_calls: int = 15,                   
+    h: int = 12,
+    n_calls: int = 15,
     random_state: int = 42,
 ):
     print("Starting hyperparameter tuning for DLT model using WBIC...")
@@ -165,17 +165,17 @@ def hyper_tuning_dlt_with_wbic(
 
     # Define the hyperparam space
     search_space = [
-        Real(0.0001, 0.1, prior='log-uniform', name='lev_sm'),
-        Real(0.001, 0.1, prior='log-uniform', name='slp_sm'),
-        Real(0, 1., prior='uniform', name='theta'),
+        Real(0.0001, 0.1, prior="log-uniform", name="lev_sm"),
+        Real(0.001, 0.1, prior="log-uniform", name="slp_sm"),
+        Real(0, 1.0, prior="uniform", name="theta"),
     ]
 
     # Run Bayesian Optimization
     result = gp_minimize(
-        func=lambda params: run_dlt_model_and_compute_wbic(params=params, data=data, h=h),  
+        func=lambda params: run_dlt_model_and_compute_wbic(params=params, data=data, h=h),
         dimensions=search_space,
-        n_calls=n_calls,                   
-        random_state=random_state
+        n_calls=n_calls,
+        random_state=random_state,
     )
 
     return result
