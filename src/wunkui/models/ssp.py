@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpyro.distributions as dist
 from jax import lax, random
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("wunkui")
 
 
 def kalman_filter_1d(
@@ -24,6 +24,10 @@ def kalman_filter_1d(
     # (n_steps,)
     y: jnp.array,
     logp: bool = False,
+    # (n_steps, n_states) — observed latent state means; ignored where a_obs_var is inf
+    a_obs_loc: Optional[jnp.ndarray] = None,
+    # (n_steps, n_states) — observed latent state variances; inf = no information (pure filter)
+    a_obs_var: Optional[jnp.ndarray] = None,
 ) -> Tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.array, jnp.ndarray]:
     logger.debug("kalman_filter_1d inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
                  a0.shape, P0.shape, Z.shape, y.shape,
@@ -32,11 +36,24 @@ def kalman_filter_1d(
     sigma_h_sq = jnp.square(sigma_h)
     sigma_q_sq = jnp.square(sigma_q)
     p = len(y)
+    n_states = a0.shape[0]
 
-    def _transition_fn(carry, t):
+    # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
+    _a_obs_loc = a_obs_loc if a_obs_loc is not None else jnp.zeros((y.shape[0], n_states))
+    _a_obs_var = a_obs_var if a_obs_var is not None else jnp.full((y.shape[0], n_states), jnp.inf)
+
+    def _transition_fn(carry, xs):
         """transition function for Kalman filter"""
         # (n_states,), (n_states,), scalar
         at, Pt, log_p = carry
+        t, at_obs_loc_t, at_obs_var_t = xs
+
+        # Bayesian Gaussian fusion of filter prior N(at, Pt) with disclosed obs N(at_obs_loc_t, at_obs_var_t).
+        # at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
+        prec_filter = 1.0 / Pt
+        prec_obs    = 1.0 / at_obs_var_t
+        Pt          = 1.0 / (prec_filter + prec_obs)
+        at          = Pt * (prec_filter * at + prec_obs * at_obs_loc_t)
 
         # scalar
         yt = y[t]
@@ -70,7 +87,7 @@ def kalman_filter_1d(
     (_, _, log_p), (at, Pt, vt, Ft, Kt) = lax.scan(
         _transition_fn,
         (a0, P0, 0.0),
-        jnp.arange(y.shape[0]),
+        (jnp.arange(y.shape[0]), _a_obs_loc, _a_obs_var),
         length=y.shape[0],
     )
     return log_p, at, Pt, vt, Ft, Kt

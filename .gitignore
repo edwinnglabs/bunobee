@@ -168,3 +168,8 @@ push_package.sh
 .vscode/
 
 *settings.json
+
+# images
+*.png
+*.jpg
+*.jpeg
