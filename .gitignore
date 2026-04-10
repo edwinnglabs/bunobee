@@ -166,3 +166,5 @@ push_package.sh
 
 # vscode
 .vscode/
+
+*settings.json
