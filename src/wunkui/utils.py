@@ -3,6 +3,7 @@ import arviz as az
 import xarray as xr
 import pandas as pd
 import jax.numpy as jnp
+import numpy as np
 
 
 def generate_seed():

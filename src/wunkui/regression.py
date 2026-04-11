@@ -183,3 +183,50 @@ def make_fourier_series_with_ts(dt_arr: pd.Series, period: Union[int, float], or
     # shape (n, 2 * order)
     out = np.concatenate([np.cos(x), np.sin(x)], axis=1)
     return out
+
+
+def make_fourier_series(
+    n_steps: int, 
+    period: float, 
+    order: int,
+) -> np.ndarray:
+    """Build Fourier design matrix of shape (n_steps, 2*order)."""
+    t = np.arange(n_steps)
+    sins = np.stack([np.sin(2 * np.pi * i * t / period) for i in range(1, order + 1)], axis=1)
+    coss = np.stack([np.cos(2 * np.pi * i * t / period) for i in range(1, order + 1)], axis=1)
+    return np.concatenate([sins, coss], axis=1)
+
+
+def make_peridoic_dummies(
+    n_steps: int,
+    period: int,
+    drop_first: bool = True,
+) -> np.ndarray:
+    """Build periodic dummy design matrix of shape (n_steps, period - int(drop_first)).
+
+    Tiles an identity matrix of size (period, period) to cover n_steps, encoding
+    cyclic effects (e.g. day-of-week). The phase is anchored to step 0 = day 0 of
+    the cycle, so slicing [n_train:] on a longer array gives the correct future dummies.
+
+    Parameters
+    ----------
+    n_steps : int
+        Number of time steps.
+    period : int
+        Cycle length (e.g. 7 for weekly dummies).
+    drop_first : bool
+        If True, drop the first dummy column to avoid perfect multicollinearity
+        with an intercept term. Default True.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 design matrix of shape (n_steps, period - int(drop_first)).
+    """
+    import math
+
+    n_repeats = math.ceil(n_steps / period)
+    dummies = np.tile(np.eye(period, dtype=np.float32), (n_repeats, 1))[:n_steps]
+    if drop_first:
+        dummies = dummies[:, 1:]
+    return dummies
