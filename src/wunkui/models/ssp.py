@@ -28,47 +28,61 @@ def kalman_filter_1d(
     a_obs_loc: Optional[jnp.ndarray] = None,
     # (n_steps, n_states) — observed latent state variances; inf = no information (pure filter)
     a_obs_var: Optional[jnp.ndarray] = None,
+    # (n_states, )
+    positivity_idx: Optional[jnp.ndarray] = None,
 ) -> Tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.array, jnp.ndarray]:
+
     logger.debug("kalman_filter_1d inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
                  a0.shape, P0.shape, Z.shape, y.shape,
                  getattr(sigma_h, "shape", sigma_h),
                  getattr(sigma_q, "shape", sigma_q))
+
     sigma_h_sq = jnp.square(sigma_h)
     sigma_q_sq = jnp.square(sigma_q)
-    p = len(y)
     n_states = a0.shape[0]
 
     # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
+    _has_obs_fusion = a_obs_loc is not None or a_obs_var is not None
     _a_obs_loc = a_obs_loc if a_obs_loc is not None else jnp.zeros((y.shape[0], n_states))
     _a_obs_var = a_obs_var if a_obs_var is not None else jnp.full((y.shape[0], n_states), jnp.inf)
 
+    _has_positivity = positivity_idx is not None
+    _positivity_idx = positivity_idx if positivity_idx is not None else jnp.zeros(n_states, dtype=bool)
+    p = len(y)
+
     def _transition_fn(carry, xs):
         """transition function for Kalman filter"""
+
+        # ------ Unpack ------
         # (n_states,), (n_states,), scalar
         at, Pt, log_p = carry
         t, at_obs_loc_t, at_obs_var_t = xs
-
-        # Bayesian Gaussian fusion of filter prior N(at, Pt) with disclosed obs N(at_obs_loc_t, at_obs_var_t).
-        # at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
-        prec_filter = 1.0 / Pt
-        prec_obs    = 1.0 / at_obs_var_t
-        Pt          = 1.0 / (prec_filter + prec_obs)
-        at          = Pt * (prec_filter * at + prec_obs * at_obs_loc_t)
-
         # scalar
         yt = y[t]
         # (n_states,)
         Zt = Z[t]
 
+        # ------ Latent obs fusion (skipped entirely when no obs info provided) ------
+        if _has_obs_fusion:
+            # Bayesian Gaussian fusion of filter prior N(at, Pt) with disclosed obs
+            # N(at_obs_loc_t, at_obs_var_t).
+            # at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
+            prec_filter = 1.0 / Pt
+            prec_obs    = 1.0 / at_obs_var_t
+            Pt          = 1.0 / (prec_filter + prec_obs)
+            at          = Pt * (prec_filter * at + prec_obs * at_obs_loc_t)
+
+            # TODO: add logp if we observe latent states?
+
+        # ------ Prediction step ------
         # (n_states,) * (n_states,) -> sum -> (1,)
         yhat = jnp.sum(Zt * at, -1, keepdims=True)
 
+        # ------ Measurement step ------
         # scalar - (1,) -> (1,)
         vt = yt - yhat
-
         # (n_states,) * (n_states,) -> sum -> (1,)  +  scalar -> (1,)
         Ft = jnp.sum(Pt * jnp.square(Zt), -1, keepdims=True) + sigma_h_sq
-
         # (n_states,) * (n_states,) / (1,) -> (n_states,)
         Kt = Pt * Zt / Ft
 
@@ -76,11 +90,27 @@ def kalman_filter_1d(
         if logp:
             log_p += -0.5 * (p * jnp.log(2 * jnp.pi) + jnp.sum(jnp.log(Ft) + jnp.square(vt) / Ft))
 
+        # ------ Update step ------
+        # to enforce positivity after Kalman update, we can either
+        # in next measurement we use precision fusion
+        # however, we also need to ensure such condition
+        # when we return final estimate (assume we also do positivity in next step)
         # (n_states,) + (n_states,) * (1,) -> (n_states,)
         at = at + Kt * vt
+        # (n_states,) * (n_states,) - (n_states,) * (n_states,) * (1,) -> (n_states,)
+        Pt = Pt * (1 - Kt * Zt) + sigma_q_sq
 
-        # (n_states,) * (scalar - (n_states,)) + (n_states,) -> (n_states,)
-        Pt = Pt * (1 -  Kt) + sigma_q_sq
+        if _has_positivity:
+            enforce = _positivity_idx & (at < 0)
+            # soft adjustment jitter with 1e-3 to create numerically stable gap from zero
+            at_adj = jnp.where(enforce, 1e-3, at)
+            Pt_adj = jnp.where(enforce, 1e-3, Pt)
+            prec_filter = 1.0 / Pt
+            prec_obs    = 1.0 / Pt_adj
+            Pt          = 1.0 / (prec_filter + prec_obs)
+            at          = Pt * (prec_filter * at + prec_obs * at_adj)
+            # avoid exact boundary issues
+            at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
 
         return ((at, Pt, log_p), (at, Pt, vt, Ft, Kt))
 
