@@ -123,6 +123,184 @@ def kalman_filter_1d(
     return log_p, at, Pt, vt, Ft, Kt
 
 
+def kalman_filter_1d_ekf(
+    a0: jnp.ndarray,
+    P0: jnp.ndarray,
+    Z: jnp.ndarray,
+    sigma_h: Union[jnp.ndarray, float],
+    sigma_q: Union[jnp.ndarray, float],
+    y: jnp.ndarray,
+    logp: bool = False,
+    exponent: float = 0.5,
+    positivity_idx: Optional[jnp.ndarray] = None,
+    # (n_steps, n_states) — observed latent state means in a-space; ignored where a_obs_var is inf
+    a_obs_loc: Optional[jnp.ndarray] = None,
+    # (n_steps, n_states) — observed latent state variances in a-space; inf = no information
+    a_obs_var: Optional[jnp.ndarray] = None,
+) -> Tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """1D Extended Kalman Filter with log-state reparameterization.
+
+    Observation model: y_t = sum_i Z_{t,i} · h(a_{t,i}) + ε_t
+    State evolution:   a_t = a_{t-1} + η_t,  η_t ~ N(0, σ_q²)
+
+    For nonlinear states the observation function is h(a_i) = exp(exponent · a_i)
+    with Jacobian H_i = exponent · Z_i · exp(exponent · a_i).
+    For linear states h(a_i) = a_i and H_i = Z_i.
+
+    ``positivity_idx=None`` (default) applies the nonlinear mapping to all states.
+    Pass a boolean mask to make only selected states nonlinear; pass
+    ``jnp.zeros(n_states, dtype=bool)`` to recover a fully linear Kalman filter.
+
+    ``exponent=0.5`` (default, log-normal EKF) gives a softer nonlinearity:
+    a unit change in a_t scales the intensity by exp(0.5) ≈ 1.65.
+    ``exponent=1.0`` gives the standard log-state EKF (scale factor e ≈ 2.72).
+
+    Parameters
+    ----------
+    a0 : jnp.ndarray
+        (n_states,) Initial state mean in log-intensity space for nonlinear states,
+        direct value for linear states. To start at intensity v for a nonlinear
+        state, set a0 = log(v) / exponent.
+    P0 : jnp.ndarray
+        (n_states,) Initial state variance.
+    Z : jnp.ndarray
+        (n_steps, n_states) Design/measurement matrix.
+    sigma_h : Union[jnp.ndarray, float]
+        Scalar observation noise standard deviation.
+    sigma_q : Union[jnp.ndarray, float]
+        (n_states,) or scalar process noise standard deviation.
+    y : jnp.ndarray
+        (n_steps,) Observed values.
+    logp : bool, optional
+        If True, accumulate the approximate Gaussian log-likelihood, by default False.
+    exponent : float, optional
+        Exponent in the nonlinear mapping exp(exponent · a_t), by default 0.5.
+    positivity_idx : jnp.ndarray | None, optional
+        (n_states,) Boolean mask selecting nonlinear states. None → all states
+        are nonlinear. Pass jnp.zeros(n_states, dtype=bool) for a fully linear filter.
+    a_obs_loc : jnp.ndarray | None, optional
+        (n_steps, n_states) Disclosed latent state means in a-space — i.e. the
+        state **before** the exp(exponent · a) transformation. For nonlinear
+        states this is log-intensity space; for linear states it is the direct
+        value. Ignored at timesteps where the corresponding a_obs_var is inf.
+    a_obs_var : jnp.ndarray | None, optional
+        (n_steps, n_states) Disclosed latent state variances in a-space. Set to
+        inf (or omit) for timesteps / states with no external information. When
+        both a_obs_loc and a_obs_var are None the filter runs without any state
+        disclosure (default behaviour).
+
+    Returns
+    -------
+    log_p : float
+        Accumulated log-likelihood (0.0 if logp=False).
+    at : jnp.ndarray
+        (n_steps, n_states) Filtered state estimates. Recover intensities for
+        nonlinear states via jnp.exp(exponent * at).
+    Pt : jnp.ndarray
+        (n_steps, n_states) Filtered state variances.
+    vt_arr : jnp.ndarray
+        (n_steps,) Innovation at each step.
+    Ft_arr : jnp.ndarray
+        (n_steps,) Innovation variance at each step.
+    Kt_arr : jnp.ndarray
+        (n_steps, n_states) Kalman gain at each step.
+
+    Notes
+    -----
+    The Gaussian likelihood is a Laplace approximation — exact only for fully
+    linear models. The diagonal covariance approximation is maintained throughout.
+    State disclosure is a Bayesian precision-weighted fusion in a-space, applied
+    after the prediction step so that process noise is already included before
+    the linearisation point is updated.
+    """
+    logger.debug(
+        "kalman_filter_1d_ekf inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
+        a0.shape, P0.shape, Z.shape, y.shape,
+        getattr(sigma_h, "shape", sigma_h),
+        getattr(sigma_q, "shape", sigma_q),
+    )
+
+    sigma_h_sq = jnp.square(sigma_h)
+    sigma_q_sq = jnp.square(sigma_q)
+    n_states = a0.shape[0]
+
+    # None → all states use the nonlinear exp mapping
+    _positivity = positivity_idx if positivity_idx is not None else jnp.ones(n_states, dtype=bool)
+
+    # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
+    _has_obs_fusion = a_obs_loc is not None or a_obs_var is not None
+    _a_obs_loc = a_obs_loc if a_obs_loc is not None else jnp.zeros((y.shape[0], n_states))
+    _a_obs_var = a_obs_var if a_obs_var is not None else jnp.full((y.shape[0], n_states), jnp.inf)
+
+    def _ekf_step(carry, xs):
+        """Single EKF prediction–update step."""
+        at, Pt, log_p = carry
+        t, at_obs_loc_t, at_obs_var_t = xs
+
+        Zt = Z[t]
+        yt = y[t]
+
+        # Prediction (linear state evolution for all states)
+        a_pred = at
+        P_pred = Pt + sigma_q_sq
+
+        # ------ Latent state fusion in a-space (skipped when no obs info provided) ------
+        # Bayesian precision-weighted fusion of predicted state N(a_pred, P_pred)
+        # with disclosed a-space observation N(at_obs_loc_t, at_obs_var_t).
+        # at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
+        # Fusion happens after prediction so process noise is already absorbed
+        # before updating the linearisation point.
+        if _has_obs_fusion:
+            prec_filter = 1.0 / P_pred
+            prec_obs = 1.0 / at_obs_var_t
+            P_pred = 1.0 / (prec_filter + prec_obs)
+            a_pred = P_pred * (prec_filter * a_pred + prec_obs * at_obs_loc_t)
+
+        # exp(exponent·a_pred); clip to avoid overflow
+        exp_a = jnp.exp(jnp.clip(exponent * a_pred, -10.0, 10.0))
+
+        # Per-state effective observation value:
+        #   nonlinear states → exp(exponent·a),  linear states → a directly
+        a_eff = jnp.where(_positivity, exp_a, a_pred)
+
+        # Per-state Jacobian:
+        #   nonlinear states → exponent·Z·exp(exponent·a),  linear states → Z
+        Ht = jnp.where(_positivity, exponent * Zt * exp_a, Zt)
+
+        # Predicted observation
+        yhat = jnp.sum(Zt * a_eff)
+
+        # Innovation (scalar)
+        vt = yt - yhat
+
+        # Innovation variance: F_t = sum(P_pred · H_t²) + σ_h²
+        Ft = jnp.sum(P_pred * jnp.square(Ht)) + sigma_h_sq
+
+        # Kalman gain
+        Kt = P_pred * Ht / Ft
+
+        # Approximate Gaussian log-likelihood (Laplace approximation)
+        log_p = jnp.where(
+            logp,
+            log_p + -0.5 * (jnp.log(2 * jnp.pi) + jnp.log(Ft) + jnp.square(vt) / Ft),
+            log_p,
+        )
+
+        # Update (P(1 - KH) is the diagonal approximation of P - KHP)
+        at_new = a_pred + Kt * vt
+        Pt_new = P_pred * (1.0 - Kt * Ht)
+
+        return (at_new, Pt_new, log_p), (at_new, Pt_new, vt, Ft, Kt)
+
+    (_, _, log_p), (at, Pt, vt_arr, Ft_arr, Kt_arr) = lax.scan(
+        _ekf_step,
+        (a0, P0, 0.0),
+        (jnp.arange(y.shape[0]), _a_obs_loc, _a_obs_var),
+        length=y.shape[0],
+    )
+    return log_p, at, Pt, vt_arr, Ft_arr, Kt_arr
+
+
 def kalman_smoother(
     a0: jnp.ndarray,
     P0: jnp.ndarray,
