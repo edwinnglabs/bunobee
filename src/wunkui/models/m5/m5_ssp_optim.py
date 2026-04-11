@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+import logging
+
+import optax
+from jax import jit, value_and_grad
+import numpy as np
+import jax.numpy as jnp
+from numpyro import distributions as dist
+
+from ..ssp.univariate import kalman_filter_1d
+
+logger = logging.getLogger(__name__)
+
+def _softplus(x: jnp.ndarray) -> jnp.ndarray:
+    return jnp.log1p(jnp.exp(x))
+
+
+def _softplus_inv(v: float) -> float:
+    """Softplus inverse: maps a positive value to the unconstrained initialisation point."""
+    return float(np.log(np.expm1(float(v)) + 1e-12))
+
+
+def fit_one_series_opt(
+    sales: np.ndarray,
+    n_iter: int = 500,
+    lr: float = 3e-2,
+    Z: jnp.ndarray | None = None,
+    patience: int | None = 50,
+    tol: float = 1e-5,
+    log_every: int | None = None,
+) -> dict:
+    """Fit a local-level + weekly-seasonality SSP model via MAP (Adam optimiser).
+
+    Uses the same Kalman filter and prior specification as ``fit_one_series`` but
+    replaces NUTS with gradient-based MAP estimation — much faster, no posterior
+    uncertainty.
+
+    Parameters
+    ----------
+    sales : np.ndarray
+        1-D array of daily unit sales (n_steps,).
+    n_iter : int
+        Maximum number of Adam optimisation steps, by default 500.
+    lr : float
+        Adam learning rate, by default 3e-2.
+    Z : jnp.ndarray | None
+        (n_steps, n_states) pre-built design matrix. Pass ``Z_shared`` to avoid
+        redundant dummy builds when fitting many series of the same length.
+    patience : int | None
+        Stop early if the loss does not improve by more than ``tol`` for this
+        many consecutive steps. Set to ``None`` to disable early stopping.
+    tol : float
+        Minimum loss improvement to reset the patience counter, by default 1e-5.
+    log_every : int | None
+        Log loss at this step interval via DEBUG. ``None`` disables logging.
+
+    Returns
+    -------
+    dict
+        Keys: ``at`` (n_steps, n_states), ``sigma_h`` (float), ``sigma_q``
+        (n_states,), ``response_norm`` (float), ``Z``, ``a0``, ``P0``,
+        ``losses`` (list[float]), ``n_iter_run`` (int).
+    """
+    sales_clipped = np.clip(sales, 1e-1, None).astype(np.float32)
+    response_norm = float(sales_clipped.mean())
+    y = jnp.array(np.log(sales_clipped / response_norm))
+
+    n_states = Z.shape[1]
+
+    a0 = jnp.zeros(n_states)
+    P0 = jnp.ones(n_states)
+
+    def neg_log_posterior(params: jnp.ndarray) -> jnp.ndarray:
+        sigma_h = _softplus(params[0])
+        sigma_q_level = _softplus(params[1])
+        sigma_q_seas = _softplus(params[2])
+        sigma_q = jnp.concatenate([
+            sigma_q_level[None],
+            jnp.repeat(sigma_q_seas[None], n_states - 1),
+        ])
+
+        lp, _, _, _, _, _ = kalman_filter_1d(
+            a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
+            y=y, Z=Z, logp=True,
+        )
+
+        # Uniform priors: sigma_h ~ U(0.1, 1.0), sigma_q ~ U(0.01, 0.1)
+        log_prior = (
+            dist.Uniform(0.1, 1.0).log_prob(sigma_h)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
+        )
+        return -(lp + log_prior)
+
+    # Initialise unconstrained params at the midpoint of each uniform range
+    params = jnp.array([
+        _softplus_inv(0.55),   # sigma_h midpoint of U(0.1, 1.0)
+        _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
+        _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+    ])
+
+    optimizer = optax.adam(lr)
+    opt_state = optimizer.init(params)
+
+    @jit
+    def _step(params, opt_state):
+        loss, grads = value_and_grad(neg_log_posterior)(params)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        return optax.apply_updates(params, updates), new_opt_state, loss
+
+    losses: list[float] = []
+    best_loss = float("inf")
+    no_improve = 0
+
+    for i in range(n_iter):
+        params, opt_state, loss = _step(params, opt_state)
+        loss_val = float(loss)
+        losses.append(loss_val)
+
+        if log_every is not None and i % log_every == 0:
+            logger.debug("step %d  loss=%.6f", i, loss_val)
+
+        if patience is not None:
+            if best_loss - loss_val > tol:
+                best_loss = loss_val
+                no_improve = 0
+            else:
+                no_improve += 1
+            if no_improve >= patience:
+                logger.debug("early stop at step %d  loss=%.6f", i, loss_val)
+                break
+
+    sigma_h = float(_softplus(params[0]))
+    sigma_q_level = float(_softplus(params[1]))
+    sigma_q_seas = float(_softplus(params[2]))
+    sigma_q = jnp.concatenate([
+        jnp.array([sigma_q_level]),
+        jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1),
+    ])
+
+    _, at, _, _, _, _ = kalman_filter_1d(
+        a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
+        y=y, Z=Z, logp=False,
+    )
+
+    return {
+        "at": np.array(at),
+        "sigma_h": sigma_h,
+        "sigma_q": np.array(sigma_q),
+        "response_norm": response_norm,
+        "Z": Z,
+        "a0": a0,
+        "P0": P0,
+        "losses": losses,
+        "n_iter_run": len(losses),
+    }
+
+
+def predict_one_series_opt(
+    fit_result: dict,
+    Z_future: np.ndarray | None = None,
+) -> np.ndarray:
+    """Generate point forecast from a MAP-fitted single-series model.
+
+    Parameters
+    ----------
+    fit_result : dict
+        Output of ``fit_one_series_opt()``.
+    horizon : int
+        Number of future steps to forecast.
+    Z_future : np.ndarray | None
+        (horizon, n_states) pre-built future design matrix. Pass
+        ``Z_future_shared`` to avoid redundant work across many series.
+
+    Returns
+    -------
+    np.ndarray
+        Point forecasts of shape (horizon,).
+    """
+    at = fit_result["at"]
+    # sigma_h = fit_result["sigma_h"]
+    response_norm = fit_result["response_norm"]
+    # n_steps_data = at.shape[0]
+
+    a_last = at[-1]                     # (n_states,)
+    mu_future = Z_future @ a_last       # (horizon,)
+
+    # NOTE: we don't need to simulate eps as we just need point forecast
+
+    return np.exp(mu_future) * response_norm
