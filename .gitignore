@@ -173,3 +173,4 @@ push_package.sh
 *.png
 *.jpg
 *.jpeg
+*.nc
