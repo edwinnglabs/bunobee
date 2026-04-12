@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Union
 
 import jax.numpy as jnp
 import numpyro.distributions as dist
-from jax import lax, random
+from jax import lax, random, vmap
 
 logger = logging.getLogger("wunkui")
 
@@ -200,6 +200,72 @@ def kalman_filter_1d(
         length=y.shape[0],
     )
     return log_p, at, Pt, vt, Ft, Kt
+
+
+def kalman_filter_1d_batch(
+    a0: jnp.ndarray,
+    P0: jnp.ndarray,
+    Z: jnp.ndarray,
+    sigma_h: jnp.ndarray,
+    sigma_q: jnp.ndarray,
+    y: jnp.ndarray,
+    logp: bool = True,
+    chunk_size: int | None = 4096,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Batched Kalman filter over B independent series via ``jax.vmap``.
+
+    Wraps :func:`kalman_filter_1d` to process many series in parallel.
+    ``Z``, ``a0``, and ``P0`` are shared across all series; only ``y``,
+    ``sigma_h``, and ``sigma_q`` vary per series.
+
+    Parameters
+    ----------
+    a0 : jnp.ndarray, shape (n_states,)
+        Initial state mean, shared across all series.
+    P0 : jnp.ndarray, shape (n_states,)
+        Initial state variance (diagonal), shared across all series.
+    Z : jnp.ndarray, shape (n_steps, n_states)
+        Design / measurement matrix, shared across all series.
+    sigma_h : jnp.ndarray, shape (B,)
+        Per-series observation noise standard deviation.
+    sigma_q : jnp.ndarray, shape (B, n_states)
+        Per-series process noise standard deviation.
+    y : jnp.ndarray, shape (B, n_steps)
+        Observed time series for each of the B series.
+    logp : bool, optional
+        Accumulate the Gaussian log-likelihood. Default True.
+    chunk_size : int | None, optional
+        Process at most this many series per ``vmap`` call to limit peak
+        memory usage. ``None`` processes all series in one call.
+        Default 4096.
+
+    Returns
+    -------
+    log_p : jnp.ndarray, shape (B,)
+    at : jnp.ndarray, shape (B, n_steps, n_states)
+    Pt : jnp.ndarray, shape (B, n_steps, n_states)
+    vt : jnp.ndarray, shape (B, n_steps, 1)
+    Ft : jnp.ndarray, shape (B, n_steps, 1)
+    Kt : jnp.ndarray, shape (B, n_steps, n_states)
+    """
+    _kf = vmap(
+        lambda sh, sq, yi: kalman_filter_1d(
+            a0=a0, P0=P0, Z=Z, sigma_h=sh, sigma_q=sq, y=yi, logp=logp,
+        ),
+        in_axes=(0, 0, 0),
+    )
+
+    B = y.shape[0]
+    if chunk_size is None or B <= chunk_size:
+        return _kf(sigma_h, sigma_q, y)
+
+    # Process in chunks to limit peak memory
+    outs: list[tuple] = []
+    for start in range(0, B, chunk_size):
+        end = min(start + chunk_size, B)
+        outs.append(_kf(sigma_h[start:end], sigma_q[start:end], y[start:end]))
+
+    return tuple(jnp.concatenate([o[i] for o in outs], axis=0) for i in range(6))
 
 
 def kalman_filter_1d_ekf(
