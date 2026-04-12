@@ -175,3 +175,4 @@ push_package.sh
 *.jpeg
 *.nc
 *.npz
+*.pdf
