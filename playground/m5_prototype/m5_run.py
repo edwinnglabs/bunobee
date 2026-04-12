@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 from datetime import datetime
 from pathlib import Path
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -58,6 +60,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Adam learning rate.")
     p.add_argument("--chunk-size", type=int, default=4096, metavar="N",
                    help="Max series per vmap chunk (memory guard). 0 = no chunking.")
+    p.add_argument("--n-plot", type=int, default=50, metavar="N",
+                   help="Number of series to include in forecasts.pdf. 0 = all fitted series.")
+    p.add_argument("--plots-per-page", type=int, default=5, metavar="N",
+                   help="Forecast subplots per PDF page, by default 5.")
     return p.parse_args()
 
 
@@ -210,29 +216,45 @@ def main() -> None:
     logger.info("Saved diagnostics.png")
 
     # ------------------------------------------------------------------
-    # 6. Forecast plot (first n_plot series)
+    # 6. Forecast PDF (paginated, --plots-per-page series per page)
     # ------------------------------------------------------------------
-    n_plot = min(n_fit, 10)
+    n_plot = n_fit if args.n_plot == 0 else min(args.n_plot, n_fit)
+    per_page = args.plots_per_page
+    n_pages = math.ceil(n_plot / per_page)
     tail = 90
-    fig, axes = plt.subplots(n_plot, 1, figsize=(12, 3 * n_plot), sharex=True, squeeze=False)
-    axes = axes[:, 0]
+    pdf_path = run_dir / "forecasts.pdf"
 
-    for rank, (ax, idx) in enumerate(zip(axes, fit_idx[:n_plot])):
-        actual = sales_matrix[idx]
-        forecast = forecasts[rank]
-        ax.plot(range(tail), actual[-tail:], label="Actual", alpha=0.7)
-        ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast", linestyle="--", color="tomato")
-        ax.axvline(tail, color="grey", linestyle=":", alpha=0.5)
-        ax.set_title(series_ids[idx], fontsize=9, loc="left")
-        ax.set_ylabel("Units")
-        ax.legend(fontsize=8)
+    with PdfPages(pdf_path) as pdf:
+        for page in range(n_pages):
+            start = page * per_page
+            end = min(start + per_page, n_plot)
+            page_ranks = range(start, end)
+            n_rows = end - start
 
-    axes[-1].set_xlabel("Day")
-    fig.suptitle(f"{n_plot} series ({label}) — SSP batch forecast", y=1.01)
-    plt.tight_layout()
-    fig.savefig(run_dir / "forecasts.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved forecasts.png")
+            fig, axes = plt.subplots(n_rows, 1, figsize=(12, 3 * n_rows), sharex=True, squeeze=False)
+            axes = axes[:, 0]
+
+            for ax, rank in zip(axes, page_ranks):
+                idx = fit_idx[rank]
+                actual = sales_matrix[idx]
+                forecast = forecasts[rank]
+                ax.plot(range(tail), actual[-tail:], label="Actual", alpha=0.7)
+                ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast",
+                        linestyle="--", color="tomato")
+                ax.axvline(tail, color="grey", linestyle=":", alpha=0.5)
+                ax.set_title(series_ids[idx], fontsize=9, loc="left")
+                ax.set_ylabel("Units")
+                ax.legend(fontsize=8)
+
+            axes[-1].set_xlabel("Day")
+            fig.suptitle(
+                f"SSP batch forecast — {label}  (page {page + 1}/{n_pages})", y=1.01,
+            )
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    logger.info("Saved forecasts.pdf  (%d series, %d pages)", n_plot, n_pages)
 
     # ------------------------------------------------------------------
     # 7. Save fitted parameters
