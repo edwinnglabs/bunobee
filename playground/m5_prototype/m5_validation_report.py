@@ -121,8 +121,8 @@ def _reconstruct_forecasts(
     a0 = jnp.zeros(n_states)
     P0 = jnp.ones(n_states)
 
-    # Run batched Kalman filter to recover filtered states at MAP params
-    _, at, _, _, _, _ = kalman_filter_1d_batch(
+    # Run batched Kalman filter to recover filtered states and covariances at MAP params
+    _, at, Pt, _, _, _ = kalman_filter_1d_batch(
         a0=a0,
         P0=P0,
         Z=Z_shared,
@@ -134,10 +134,24 @@ def _reconstruct_forecasts(
     )
 
     at_np = np.asarray(at)  # (B, n_train, n_states)
+    Pt_np = np.asarray(Pt)  # (B, n_train, n_states) — diagonal variances
     a_last = at_np[:, -1, :]  # (B, n_states)
+    P_last = Pt_np[:, -1, :]  # (B, n_states)
 
-    mu_future = a_last @ np.asarray(Z_future).T  # (B, HORIZON_TOTAL)
-    forecasts = np.exp(mu_future) * response_norm[:, None]
+    Z_future_np = np.asarray(Z_future)  # (HORIZON_TOTAL, n_states)
+    mu_future = a_last @ Z_future_np.T  # (B, HORIZON_TOTAL)
+
+    # Predictive variance under random-walk states: P_{T+h} = P_T + h · σ_q²
+    # Var(y_{T+h}) = Σ_i Z_{T+h,i}² · (P_T,i + h · σ_q,i²) + σ_h²
+    # Lognormal back-transform needs +0.5·Var to be unbiased (Jensen correction).
+    h_steps = np.arange(1, Z_future_np.shape[0] + 1, dtype=np.float64)  # (HORIZON_TOTAL,)
+    sigma_q_sq = np.asarray(sigma_q) ** 2  # (B, n_states)
+    Z_sq = Z_future_np ** 2  # (HORIZON_TOTAL, n_states)
+    # (B, HORIZON_TOTAL): contribution from P_T (constant over h) + from accumulated process noise
+    var_state = P_last @ Z_sq.T + sigma_q_sq @ Z_sq.T * h_steps[None, :]
+    var_future = var_state + (np.asarray(sigma_h) ** 2)[:, None]  # (B, HORIZON_TOTAL)
+
+    forecasts = np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
     return forecasts, fit_idx
 
 
