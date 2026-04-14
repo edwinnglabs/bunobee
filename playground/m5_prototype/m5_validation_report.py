@@ -99,8 +99,13 @@ def _reconstruct_val_forecasts(
         raise RuntimeError("Training window too short to compute scale and states.")
 
     dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))
-    Z_val = jnp.asarray(_dow_dummies(dow[val_mask]))
+    # Level column prepended to match the Z layout used in m5_run.py.
+    dow_train = _dow_dummies(dow[train_mask])
+    dow_val = _dow_dummies(dow[val_mask])
+    ones_train = np.ones((dow_train.shape[0], 1), dtype=np.float32)
+    ones_val = np.ones((dow_val.shape[0], 1), dtype=np.float32)
+    Z_shared = jnp.asarray(np.concatenate([ones_train, dow_train], axis=1))
+    Z_val = jnp.asarray(np.concatenate([ones_val, dow_val], axis=1))
 
     if Z_val.shape[0] != HORIZON_VAL:
         raise RuntimeError(f"Expected validation horizon {HORIZON_VAL}, got {Z_val.shape[0]}")

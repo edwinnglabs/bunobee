@@ -149,8 +149,14 @@ def main() -> None:
     # 2. Build design matrices
     # ------------------------------------------------------------------
     dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))          # (n_train_steps, 6)
-    Z_future_shared = jnp.asarray(_dow_dummies(dow[val_mask]))     # (horizon, 6)
+    # Prepend a ones column (level state) so the model can track drift independently
+    # of the DOW seasonality. State layout: [level, tue, wed, thu, fri, sat, sun].
+    dow_train = _dow_dummies(dow[train_mask])                       # (n_train_steps, 6)
+    dow_val = _dow_dummies(dow[val_mask])                           # (horizon, 6)
+    ones_train = np.ones((dow_train.shape[0], 1), dtype=np.float32)
+    ones_val = np.ones((dow_val.shape[0], 1), dtype=np.float32)
+    Z_shared = jnp.asarray(np.concatenate([ones_train, dow_train], axis=1))        # (n_train_steps, 7)
+    Z_future_shared = jnp.asarray(np.concatenate([ones_val, dow_val], axis=1))     # (horizon, 7)
     logger.info("Z_shared: %s  Z_future_shared: %s", Z_shared.shape, Z_future_shared.shape)
 
     # ------------------------------------------------------------------
