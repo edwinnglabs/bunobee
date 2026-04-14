@@ -121,7 +121,7 @@ def _level_stats(
     }
 
 
-def _compute_hierarchical_wrmsse(
+def compute_hierarchical_wrmsse(
     ds: xr.Dataset,
     forecasts: np.ndarray,
     series_order: np.ndarray,
@@ -192,7 +192,7 @@ def main() -> None:
     logger.info("Loading dataset from %s", ds_path)
     ds = xr.open_dataset(ds_path)
 
-    per_level = _compute_hierarchical_wrmsse(ds, forecasts, series_order)
+    per_level = compute_hierarchical_wrmsse(ds, forecasts, series_order)
     final_wrmsse = float(per_level["wrmsse"].mean())
 
     logger.info("Per-level WRMSSE + bias (validation d_1914-d_1941):")
