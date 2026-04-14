@@ -86,19 +86,19 @@ def fit_one_series_opt(
             y=y, Z=Z, logp=True,
         )
 
-        # Uniform priors: sigma_h ~ U(0.1, 1.0), sigma_q ~ U(0.01, 0.1)
+        # sigma_h ~ U(0.1, 1.0); σ_q widened to U(0.001, 0.5) to allow trending series
         log_prior = (
             dist.Uniform(0.1, 1.0).log_prob(sigma_h)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
+            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_level)
+            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_seas)
         )
         return -(lp + log_prior)
 
-    # Initialise unconstrained params at the midpoint of each uniform range
+    # Initialise unconstrained params at the geometric midpoint of each range
     params = jnp.array([
-        _softplus_inv(0.55),   # sigma_h midpoint of U(0.1, 1.0)
-        _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
-        _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+        _softplus_inv(0.55),    # sigma_h midpoint of U(0.1, 1.0)
+        _softplus_inv(0.022),   # sigma_q_level midpoint of U(0.001, 0.5) in log-space
+        _softplus_inv(0.022),   # sigma_q_seas midpoint of U(0.001, 0.5) in log-space
     ])
 
     optimizer = optax.adam(lr)
@@ -140,13 +140,14 @@ def fit_one_series_opt(
         jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1),
     ])
 
-    _, at, _, _, _, _ = kalman_filter_1d(
+    _, at, Pt, _, _, _ = kalman_filter_1d(
         a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
         y=y, Z=Z, logp=False,
     )
 
     return {
         "at": np.array(at),
+        "Pt": np.array(Pt),          # (n_steps, n_states) filtered diagonal covariances
         "sigma_h": sigma_h,
         "sigma_q": np.array(sigma_q),
         "response_norm": response_norm,
@@ -162,17 +163,17 @@ def predict_one_series_opt(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Generate point forecast from a MAP-fitted single-series model.
+    """Generate lognormal-mean forecasts from a MAP-fitted single-series model.
+
+    Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
+    transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
 
     Parameters
     ----------
     fit_result : dict
         Output of ``fit_one_series_opt()``.
-    horizon : int
-        Number of future steps to forecast.
     Z_future : np.ndarray | None
-        (horizon, n_states) pre-built future design matrix. Pass
-        ``Z_future_shared`` to avoid redundant work across many series.
+        (horizon, n_states) pre-built future design matrix.
 
     Returns
     -------
@@ -180,16 +181,23 @@ def predict_one_series_opt(
         Point forecasts of shape (horizon,).
     """
     at = fit_result["at"]
-    # sigma_h = fit_result["sigma_h"]
+    Pt = fit_result["Pt"]                # (n_steps, n_states) diagonal covariances
+    sigma_h = float(fit_result["sigma_h"])
+    sigma_q = np.asarray(fit_result["sigma_q"])   # (n_states,)
     response_norm = fit_result["response_norm"]
-    # n_steps_data = at.shape[0]
 
-    a_last = at[-1]                     # (n_states,)
-    mu_future = Z_future @ a_last       # (horizon,)
+    Z_future = np.asarray(Z_future)      # (horizon, n_states)
+    a_last = at[-1]                      # (n_states,)
+    P_last = Pt[-1]                      # (n_states,) diagonal
+    mu_future = Z_future @ a_last        # (horizon,)
 
-    # NOTE: we don't need to simulate eps as we just need point forecast
+    # Predictive variance: P_{T+h} = P_T + h·σ_q², Var(y_{T+h}) = Σ Z²·P_{T+h} + σ_h²
+    h_steps = np.arange(1, Z_future.shape[0] + 1, dtype=np.float64)
+    Z_sq = Z_future ** 2                 # (horizon, n_states)
+    var_state = Z_sq @ P_last + (Z_sq @ (sigma_q ** 2)) * h_steps
+    var_future = var_state + sigma_h ** 2
 
-    return np.exp(mu_future) * response_norm
+    return np.exp(mu_future + 0.5 * var_future) * response_norm
 
 
 def fit_batch_series_opt(
@@ -244,9 +252,9 @@ def fit_batch_series_opt(
 
     init_params = jnp.tile(
         jnp.array([
-            _softplus_inv(0.55),
-            _softplus_inv(0.055),
-            _softplus_inv(0.055),
+            _softplus_inv(0.55),    # sigma_h midpoint of U(0.1, 1.0)
+            _softplus_inv(0.022),   # sigma_q_level midpoint of U(0.001, 0.5) in log-space
+            _softplus_inv(0.022),   # sigma_q_seas midpoint of U(0.001, 0.5) in log-space
         ]),
         (B, 1),
     )  # (B, 3)
@@ -269,10 +277,11 @@ def fit_batch_series_opt(
             y=y, logp=True, chunk_size=chunk_size,
         )
 
+        # sigma_h ~ U(0.1, 1.0); σ_q widened to U(0.001, 0.5) to allow trending series
         log_prior = (
             dist.Uniform(0.1, 1.0).log_prob(sigma_h)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
+            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_level)
+            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_seas)
         )  # (B,)
 
         per_series = -(log_p + log_prior)  # (B,)
@@ -313,14 +322,15 @@ def fit_batch_series_opt(
         jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
     ], axis=1)
 
-    # Final forward pass to get filtered states
-    _, at, _, _, _, _ = kalman_filter_1d_batch(
+    # Final forward pass to get filtered states and diagonal covariances
+    _, at, Pt, _, _, _ = kalman_filter_1d_batch(
         a0=a0, P0=P0, Z=Z, sigma_h=sigma_h, sigma_q=sigma_q,
         y=y, logp=False, chunk_size=chunk_size,
     )
 
     return {
         "at": np.array(at),            # (B, n_steps, n_states)
+        "Pt": np.array(Pt),            # (B, n_steps, n_states) filtered diagonal covariances
         "sigma_h": np.array(sigma_h),  # (B,)
         "sigma_q": np.array(sigma_q),  # (B, n_states)
         "response_norm": response_norm, # (B,)
@@ -335,7 +345,10 @@ def predict_batch_series_opt(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Generate point forecasts for B series from a batch-fitted model.
+    """Generate lognormal-mean forecasts for B series from a batch-fitted model.
+
+    Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
+    transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
 
     Parameters
     ----------
@@ -350,9 +363,20 @@ def predict_batch_series_opt(
         Point forecasts of shape (B, horizon).
     """
     at = fit_result["at"]                          # (B, n_steps, n_states)
+    Pt = fit_result["Pt"]                          # (B, n_steps, n_states) diagonal covariances
+    sigma_h = np.asarray(fit_result["sigma_h"])    # (B,)
+    sigma_q = np.asarray(fit_result["sigma_q"])    # (B, n_states)
     response_norm = fit_result["response_norm"]    # (B,)
 
+    Z_future = np.asarray(Z_future)                # (horizon, n_states)
     a_last = at[:, -1, :]                          # (B, n_states)
+    P_last = Pt[:, -1, :]                          # (B, n_states) diagonal
     mu_future = a_last @ Z_future.T                # (B, horizon)
 
-    return np.exp(mu_future) * response_norm[:, None]
+    # Predictive variance: P_{T+h} = P_T + h·σ_q², Var(y_{T+h}) = Σ Z²·P_{T+h} + σ_h²
+    h_steps = np.arange(1, Z_future.shape[0] + 1, dtype=np.float64)   # (horizon,)
+    Z_sq = Z_future ** 2                           # (horizon, n_states)
+    var_state = P_last @ Z_sq.T + (sigma_q ** 2) @ Z_sq.T * h_steps[None, :]
+    var_future = var_state + (sigma_h ** 2)[:, None]                   # (B, horizon)
+
+    return np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
