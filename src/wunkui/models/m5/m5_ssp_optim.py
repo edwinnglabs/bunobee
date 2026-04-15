@@ -86,19 +86,17 @@ def fit_one_series_opt(
             y=y, Z=Z, logp=True,
         )
 
-        # sigma_h ~ U(0.1, 1.0); σ_q widened to U(0.001, 0.5) to allow trending series
         log_prior = (
-            dist.Uniform(0.1, 1.0).log_prob(sigma_h)
-            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_level)
-            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_seas)
+            dist.Uniform(0.1, 0.5).log_prob(sigma_h)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
         )
         return -(lp + log_prior)
 
-    # Initialise unconstrained params at the geometric midpoint of each range
     params = jnp.array([
-        _softplus_inv(0.55),    # sigma_h midpoint of U(0.1, 1.0)
-        _softplus_inv(0.022),   # sigma_q_level midpoint of U(0.001, 0.5) in log-space
-        _softplus_inv(0.022),   # sigma_q_seas midpoint of U(0.001, 0.5) in log-space
+        _softplus_inv(0.30),   # sigma_h midpoint of U(0.1, 0.5)
+        _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
+        _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
     ])
 
     optimizer = optax.adam(lr)
@@ -183,7 +181,6 @@ def predict_one_series_opt(
     at = fit_result["at"]
     Pt = fit_result["Pt"]                # (n_steps, n_states) diagonal covariances
     sigma_h = float(fit_result["sigma_h"])
-    sigma_q = np.asarray(fit_result["sigma_q"])   # (n_states,)
     response_norm = fit_result["response_norm"]
 
     Z_future = np.asarray(Z_future)      # (horizon, n_states)
@@ -191,11 +188,14 @@ def predict_one_series_opt(
     P_last = Pt[-1]                      # (n_states,) diagonal
     mu_future = Z_future @ a_last        # (horizon,)
 
-    # Predictive variance: P_{T+h} = P_T + h·σ_q², Var(y_{T+h}) = Σ Z²·P_{T+h} + σ_h²
-    h_steps = np.arange(1, Z_future.shape[0] + 1, dtype=np.float64)
+    # Use P_last (terminal filtered variance) + σ_h² for Jensen correction.
+    # The daily random-walk drift h·σ_q² is excluded: the state transitions run
+    # every day but the seasonal states are only active once per week, so the
+    # daily accumulation inflates week-4 forecasts relative to week-1 with no
+    # basis in the observations. P_last already encodes σ_q implicitly via the
+    # converged Kalman filter, so the correction remains meaningful but horizon-flat.
     Z_sq = Z_future ** 2                 # (horizon, n_states)
-    var_state = Z_sq @ P_last + (Z_sq @ (sigma_q ** 2)) * h_steps
-    var_future = var_state + sigma_h ** 2
+    var_future = Z_sq @ P_last + sigma_h ** 2
 
     return np.exp(mu_future + 0.5 * var_future) * response_norm
 
@@ -252,9 +252,9 @@ def fit_batch_series_opt(
 
     init_params = jnp.tile(
         jnp.array([
-            _softplus_inv(0.55),    # sigma_h midpoint of U(0.1, 1.0)
-            _softplus_inv(0.022),   # sigma_q_level midpoint of U(0.001, 0.5) in log-space
-            _softplus_inv(0.022),   # sigma_q_seas midpoint of U(0.001, 0.5) in log-space
+            _softplus_inv(0.30),   # sigma_h midpoint of U(0.1, 0.5)
+            _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
+            _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
         ]),
         (B, 1),
     )  # (B, 3)
@@ -277,11 +277,10 @@ def fit_batch_series_opt(
             y=y, logp=True, chunk_size=chunk_size,
         )
 
-        # sigma_h ~ U(0.1, 1.0); σ_q widened to U(0.001, 0.5) to allow trending series
         log_prior = (
-            dist.Uniform(0.1, 1.0).log_prob(sigma_h)
-            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_level)
-            + dist.Uniform(0.001, 0.5).log_prob(sigma_q_seas)
+            dist.Uniform(0.1, 0.5).log_prob(sigma_h)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
+            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
         )  # (B,)
 
         per_series = -(log_p + log_prior)  # (B,)
@@ -365,7 +364,6 @@ def predict_batch_series_opt(
     at = fit_result["at"]                          # (B, n_steps, n_states)
     Pt = fit_result["Pt"]                          # (B, n_steps, n_states) diagonal covariances
     sigma_h = np.asarray(fit_result["sigma_h"])    # (B,)
-    sigma_q = np.asarray(fit_result["sigma_q"])    # (B, n_states)
     response_norm = fit_result["response_norm"]    # (B,)
 
     Z_future = np.asarray(Z_future)                # (horizon, n_states)
@@ -373,10 +371,13 @@ def predict_batch_series_opt(
     P_last = Pt[:, -1, :]                          # (B, n_states) diagonal
     mu_future = a_last @ Z_future.T                # (B, horizon)
 
-    # Predictive variance: P_{T+h} = P_T + h·σ_q², Var(y_{T+h}) = Σ Z²·P_{T+h} + σ_h²
-    h_steps = np.arange(1, Z_future.shape[0] + 1, dtype=np.float64)   # (horizon,)
+    # Use P_last (terminal filtered variance) + σ_h² for Jensen correction.
+    # The daily random-walk drift h·σ_q² is excluded: the state transitions run
+    # every day but the seasonal states are only active once per week, so the
+    # daily accumulation inflates week-4 forecasts relative to week-1 with no
+    # basis in the observations. P_last already encodes σ_q implicitly via the
+    # converged Kalman filter, so the correction remains meaningful but horizon-flat.
     Z_sq = Z_future ** 2                           # (horizon, n_states)
-    var_state = P_last @ Z_sq.T + (sigma_q ** 2) @ Z_sq.T * h_steps[None, :]
-    var_future = var_state + (sigma_h ** 2)[:, None]                   # (B, horizon)
+    var_future = P_last @ Z_sq.T + (sigma_h ** 2)[:, None]            # (B, horizon)
 
     return np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]

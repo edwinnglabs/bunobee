@@ -99,13 +99,8 @@ def _reconstruct_val_forecasts(
         raise RuntimeError("Training window too short to compute scale and states.")
 
     dow = ds["day_of_week"].values
-    # Level column prepended to match the Z layout used in m5_run.py.
-    dow_train = _dow_dummies(dow[train_mask])
-    dow_val = _dow_dummies(dow[val_mask])
-    ones_train = np.ones((dow_train.shape[0], 1), dtype=np.float32)
-    ones_val = np.ones((dow_val.shape[0], 1), dtype=np.float32)
-    Z_shared = jnp.asarray(np.concatenate([ones_train, dow_train], axis=1))
-    Z_val = jnp.asarray(np.concatenate([ones_val, dow_val], axis=1))
+    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))
+    Z_val = jnp.asarray(_dow_dummies(dow[val_mask]))
 
     if Z_val.shape[0] != HORIZON_VAL:
         raise RuntimeError(f"Expected validation horizon {HORIZON_VAL}, got {Z_val.shape[0]}")
@@ -136,13 +131,9 @@ def _reconstruct_val_forecasts(
     Z_val_np = np.asarray(Z_val)
     mu_future = a_last @ Z_val_np.T
 
-    # Predictive variance under random-walk states: P_{T+h} = P_T + h · σ_q²
-    # Lognormal back-transform needs +0.5·Var for unbiased mean (Jensen correction).
-    h_steps = np.arange(1, Z_val_np.shape[0] + 1, dtype=np.float64)
-    sigma_q_sq = np.asarray(sigma_q) ** 2
+    # Use P_last + σ_h² for Jensen correction — see predict_batch_series_opt.
     Z_sq = Z_val_np ** 2
-    var_state = P_last @ Z_sq.T + sigma_q_sq @ Z_sq.T * h_steps[None, :]
-    var_future = var_state + (np.asarray(sigma_h) ** 2)[:, None]
+    var_future = P_last @ Z_sq.T + (np.asarray(sigma_h) ** 2)[:, None]
 
     forecasts = np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
     return forecasts, fit_idx
