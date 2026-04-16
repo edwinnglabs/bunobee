@@ -71,6 +71,17 @@ EW
         Observed time series, one column per series.
     logp : bool, optional
         Accumulate the Gaussian log-likelihood. Default False.
+    a_obs_loc : jnp.ndarray | None, optional, shape (n_steps, n_states)
+        Externally disclosed latent state means. Set rows to zero and pair
+        with ``a_obs_var=inf`` at timesteps with no disclosure.
+    a_obs_var : jnp.ndarray | None, optional, shape (n_steps, n_states)
+        Externally disclosed latent state variances. Use ``jnp.inf`` for
+        timesteps / states with no external information. When both
+        ``a_obs_loc`` and ``a_obs_var`` are None the filter runs without
+        any state fusion.
+    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+        Boolean mask — True selects states that must remain non-negative.
+        ``None`` (default) disables positivity correction for all states.
 
     Returns
     -------
@@ -99,14 +110,34 @@ EW
     sigma_h_sq = jnp.broadcast_to(jnp.square(sigma_h), (n_series,))
     sigma_q_sq = jnp.broadcast_to(jnp.square(sigma_q), (n_states,))
 
+    # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
+    _has_obs_fusion = a_obs_loc is not None or a_obs_var is not None
+    _a_obs_loc = a_obs_loc if a_obs_loc is not None else jnp.zeros((y.shape[0], n_states))
+    _a_obs_var = a_obs_var if a_obs_var is not None else jnp.full((y.shape[0], n_states), jnp.inf)
+
+    _has_positivity = positivity_idx is not None
+    _positivity_idx = positivity_idx if positivity_idx is not None else jnp.zeros(n_states, dtype=bool)
+
     def _transition_fn(
         carry: tuple[jnp.ndarray, jnp.ndarray, float],
-        xs: tuple[jnp.ndarray, jnp.ndarray],
+        xs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[tuple, tuple]:
         at, Pt, log_p = carry
-        # (n_series,), (n_series, n_states)
-        yt, Zt = xs
+        # (n_series,), (n_series, n_states), (n_states,), (n_states,)
+        yt, Zt, at_obs_loc_t, at_obs_var_t = xs
 
+        # ------ Latent obs fusion (skipped entirely when no obs info provided) ------
+        if _has_obs_fusion:
+            # Precision-weighted Bayesian fusion: full-covariance prior + diagonal obs.
+            # When at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
+            prec_obs_diag = 1.0 / at_obs_var_t                         # (n_states,)
+            Pt_inv = jnp.linalg.solve(Pt, jnp.eye(n_states))          # (n_states, n_states)
+            P_fused_inv = Pt_inv + jnp.diag(prec_obs_diag)
+            Pt = jnp.linalg.solve(P_fused_inv, jnp.eye(n_states))
+            Pt = 0.5 * (Pt + Pt.T)
+            at = Pt @ (Pt_inv @ at + prec_obs_diag * at_obs_loc_t)
+
+        # ------ Prediction step ------
         # Predicted observations: (n_series,)
         yhat = Zt @ at
         vt = yt - yhat
@@ -123,19 +154,34 @@ EW
             mahal = vt @ jnp.linalg.solve(Ft, vt)
             log_p = log_p - 0.5 * (n_series * jnp.log(2.0 * jnp.pi) + log_det_F + mahal)
 
-        # State update
+        # ------ Update step ------
         at = at + Kt @ vt
 
         # Covariance update + process noise; symmetrize to prevent numerical drift
         Pt = Pt - Kt @ Zt @ Pt + jnp.diag(sigma_q_sq)
         Pt = 0.5 * (Pt + Pt.T)
 
+        # ------ Positivity correction ------
+        if _has_positivity:
+            enforce = _positivity_idx & (at < 0)
+            # Treat as pseudo-observation: observe a_i=1e-3 with var=1e-3 for violated states
+            pos_loc = jnp.where(enforce, 1e-3, 0.0)
+            pos_var = jnp.where(enforce, 1e-3, jnp.inf)
+            prec_obs_diag = 1.0 / pos_var                              # (n_states,)
+            Pt_inv = jnp.linalg.solve(Pt, jnp.eye(n_states))
+            P_fused_inv = Pt_inv + jnp.diag(prec_obs_diag)
+            Pt = jnp.linalg.solve(P_fused_inv, jnp.eye(n_states))
+            Pt = 0.5 * (Pt + Pt.T)
+            at = Pt @ (Pt_inv @ at + prec_obs_diag * pos_loc)
+            # Hard floor for numerical stability
+            at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
+
         return (at, Pt, log_p), (at, Pt, vt, Ft, Kt)
 
     (_, _, log_p), (at, Pt, vt, Ft, Kt) = lax.scan(
         _transition_fn,
         (a0, P0, 0.0),
-        (y, Z),
+        (y, Z, _a_obs_loc, _a_obs_var),
         length=y.shape[0],
     )
     return log_p, at, Pt, vt, Ft, Kt
