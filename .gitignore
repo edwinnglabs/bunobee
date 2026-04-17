@@ -176,3 +176,5 @@ push_package.sh
 *.nc
 *.npz
 *.pdf
+
+.research/
