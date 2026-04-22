@@ -5,7 +5,7 @@ import logging
 import jax.numpy as jnp
 from jax import lax
 
-logger = logging.getLogger("wunkui")
+logger = logging.getLogger(__name__)
 
 
 def kalman_filter_1d_st(
@@ -54,7 +54,7 @@ def kalman_filter_1d_st(
 
            a_t ← a_t + K_t v_t
            P_t ← P_t − K_t Z_t P_t + diag(σ_q²)    (symmetrized)
-    
+
     Parameters
     ----------
     a0 : jnp.ndarray, shape (n_states,)
@@ -122,6 +122,7 @@ def kalman_filter_1d_st(
         carry: tuple[jnp.ndarray, jnp.ndarray, float],
         xs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[tuple, tuple]:
+        """Single Kalman filter step: fuse latent obs, predict, update, enforce positivity."""
         at, Pt, log_p = carry
         # (n_series,), (n_series, n_states), (n_states,), (n_states,)
         yt, Zt, at_obs_loc_t, at_obs_var_t = xs
@@ -130,8 +131,10 @@ def kalman_filter_1d_st(
         if _has_obs_fusion:
             # Precision-weighted Bayesian fusion: full-covariance prior + diagonal obs.
             # When at_obs_var_t = inf → prec_obs = 0 → no-op (pure filter carry-through).
-            prec_obs_diag = 1.0 / at_obs_var_t                         # (n_states,)
-            Pt_inv = jnp.linalg.solve(Pt, jnp.eye(n_states))          # (n_states, n_states)
+            # (n_states,)
+            prec_obs_diag = 1.0 / at_obs_var_t
+            # (n_states, n_states)
+            Pt_inv = jnp.linalg.solve(Pt, jnp.eye(n_states))
             P_fused_inv = Pt_inv + jnp.diag(prec_obs_diag)
             Pt = jnp.linalg.solve(P_fused_inv, jnp.eye(n_states))
             Pt = 0.5 * (Pt + Pt.T)
@@ -167,7 +170,8 @@ def kalman_filter_1d_st(
             # Treat as pseudo-observation: observe a_i=1e-3 with var=1e-3 for violated states
             pos_loc = jnp.where(enforce, 1e-3, 0.0)
             pos_var = jnp.where(enforce, 1e-3, jnp.inf)
-            prec_obs_diag = 1.0 / pos_var                              # (n_states,)
+            # (n_states,)
+            prec_obs_diag = 1.0 / pos_var
             Pt_inv = jnp.linalg.solve(Pt, jnp.eye(n_states))
             P_fused_inv = Pt_inv + jnp.diag(prec_obs_diag)
             Pt = jnp.linalg.solve(P_fused_inv, jnp.eye(n_states))
@@ -312,6 +316,7 @@ def kalman_filter_1d_ekf_st(
         carry: tuple[jnp.ndarray, jnp.ndarray, float],
         xs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[tuple, tuple]:
+        """Single EKF step: predict, fuse latent obs, linearise, update."""
         at, Pt, log_p = carry
         yt, Zt, at_obs_loc_t, at_obs_var_t = xs
 
@@ -323,7 +328,8 @@ def kalman_filter_1d_ekf_st(
         # ------ State fusion in a-space (full-covariance form) ------
         # Bayesian precision-weighted fusion: when at_obs_var_t = inf → prec_obs = 0 → no-op.
         if _has_obs_fusion:
-            prec_obs_diag = 1.0 / at_obs_var_t                              # (n_states,)
+            # (n_states,)
+            prec_obs_diag = 1.0 / at_obs_var_t
             Pt_inv = jnp.linalg.solve(P_pred, jnp.eye(n_states))
             P_fused_inv = Pt_inv + jnp.diag(prec_obs_diag)
             P_pred = jnp.linalg.solve(P_fused_inv, jnp.eye(n_states))
@@ -332,27 +338,35 @@ def kalman_filter_1d_ekf_st(
 
         # ------ Linearise around a_pred ------
         # exp(exponent·a_pred); clip to avoid overflow
-        exp_a = jnp.exp(jnp.clip(exponent * a_pred, -10.0, 10.0))           # (n_states,)
+        # (n_states,)
+        exp_a = jnp.exp(jnp.clip(exponent * a_pred, -10.0, 10.0))
 
         # Per-state effective observation value: exp mapping or identity
-        a_eff = jnp.where(_positivity, exp_a, a_pred)                        # (n_states,)
+        # (n_states,)
+        a_eff = jnp.where(_positivity, exp_a, a_pred)
 
         # Per-state Jacobian scalar: d h(a_i)/d a_i
-        jac_diag = jnp.where(_positivity, exponent * exp_a, 1.0)             # (n_states,)
+        # (n_states,)
+        jac_diag = jnp.where(_positivity, exponent * exp_a, 1.0)
 
         # Linearised measurement matrix: H[j, i] = Z[j, i] * jac_diag[i]
-        Ht = Zt * jac_diag                                                    # (n_series, n_states)
+        # (n_series, n_states)
+        Ht = Zt * jac_diag
 
         # Predicted observations and innovations
-        yhat = Zt @ a_eff                                                     # (n_series,)
-        vt = yt - yhat                                                        # (n_series,)
+        # (n_series,)
+        yhat = Zt @ a_eff
+        # (n_series,)
+        vt = yt - yhat
 
         # ------ Update ------
         # Innovation covariance using linearised H (full matrix)
-        Ft = Ht @ P_pred @ Ht.T + jnp.diag(sigma_h_sq)                      # (n_series, n_series)
+        # (n_series, n_series)
+        Ft = Ht @ P_pred @ Ht.T + jnp.diag(sigma_h_sq)
 
         # Kalman gain via solve to avoid explicit inversion: K = P H.T F⁻¹
-        Kt = jnp.linalg.solve(Ft, Ht @ P_pred).T                             # (n_states, n_series)
+        # (n_states, n_series)
+        Kt = jnp.linalg.solve(Ft, Ht @ P_pred).T
 
         # Approximate multivariate Gaussian log-likelihood (Laplace approximation)
         if logp:
