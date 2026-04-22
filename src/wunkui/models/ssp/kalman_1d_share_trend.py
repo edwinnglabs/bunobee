@@ -54,7 +54,7 @@ def kalman_filter_1d_st(
 
            a_t ← a_t + K_t v_t
            P_t ← P_t − K_t Z_t P_t + diag(σ_q²)    (symmetrized)
-EW
+    
     Parameters
     ----------
     a0 : jnp.ndarray, shape (n_states,)
