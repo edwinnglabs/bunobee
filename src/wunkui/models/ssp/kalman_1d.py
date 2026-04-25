@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Union
 
 import jax.numpy as jnp
 import numpyro.distributions as dist
-from jax import lax, random, vmap
+from jax import lax
 
 logger = logging.getLogger("wunkui")
 
@@ -200,72 +200,6 @@ def kalman_filter_1d(
         length=y.shape[0],
     )
     return log_p, at, Pt, vt, Ft, Kt
-
-
-def kalman_filter_1d_batch(
-    a0: jnp.ndarray,
-    P0: jnp.ndarray,
-    Z: jnp.ndarray,
-    sigma_h: jnp.ndarray,
-    sigma_q: jnp.ndarray,
-    y: jnp.ndarray,
-    logp: bool = True,
-    chunk_size: int | None = 4096,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Batched Kalman filter over B independent series via ``jax.vmap``.
-
-    Wraps :func:`kalman_filter_1d` to process many series in parallel.
-    ``Z``, ``a0``, and ``P0`` are shared across all series; only ``y``,
-    ``sigma_h``, and ``sigma_q`` vary per series.
-
-    Parameters
-    ----------
-    a0 : jnp.ndarray, shape (n_states,)
-        Initial state mean, shared across all series.
-    P0 : jnp.ndarray, shape (n_states,)
-        Initial state variance (diagonal), shared across all series.
-    Z : jnp.ndarray, shape (n_steps, n_states)
-        Design / measurement matrix, shared across all series.
-    sigma_h : jnp.ndarray, shape (B,)
-        Per-series observation noise standard deviation.
-    sigma_q : jnp.ndarray, shape (B, n_states)
-        Per-series process noise standard deviation.
-    y : jnp.ndarray, shape (B, n_steps)
-        Observed time series for each of the B series.
-    logp : bool, optional
-        Accumulate the Gaussian log-likelihood. Default True.
-    chunk_size : int | None, optional
-        Process at most this many series per ``vmap`` call to limit peak
-        memory usage. ``None`` processes all series in one call.
-        Default 4096.
-
-    Returns
-    -------
-    log_p : jnp.ndarray, shape (B,)
-    at : jnp.ndarray, shape (B, n_steps, n_states)
-    Pt : jnp.ndarray, shape (B, n_steps, n_states)
-    vt : jnp.ndarray, shape (B, n_steps, 1)
-    Ft : jnp.ndarray, shape (B, n_steps, 1)
-    Kt : jnp.ndarray, shape (B, n_steps, n_states)
-    """
-    _kf = vmap(
-        lambda sh, sq, yi: kalman_filter_1d(
-            a0=a0, P0=P0, Z=Z, sigma_h=sh, sigma_q=sq, y=yi, logp=logp,
-        ),
-        in_axes=(0, 0, 0),
-    )
-
-    B = y.shape[0]
-    if chunk_size is None or B <= chunk_size:
-        return _kf(sigma_h, sigma_q, y)
-
-    # Process in chunks to limit peak memory
-    outs: list[tuple] = []
-    for start in range(0, B, chunk_size):
-        end = min(start + chunk_size, B)
-        outs.append(_kf(sigma_h[start:end], sigma_q[start:end], y[start:end]))
-
-    return tuple(jnp.concatenate([o[i] for o in outs], axis=0) for i in range(6))
 
 
 def kalman_filter_1d_ekf(
@@ -470,107 +404,108 @@ def kalman_filter_1d_ekf(
     return log_p, at, Pt, vt_arr, Ft_arr, Kt_arr
 
 
-def kalman_smoother(
-    a0: jnp.ndarray,
-    P0: jnp.ndarray,
-    sigma_h: Union[jnp.ndarray, float],
-    sigma_q: Union[jnp.ndarray, float],
-    obs: jnp.ndarray,
-    rng_key: jnp.ndarray,
-) -> jnp.ndarray:
+# this is simulation smoothing
+# def kalman_smoother(
+#     a0: jnp.ndarray,
+#     P0: jnp.ndarray,
+#     sigma_h: Union[jnp.ndarray, float],
+#     sigma_q: Union[jnp.ndarray, float],
+#     obs: jnp.ndarray,
+#     rng_key: jnp.ndarray,
+# ) -> jnp.ndarray:
 
-    # step 1. simulate obs based on non-optimized alpha
-    # step 2. run kalman smoother backward
-    # step 3. run kalman filter forward
-    # step 4. derive smoothed alpha for full dist. of alpha
+#     # step 1. simulate obs based on non-optimized alpha
+#     # step 2. run kalman smoother backward
+#     # step 3. run kalman filter forward
+#     # step 4. derive smoothed alpha for full dist. of alpha
 
-    n_steps = obs.shape[0]
-    sigma_q_sq = jnp.square(sigma_q)
+#     n_steps = obs.shape[0]
+#     sigma_q_sq = jnp.square(sigma_q)
 
-    rng_sub_keys = random.split(rng_key, 3)
-    # note that this alpha is ~ N(0, P0) not N(a0, P0)
-    init_sim_alpha = dist.Normal(0.0, 1.0).sample(
-        rng_sub_keys[0],
-    ) * jnp.sqrt(P0)
+#     rng_sub_keys = random.split(rng_key, 3)
+#     # note that this alpha is ~ N(0, P0) not N(a0, P0)
+#     init_sim_alpha = dist.Normal(0.0, 1.0).sample(
+#         rng_sub_keys[0],
+#     ) * jnp.sqrt(P0)
 
-    obs_noise = dist.Normal(0.0, 1.0).sample(
-        rng_sub_keys[1],
-        sample_shape=(n_steps, ),
-    ) * sigma_h
+#     obs_noise = dist.Normal(0.0, 1.0).sample(
+#         rng_sub_keys[1],
+#         sample_shape=(n_steps, ),
+#     ) * sigma_h
 
-    innov = dist.Normal(0.0, 1.0).sample(
-        rng_sub_keys[2],
-        sample_shape=(n_steps, ),
-    ) * sigma_q
+#     innov = dist.Normal(0.0, 1.0).sample(
+#         rng_sub_keys[2],
+#         sample_shape=(n_steps, ),
+#     ) * sigma_q
 
-    def sim_obs_fn(carry, t):
-        alpha_t = carry
+#     def sim_obs_fn(carry, t):
+#         alpha_t = carry
 
-        # observations simulate step
-        y_t = alpha_t + obs_noise[t]
-        alpha_t = alpha_t + innov[t]
-        return alpha_t, (alpha_t, y_t)
+#         # observations simulate step
+#         y_t = alpha_t + obs_noise[t]
+#         alpha_t = alpha_t + innov[t]
+#         return alpha_t, (alpha_t, y_t)
 
-    _, (alpha_plus, obs_plus) = lax.scan(
-        sim_obs_fn,
-        init=init_sim_alpha,
-        xs=jnp.arange(n_steps),
-        length=n_steps,
-    )
+#     _, (alpha_plus, obs_plus) = lax.scan(
+#         sim_obs_fn,
+#         init=init_sim_alpha,
+#         xs=jnp.arange(n_steps),
+#         length=n_steps,
+#     )
 
-    # output from scan has an additional shape in last dim
-    obs_diff = obs - jnp.squeeze(obs_plus, -1)
+#     # output from scan has an additional shape in last dim
+#     obs_diff = obs - jnp.squeeze(obs_plus, -1)
 
-    _, _, _, v, F, K = kalman_filter(
-        a0=a0,
-        P0=P0,
-        sigma_h=sigma_h,
-        sigma_q=sigma_q,
-        y=obs_diff,
-    )
+#     _, _, _, v, F, K = kalman_filter(
+#         a0=a0,
+#         P0=P0,
+#         sigma_h=sigma_h,
+#         sigma_q=sigma_q,
+#         y=obs_diff,
+#     )
 
-    def kalman_smoother_backward_fn(carry, t):
-        rt = carry
-        Lt = 1 - K[t]
-        rt = 1 / F[t] * v[t] + Lt * rt
+#     def kalman_smoother_backward_fn(carry, t):
+#         rt = carry
+#         Lt = 1 - K[t]
+#         rt = 1 / F[t] * v[t] + Lt * rt
 
-        return rt, rt
+#         return rt, rt
 
-    rT = jnp.zeros((1))
-    _, r = lax.scan(
-        kalman_smoother_backward_fn,
-        init=rT,
-        xs=jnp.arange(n_steps - 1, -1, -1),
-        length=n_steps,
-    )
+#     rT = jnp.zeros((1))
+#     _, r = lax.scan(
+#         kalman_smoother_backward_fn,
+#         init=rT,
+#         xs=jnp.arange(n_steps - 1, -1, -1),
+#         length=n_steps,
+#     )
 
-    r = jnp.squeeze(r, -1)
-    # flip on steps
-    r = jnp.flip(r, -1)
-    # include first step
-    r = jnp.concatenate([r, rT], -1)
+#     r = jnp.squeeze(r, -1)
+#     # flip on steps
+#     r = jnp.flip(r, -1)
+#     # include first step
+#     r = jnp.concatenate([r, rT], -1)
 
-    def kalman_smoother_forward_fn(carry, t):
-        alpha_t = carry
-        # correction of mean vector given lookahead data points
-        # note that r vector is appended with initial value;
-        # so t + 1 means t in the actual maths
-        alpha_t = alpha_t + sigma_q_sq * r[t + 1]
+#     def kalman_smoother_forward_fn(carry, t):
+#         alpha_t = carry
+#         # correction of mean vector given lookahead data points
+#         # note that r vector is appended with initial value;
+#         # so t + 1 means t in the actual maths
+#         alpha_t = alpha_t + sigma_q_sq * r[t + 1]
 
-        return alpha_t, alpha_t
+#         return alpha_t, alpha_t
 
-    alpha_0 = a0 + P0 * r[0]
+#     alpha_0 = a0 + P0 * r[0]
 
-    _, smoothed_obs_diff_alpha = lax.scan(
-        kalman_smoother_forward_fn,
-        init=alpha_0,
-        xs=jnp.arange(n_steps),
-        length=n_steps,
-    )   
+#     _, smoothed_obs_diff_alpha = lax.scan(
+#         kalman_smoother_forward_fn,
+#         init=alpha_0,
+#         xs=jnp.arange(n_steps),
+#         length=n_steps,
+#     )   
 
-    smoothed_alpha = alpha_plus + smoothed_obs_diff_alpha
-    # (n_steps, )
-    return jnp.squeeze(smoothed_alpha, -1)
+#     smoothed_alpha = alpha_plus + smoothed_obs_diff_alpha
+#     # (n_steps, )
+#     return jnp.squeeze(smoothed_alpha, -1)
 
 
 # def simulate_forecast(
