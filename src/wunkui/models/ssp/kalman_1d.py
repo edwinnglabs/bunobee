@@ -181,13 +181,16 @@ def kalman_filter_1d(
 
         if _has_positivity:
             enforce = _positivity_idx & (at < 0)
-            # soft adjustment jitter with 1e-3 to create numerically stable gap from zero
-            at_adj = jnp.where(enforce, 1e-3, at)
-            Pt_adj = jnp.where(enforce, 1e-3, Pt)
+            # Soft adjustment jitter with 1e-3 to create numerically stable gap from zero.
+            # Apply fusion only where enforce=True; otherwise leave (at, Pt) untouched —
+            # the previous unconditional fusion silently halved Pt every step for non-enforced
+            # states, collapsing the filter variance and corrupting the smoother.
             prec_filter = 1.0 / Pt
-            prec_obs    = 1.0 / Pt_adj
-            Pt          = 1.0 / (prec_filter + prec_obs)
-            at          = Pt * (prec_filter * at + prec_obs * at_adj)
+            prec_obs    = 1.0 / 1e-3
+            Pt_fused    = 1.0 / (prec_filter + prec_obs)
+            at_fused    = Pt_fused * (prec_filter * at + prec_obs * 1e-3)
+            Pt          = jnp.where(enforce, Pt_fused, Pt)
+            at          = jnp.where(enforce, at_fused, at)
             # avoid exact boundary issues
             at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
 
@@ -402,6 +405,126 @@ def kalman_filter_1d_ekf(
         length=y.shape[0],
     )
     return log_p, at, Pt, vt_arr, Ft_arr, Kt_arr
+
+
+def kalman_dk_smoother_1d(
+    at: jnp.ndarray,
+    Pt: jnp.ndarray,
+    vt: jnp.ndarray,
+    Ft: jnp.ndarray,
+    Kt: jnp.ndarray,
+    Z: jnp.ndarray,
+    a0: jnp.ndarray,
+    P0: jnp.ndarray,
+    a_obs_loc: Optional[jnp.ndarray] = None,
+    a_obs_var: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """Durbin-Koopman disturbance smoother for the diagonal 1D state-space model.
+
+    Runs a single backward pass over the stored filter quantities to recover
+    the full-data posterior mean ``E[α_t | Y_n]`` for all ``t``.  All inputs
+    except ``Z``, ``a0``, and ``P0`` are taken directly from the output of
+    :func:`kalman_filter_1d`, so no quantities need to be recomputed.
+
+    Backward recursion (Durbin & Koopman 2012 §4.4.4) extended to handle the
+    optional latent-state fusion that :func:`kalman_filter_1d` applies before
+    each y-update.  At every step we backward-process the y observation first,
+    then the fusion pseudo-observation (Z=I, mean=a_obs_loc, var=a_obs_var).
+    For the fusion obs, F_fusion = Z·P·Z' + H = P_pred + a_obs_var (per-state
+    diagonal), so::
+
+        L_y       = 1 − K_t ⊙ Z_t
+        r_after_y = Z_t ⊙ v_t / F_t + L_y ⊙ r_{t+1}
+        F_fusion  = P_pred_t + a_obs_var_t
+        L_fusion  = a_obs_var_t / F_fusion
+        r_t       = (a_obs_loc_t − a_pred_t) / F_fusion + L_fusion ⊙ r_after_y
+        α̂_t      = a_pred_t + P_pred_t ⊙ r_t
+
+    At undisclosed elements (``a_obs_var = inf``) the fusion contribution is
+    0 and ``L_fusion = 1``, recovering the standard D&K formula.
+
+    Because :func:`kalman_filter_1d` stores ``at[t]`` as the filtered posterior
+    and ``Pt[t]`` as ``P_{t|t} + σ_q²`` (the predicted variance for the *next*
+    step), the D&K predicted quantities are recovered by shifting::
+
+        a_pred = [a0, at[0], at[1], ..., at[T-2]]
+        P_pred = [P0, Pt[0], Pt[1], ..., Pt[T-2]]
+
+    Parameters
+    ----------
+    at : jnp.ndarray, shape (T, n_states)
+        Filtered state means from :func:`kalman_filter_1d`.
+    Pt : jnp.ndarray, shape (T, n_states)
+        Filtered state variances from :func:`kalman_filter_1d`.
+        Each ``Pt[t]`` stores ``P_{t|t} + σ_q²``, not the pure posterior.
+    vt : jnp.ndarray, shape (T, 1)
+        Innovations from :func:`kalman_filter_1d`.
+    Ft : jnp.ndarray, shape (T, 1)
+        Innovation variances from :func:`kalman_filter_1d`.
+    Kt : jnp.ndarray, shape (T, n_states)
+        Kalman gains from :func:`kalman_filter_1d`.
+    Z : jnp.ndarray, shape (T, n_states)
+        Design / measurement matrix (same as passed to the filter).
+    a0 : jnp.ndarray, shape (n_states,)
+        Initial state mean (same as passed to the filter).
+    P0 : jnp.ndarray, shape (n_states,)
+        Initial state variance (same as passed to the filter).
+    a_obs_loc : jnp.ndarray | None, optional, shape (T, n_states)
+        Disclosed latent state means passed to the filter.  Use ``None`` when
+        no fusion was applied.
+    a_obs_var : jnp.ndarray | None, optional, shape (T, n_states)
+        Disclosed latent state variances passed to the filter.  Use ``jnp.inf``
+        at undisclosed timesteps / states; ``None`` for no fusion at all.
+
+    Returns
+    -------
+    at_smooth : jnp.ndarray, shape (T, n_states)
+        Smoothed state means ``E[α_t | Y_n]``.
+    """
+    T, n_states = at.shape
+
+    # D&K predicted a_t, P_t: shift filter output by one and prepend initial conditions.
+    # These are also the *pre-fusion* values, since fusion happens at the start of
+    # each filter step (before any update).
+    a_pred = jnp.concatenate([a0[None], at[:-1]], axis=0)
+    P_pred = jnp.concatenate([P0[None], Pt[:-1]], axis=0)
+
+    # When no fusion was applied, default to inf variance (zero precision)
+    # so the fusion branch is a no-op.
+    if a_obs_loc is None or a_obs_var is None:
+        a_obs_loc = jnp.zeros((T, n_states))
+        a_obs_var = jnp.full((T, n_states), jnp.inf)
+
+    def _r_step(r_next: jnp.ndarray, t: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Single backward step: y-update first, then fusion pseudo-observation."""
+        # y observation contribution
+        Lt_y = 1.0 - Kt[t] * Z[t]
+        r_after_y = Z[t] * vt[t] / Ft[t] + Lt_y * r_next
+
+        # Fusion pseudo-observation: Z_fusion = I (per-state diagonal), so
+        # F_fusion = P_pred + a_obs_var and the contribution is
+        # (a_obs_loc - a_pred) / F_fusion.  Mask out elements with a_obs_var = inf
+        # (no disclosure) — there the contribution is 0 and L_fusion = 1.
+        finite = jnp.isfinite(a_obs_var[t])
+        safe_var = jnp.where(finite, a_obs_var[t], 1.0)
+        F_fusion = P_pred[t] + safe_var
+        fusion_v_term = jnp.where(
+            finite, (a_obs_loc[t] - a_pred[t]) / F_fusion, 0.0
+        )
+        Lt_fusion = jnp.where(finite, safe_var / F_fusion, 1.0)
+        r_t = fusion_v_term + Lt_fusion * r_after_y
+
+        return r_t, r_t
+
+    _, r_all = lax.scan(
+        _r_step,
+        jnp.zeros(n_states),
+        jnp.arange(T),
+        reverse=True,
+        length=T,
+    )
+
+    return a_pred + P_pred * r_all
 
 
 # this is simulation smoothing
