@@ -7,23 +7,23 @@ import jax.numpy as jnp
 logger = logging.getLogger("wunkui")
 
 
-def to_a_space(
-    a0: jnp.ndarray,
-    P0: jnp.ndarray,
-    sigma_q: jnp.ndarray | float,
-    a_obs_loc: jnp.ndarray | None,
-    a_obs_var: jnp.ndarray | None,
+def transform_to_ekf(
+    ssp_priors_nat: dict,
     positivity_idx: jnp.ndarray,
     exponent: float = 0.5,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, jnp.ndarray | None]:
-    """Convert natural-scale EKF priors to a-space via lognormal moment-matching.
+) -> dict:
+    """Transform a natural-scale prior dict into the EKF a-space prior dict.
 
-    Converts user-supplied priors on the natural/intensity scale (where
-    ``x = exp(exponent · a)``) into Gaussian parameters in a-space, so they
-    can be passed directly to ``kalman_filter_1d_ekf_st``. Only columns where
-    ``positivity_idx[i] = True`` are transformed; linear states pass through
-    unchanged. Entries of ``a_obs_var`` equal to ``jnp.inf`` are preserved
-    (undisclosed-timestep no-ops).
+    The input ``ssp_priors_nat`` is structured as if for a vanilla Kalman
+    filter — every entry lives in the natural / intensity scale and carries
+    the ``_nat`` suffix. The returned dict drops the suffix and contains the
+    same quantities expressed in a-space, ready for ``kalman_filter_1d_ekf``
+    (which uses the forward map ``x = exp(exponent · a)`` for positivity
+    states).
+
+    Only entries selected by ``positivity_idx`` are transformed; linear
+    states pass through unchanged. Entries of ``P_obs_nat`` equal to
+    ``jnp.inf`` are preserved as undisclosed-timestep no-ops.
 
     For each positivity state ``i`` with reference level ``μ_x_i > 0`` and
     variance ``σ_x_i² ≥ 0`` (with ``k = exponent``)::
@@ -33,7 +33,7 @@ def to_a_space(
         μ_a_i  = μ_y_i / k
         σ_a_i² = σ_y_i² / k²
 
-    Off-diagonals of ``P0``:
+    Off-diagonals of ``P0_nat``:
 
     * both states positivity: ``Cov(A_i, A_j) = log(1 + C_ij / (μ_x_i μ_x_j)) / k²``
     * mixed (one positivity, one linear): ``Cov(A_i, X_j) = C_ij / (k · μ_x_i)``
@@ -41,91 +41,159 @@ def to_a_space(
 
     Parameters
     ----------
-    a0 : jnp.ndarray, shape (n_states,)
-        Initial state mean in natural scale. Entries selected by
-        ``positivity_idx`` must be strictly positive.
-    P0 : jnp.ndarray, shape (n_states, n_states)
-        Initial state covariance in natural scale.
-    sigma_q : float or jnp.ndarray, shape () or (n_states,)
-        Process-noise standard deviation in natural scale. Treated as a
-        per-state std with reference level ``a0``.
-    a_obs_loc : jnp.ndarray | None, shape (n_steps, n_states)
-        Externally disclosed means in natural scale, or ``None``.
-    a_obs_var : jnp.ndarray | None, shape (n_steps, n_states)
-        Externally disclosed variances in natural scale, or ``None``. Entries
-        equal to ``jnp.inf`` mark undisclosed steps and are preserved.
-    positivity_idx : jnp.ndarray, shape (n_states,)
-        Boolean mask — True selects states that use the nonlinear ``exp``
-        mapping in ``kalman_filter_1d_ekf_st``.
+    ssp_priors_nat : dict
+        Natural-scale prior dictionary. Required keys:
+
+        - ``a0_nat`` : jnp.ndarray, shape ``(n_states,)`` — initial state
+          mean. Entries selected by ``positivity_idx`` must be strictly
+          positive.
+        - ``P0_nat`` : jnp.ndarray, shape ``(n_states, n_states)`` — initial
+          state covariance.
+        - ``sigma_q_loc_prior_nat`` : jnp.ndarray, shape ``(n_states,)`` or
+          ``(2,)`` — hyperprior loc for ``sigma_q``. Per-state form is
+          transformed element-wise against ``a0_nat``. Compressed form
+          ``[first_state, shared_remaining]`` is transformed against
+          ``a0_nat[:2]`` as representatives; callers using the compressed
+          form must arrange states ``1:`` to share a common positivity flag
+          and reference level.
+        - ``sigma_q_scale_prior_nat`` : jnp.ndarray, same shape as
+          ``sigma_q_loc_prior_nat`` — hyperprior scale for ``sigma_q``;
+          transformed via the same per-element formula as the loc.
+        - ``a_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
+          externally disclosed means.
+        - ``P_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
+          externally disclosed variances; ``jnp.inf`` marks undisclosed steps.
+        - ``obs_idx`` : array — disclosure index, passed through unchanged.
+
+    positivity_idx : jnp.ndarray, shape ``(n_states,)``
+        Boolean mask — ``True`` selects states that use the nonlinear
+        ``exp`` mapping in ``kalman_filter_1d_ekf``.
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k·a)``. Default 0.5.
 
     Returns
     -------
-    a0_a : jnp.ndarray, shape (n_states,)
-        a-space initial mean.
-    P0_a : jnp.ndarray, shape (n_states, n_states)
-        a-space initial covariance (symmetrized).
-    sigma_q_a : jnp.ndarray, shape (n_states,)
-        a-space process-noise standard deviation.
-    a_obs_loc_a : jnp.ndarray | None, shape (n_steps, n_states)
-        a-space observed means; ``None`` if input was ``None``.
-    a_obs_var_a : jnp.ndarray | None, shape (n_steps, n_states)
-        a-space observed variances; ``None`` if input was ``None``.
+    dict
+        a-space prior dictionary with un-suffixed keys: ``a0``, ``P0``
+        (full covariance, symmetrised), ``sigma_q_loc_prior``,
+        ``sigma_q_scale_prior``, ``a_obs``, ``P_obs``, ``obs_idx``.
 
     Raises
     ------
     ValueError
-        If exactly one of ``a_obs_loc`` / ``a_obs_var`` is ``None``.
+        If exactly one of ``a_obs_nat`` / ``P_obs_nat`` is ``None``.
+
+    Notes
+    -----
+    The hyperprior loc/scale transform is a pragmatic per-element
+    approximation: a TruncatedNormal in a-space is not strictly preserved
+    by the nonlinear map, but applying the same lognormal moment-match
+    formula to each element is the natural choice consistent with the
+    ``sigma_q`` transform.
     """
-    if (a_obs_loc is None) != (a_obs_var is None):
-        raise ValueError("a_obs_loc and a_obs_var must both be provided or both be None")
+    a0_nat = ssp_priors_nat["a0_nat"]
+    P0_nat = ssp_priors_nat["P0_nat"]
+    sigma_q_loc_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"])
+    sigma_q_scale_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"])
+    a_obs_nat = ssp_priors_nat.get("a_obs_nat")
+    P_obs_nat = ssp_priors_nat.get("P_obs_nat")
+    obs_idx = ssp_priors_nat.get("obs_idx")
+
+    if (a_obs_nat is None) != (P_obs_nat is None):
+        raise ValueError("a_obs_nat and P_obs_nat must both be provided or both be None")
+
+    if sigma_q_loc_prior_nat.shape != sigma_q_scale_prior_nat.shape:
+        raise ValueError(
+            "sigma_q_loc_prior_nat and sigma_q_scale_prior_nat must share the same shape; "
+            f"got {sigma_q_loc_prior_nat.shape} and {sigma_q_scale_prior_nat.shape}"
+        )
 
     k = exponent
-    n_states = a0.shape[0]
     positivity = jnp.asarray(positivity_idx, dtype=bool)
+    n_states = a0_nat.shape[0]
 
-    # Dummy of 1.0 for non-positivity states so log/divide remain finite
-    safe_a0 = jnp.where(positivity, a0, 1.0)
+    safe_init = jnp.where(positivity, a0_nat, 1.0)
 
-    # a0 and diag(P0): joint lognormal moment-match per positivity state
-    var_diag = jnp.diag(P0)
-    sigma_y_sq_diag = jnp.log1p(var_diag / jnp.square(safe_a0))
-    mu_y = jnp.log(safe_a0) - 0.5 * sigma_y_sq_diag
-    a0_a = jnp.where(positivity, mu_y / k, a0)
+    var_diag = jnp.diag(P0_nat)
+    sigma_y_sq_diag = jnp.log1p(var_diag / jnp.square(safe_init))
+    mu_y = jnp.log(safe_init) - 0.5 * sigma_y_sq_diag
+    a0 = jnp.where(positivity, mu_y / k, a0_nat)
 
-    # P0 full covariance: exact multivariate lognormal match for (pos, pos) pairs,
-    # delta-method hybrid for mixed pairs, identity for (lin, lin)
-    safe_a0_outer = safe_a0[:, None] * safe_a0[None, :]
-    cov_both = jnp.log1p(P0 / safe_a0_outer) / (k * k)
-    denom_i = jnp.where(positivity, k * safe_a0, 1.0)[:, None]
-    denom_j = jnp.where(positivity, k * safe_a0, 1.0)[None, :]
-    cov_mixed = P0 / (denom_i * denom_j)
+    safe_init_outer = safe_init[:, None] * safe_init[None, :]
+    cov_both = jnp.log1p(P0_nat / safe_init_outer) / (k * k)
+    denom_i = jnp.where(positivity, k * safe_init, 1.0)[:, None]
+    denom_j = jnp.where(positivity, k * safe_init, 1.0)[None, :]
+    cov_mixed = P0_nat / (denom_i * denom_j)
     pos_i = positivity[:, None]
     pos_j = positivity[None, :]
     both_pos = pos_i & pos_j
-    P0_a = jnp.where(both_pos, cov_both, cov_mixed)
-    P0_a = 0.5 * (P0_a + P0_a.T)
+    P0 = jnp.where(both_pos, cov_both, cov_mixed)
+    P0 = 0.5 * (P0 + P0.T)
 
-    # sigma_q as std with reference level a0
-    sigma_q_arr = jnp.broadcast_to(jnp.asarray(sigma_q), (n_states,))
-    sq_sigma_y_sq = jnp.log1p(jnp.square(sigma_q_arr) / jnp.square(safe_a0))
-    sigma_q_a = jnp.where(positivity, jnp.sqrt(sq_sigma_y_sq) / k, sigma_q_arr)
+    sigma_ref_level, sigma_positivity = _resolve_sigma_alignment(
+        sigma_q_loc_prior_nat.shape, n_states, safe_init, positivity
+    )
+    sigma_q_loc_prior = _moment_match_sigma(sigma_q_loc_prior_nat, sigma_ref_level, sigma_positivity, k)
+    sigma_q_scale_prior = _moment_match_sigma(sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k)
 
-    if a_obs_loc is None:
-        return a0_a, P0_a, sigma_q_a, None, None
+    if a_obs_nat is None:
+        a_obs = None
+        P_obs = None
+    else:
+        finite_var = jnp.isfinite(P_obs_nat)
+        safe_var_obs = jnp.where(finite_var, P_obs_nat, 0.0)
+        safe_loc_obs = jnp.where(a_obs_nat > 0, a_obs_nat, 1.0)
 
-    # Transform only positivity columns at timesteps with finite variance; leave
-    # undisclosed rows (var = inf) untouched so EKF fusion remains a no-op.
-    finite_var = jnp.isfinite(a_obs_var)
-    safe_var_obs = jnp.where(finite_var, a_obs_var, 0.0)
-    safe_loc_obs = jnp.where(a_obs_loc > 0, a_obs_loc, 1.0)
+        sigma_y_sq_obs = jnp.log1p(safe_var_obs / jnp.square(safe_loc_obs))
+        mu_y_obs = jnp.log(safe_loc_obs) - 0.5 * sigma_y_sq_obs
 
-    sigma_y_sq_obs = jnp.log1p(safe_var_obs / jnp.square(safe_loc_obs))
-    mu_y_obs = jnp.log(safe_loc_obs) - 0.5 * sigma_y_sq_obs
+        transform_mask = positivity[None, :] & finite_var
+        a_obs = jnp.where(transform_mask, mu_y_obs / k, a_obs_nat)
+        P_obs = jnp.where(transform_mask, sigma_y_sq_obs / (k * k), P_obs_nat)
 
-    transform_mask = positivity[None, :] & finite_var
-    a_obs_loc_a = jnp.where(transform_mask, mu_y_obs / k, a_obs_loc)
-    a_obs_var_a = jnp.where(transform_mask, sigma_y_sq_obs / (k * k), a_obs_var)
+    return {
+        "a0": a0,
+        "P0": P0,
+        "sigma_q_loc_prior": sigma_q_loc_prior,
+        "sigma_q_scale_prior": sigma_q_scale_prior,
+        "a_obs": a_obs,
+        "P_obs": P_obs,
+        "obs_idx": obs_idx,
+    }
 
-    return a0_a, P0_a, sigma_q_a, a_obs_loc_a, a_obs_var_a
+
+def _moment_match_sigma(
+    sigma_nat: jnp.ndarray,
+    ref_level: jnp.ndarray,
+    positivity: jnp.ndarray,
+    k: float,
+) -> jnp.ndarray:
+    """Apply per-state lognormal moment-match to a sigma-like array."""
+    sigma_arr = jnp.broadcast_to(jnp.asarray(sigma_nat), ref_level.shape)
+    sq_sigma_y_sq = jnp.log1p(jnp.square(sigma_arr) / jnp.square(ref_level))
+    return jnp.where(positivity, jnp.sqrt(sq_sigma_y_sq) / k, sigma_arr)
+
+
+def _resolve_sigma_alignment(
+    sigma_shape: tuple[int, ...],
+    n_states: int,
+    safe_init: jnp.ndarray,
+    positivity: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pick reference level and positivity mask aligned with the sigma prior shape.
+
+    Per-state input ``(n_states,)`` keeps full ``safe_init`` and ``positivity``.
+    Compressed input ``(2,)`` (with ``n_states != 2``) uses ``[state[0], state[1]]``
+    as representatives — ``state[1]`` stands in for the shared block at
+    ``states[1:]`` and the caller is responsible for that block being uniform.
+    """
+    if sigma_shape == (n_states,):
+        return safe_init, positivity
+    if sigma_shape == (2,) and n_states >= 2:
+        ref = jnp.array([safe_init[0], safe_init[1]])
+        pos = jnp.array([positivity[0], positivity[1]])
+        return ref, pos
+    raise ValueError(
+        "sigma_q prior shape must be (n_states,) or compressed (2,); "
+        f"got shape {sigma_shape} for n_states={n_states}"
+    )
