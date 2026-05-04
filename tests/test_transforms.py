@@ -6,7 +6,7 @@ import pytest
 
 jax.config.update("jax_enable_x64", True)
 
-from wunkui.models.ssp.transforms import to_a_space
+from wunkui.models.ssp.transforms import transform_to_ekf
 
 
 K = 0.5
@@ -18,122 +18,190 @@ def _closed_form(mu_x: float, var_x: float, k: float = K) -> tuple[float, float]
     return float(mu_y / k), float(sigma_y_sq / (k * k))
 
 
-class TestToASpace:
+def _make_priors(
+    a0_nat: jnp.ndarray,
+    P0_nat: jnp.ndarray,
+    sigma_loc: jnp.ndarray | float = 0.0,
+    sigma_scale: jnp.ndarray | float | None = None,
+    a_obs_nat: jnp.ndarray | None = None,
+    P_obs_nat: jnp.ndarray | None = None,
+) -> dict:
+    n_states = a0_nat.shape[0]
+    loc_arr = jnp.broadcast_to(jnp.asarray(sigma_loc, dtype=float), (n_states,))
+    scale_src = sigma_loc if sigma_scale is None else sigma_scale
+    scale_arr = jnp.broadcast_to(jnp.asarray(scale_src, dtype=float), (n_states,))
+    return {
+        "a0_nat": a0_nat,
+        "P0_nat": P0_nat,
+        "sigma_q_loc_prior_nat": loc_arr,
+        "sigma_q_scale_prior_nat": scale_arr,
+        "a_obs_nat": a_obs_nat,
+        "P_obs_nat": P_obs_nat,
+        "obs_idx": None,
+    }
+
+
+class TestTransformToEkf:
     def test_closed_form_match_positivity_state(self):
-        a0 = jnp.array([2.0, 5.0])
-        P0 = jnp.diag(jnp.array([0.25, 1.0]))
+        a0_nat = jnp.array([2.0, 5.0])
+        P0_nat = jnp.diag(jnp.array([0.25, 1.0]))
         positivity = jnp.array([True, True])
 
-        a0_a, P0_a, _, _, _ = to_a_space(a0, P0, 0.0, None, None, positivity, exponent=K)
+        out = transform_to_ekf(_make_priors(a0_nat, P0_nat), positivity, exponent=K)
 
         for i in range(2):
-            mu_ref, var_ref = _closed_form(float(a0[i]), float(P0[i, i]))
-            assert jnp.allclose(a0_a[i], mu_ref, atol=1e-12)
-            assert jnp.allclose(P0_a[i, i], var_ref, atol=1e-12)
+            mu_ref, var_ref = _closed_form(float(a0_nat[i]), float(P0_nat[i, i]))
+            assert jnp.allclose(out["a0"][i], mu_ref, atol=1e-12)
+            assert jnp.allclose(out["P0"][i, i], var_ref, atol=1e-12)
 
     def test_linear_state_passthrough(self):
-        a0 = jnp.array([1.5, -3.0, 7.0])
-        P0 = jnp.array([[0.2, 0.05, 0.0], [0.05, 0.4, 0.0], [0.0, 0.0, 0.9]])
+        a0_nat = jnp.array([1.5, -3.0, 7.0])
+        P0_nat = jnp.array([[0.2, 0.05, 0.0], [0.05, 0.4, 0.0], [0.0, 0.0, 0.9]])
         sigma_q = jnp.array([0.1, 0.2, 0.3])
         positivity = jnp.zeros(3, dtype=bool)
 
-        a0_a, P0_a, sigma_q_a, _, _ = to_a_space(a0, P0, sigma_q, None, None, positivity, exponent=K)
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_nat, sigma_loc=sigma_q),
+            positivity,
+            exponent=K,
+        )
 
-        assert jnp.allclose(a0_a, a0)
-        assert jnp.allclose(P0_a, P0)
-        assert jnp.allclose(sigma_q_a, sigma_q)
+        assert jnp.allclose(out["a0"], a0_nat)
+        assert jnp.allclose(out["P0"], P0_nat)
+        assert jnp.allclose(out["sigma_q_loc_prior"], sigma_q)
+        assert jnp.allclose(out["sigma_q_scale_prior"], sigma_q)
 
     def test_inf_variance_preserved(self):
         n_steps, n_states = 3, 2
-        a0 = jnp.array([1.0, 1.0])
-        P0 = jnp.eye(2)
+        a0_nat = jnp.array([1.0, 1.0])
+        P0_nat = jnp.eye(2)
         positivity = jnp.array([True, True])
 
-        a_obs_loc = jnp.zeros((n_steps, n_states))
-        a_obs_var = jnp.full((n_steps, n_states), jnp.inf)
-        # one finite disclosure at (t=1, state=0)
-        a_obs_loc = a_obs_loc.at[1, 0].set(2.0)
-        a_obs_var = a_obs_var.at[1, 0].set(0.5)
+        a_obs_nat = jnp.zeros((n_steps, n_states))
+        P_obs_nat = jnp.full((n_steps, n_states), jnp.inf)
+        a_obs_nat = a_obs_nat.at[1, 0].set(2.0)
+        P_obs_nat = P_obs_nat.at[1, 0].set(0.5)
 
-        _, _, _, loc_a, var_a = to_a_space(a0, P0, 0.1, a_obs_loc, a_obs_var, positivity, exponent=K)
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_nat, sigma_loc=0.1, a_obs_nat=a_obs_nat, P_obs_nat=P_obs_nat),
+            positivity,
+            exponent=K,
+        )
 
-        # Undisclosed rows: var stays inf, loc stays at its original (zero) value
-        inf_mask = jnp.isinf(a_obs_var)
-        assert jnp.all(jnp.isinf(var_a[inf_mask]))
-        assert jnp.allclose(loc_a[inf_mask], a_obs_loc[inf_mask])
+        inf_mask = jnp.isinf(P_obs_nat)
+        assert jnp.all(jnp.isinf(out["P_obs"][inf_mask]))
+        assert jnp.allclose(out["a_obs"][inf_mask], a_obs_nat[inf_mask])
 
-        # Disclosed entry matches the closed-form lognormal match
         mu_ref, var_ref = _closed_form(2.0, 0.5)
-        assert jnp.allclose(loc_a[1, 0], mu_ref, atol=1e-12)
-        assert jnp.allclose(var_a[1, 0], var_ref, atol=1e-12)
+        assert jnp.allclose(out["a_obs"][1, 0], mu_ref, atol=1e-12)
+        assert jnp.allclose(out["P_obs"][1, 0], var_ref, atol=1e-12)
 
     def test_mixed_positivity_covariance(self):
-        a0 = jnp.array([2.0, 3.0])
-        P0 = jnp.array([[0.5, 0.1], [0.1, 0.4]])
+        a0_nat = jnp.array([2.0, 3.0])
+        P0_nat = jnp.array([[0.5, 0.1], [0.1, 0.4]])
         positivity = jnp.array([True, False])
 
-        _, P0_a, _, _, _ = to_a_space(a0, P0, 0.0, None, None, positivity, exponent=K)
+        out = transform_to_ekf(_make_priors(a0_nat, P0_nat), positivity, exponent=K)
 
-        # (0,0): full lognormal match using mu=2, var=0.5
         _, var00_ref = _closed_form(2.0, 0.5)
-        assert jnp.allclose(P0_a[0, 0], var00_ref, atol=1e-12)
+        assert jnp.allclose(out["P0"][0, 0], var00_ref, atol=1e-12)
 
-        # (1,1): linear/linear passthrough
-        assert jnp.allclose(P0_a[1, 1], P0[1, 1], atol=1e-12)
+        assert jnp.allclose(out["P0"][1, 1], P0_nat[1, 1], atol=1e-12)
 
-        # (0,1) mixed: delta-method — Cov / (k · mu_x_0)
-        mixed_ref = float(P0[0, 1]) / (K * float(a0[0]))
-        assert jnp.allclose(P0_a[0, 1], mixed_ref, atol=1e-12)
-        assert jnp.allclose(P0_a[1, 0], mixed_ref, atol=1e-12)
+        mixed_ref = float(P0_nat[0, 1]) / (K * float(a0_nat[0]))
+        assert jnp.allclose(out["P0"][0, 1], mixed_ref, atol=1e-12)
+        assert jnp.allclose(out["P0"][1, 0], mixed_ref, atol=1e-12)
 
     def test_both_positivity_off_diagonal(self):
-        a0 = jnp.array([2.0, 3.0])
-        P0 = jnp.array([[0.5, 0.2], [0.2, 0.4]])
+        a0_nat = jnp.array([2.0, 3.0])
+        P0_nat = jnp.array([[0.5, 0.2], [0.2, 0.4]])
         positivity = jnp.array([True, True])
 
-        _, P0_a, _, _, _ = to_a_space(a0, P0, 0.0, None, None, positivity, exponent=K)
+        out = transform_to_ekf(_make_priors(a0_nat, P0_nat), positivity, exponent=K)
 
         off_ref = float(jnp.log1p(jnp.array(0.2 / (2.0 * 3.0))) / (K * K))
-        assert jnp.allclose(P0_a[0, 1], off_ref, atol=1e-12)
-        assert jnp.allclose(P0_a[1, 0], off_ref, atol=1e-12)
+        assert jnp.allclose(out["P0"][0, 1], off_ref, atol=1e-12)
+        assert jnp.allclose(out["P0"][1, 0], off_ref, atol=1e-12)
 
     def test_sigma_q_lognormal_match(self):
-        a0 = jnp.array([2.0, 4.0])
-        P0 = jnp.eye(2)
+        a0_nat = jnp.array([2.0, 4.0])
+        P0_nat = jnp.eye(2)
         sigma_q = jnp.array([0.3, 0.5])
         positivity = jnp.array([True, False])
 
-        _, _, sq_a, _, _ = to_a_space(a0, P0, sigma_q, None, None, positivity, exponent=K)
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_nat, sigma_loc=sigma_q),
+            positivity,
+            exponent=K,
+        )
 
         _, var_ref = _closed_form(2.0, 0.3**2)
-        assert jnp.allclose(sq_a[0] ** 2, var_ref, atol=1e-12)
-        # linear state: passthrough
-        assert jnp.allclose(sq_a[1], sigma_q[1], atol=1e-12)
+        assert jnp.allclose(out["sigma_q_loc_prior"][0] ** 2, var_ref, atol=1e-12)
+        assert jnp.allclose(out["sigma_q_loc_prior"][1], sigma_q[1], atol=1e-12)
 
-    def test_scalar_sigma_q_broadcasts(self):
-        a0 = jnp.array([1.0, 2.0])
-        P0 = jnp.eye(2)
+    def test_scalar_sigma_broadcasts(self):
+        a0_nat = jnp.array([1.0, 2.0])
+        P0_nat = jnp.eye(2)
         positivity = jnp.array([True, True])
 
-        _, _, sq_a, _, _ = to_a_space(a0, P0, 0.1, None, None, positivity, exponent=K)
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_nat, sigma_loc=0.1),
+            positivity,
+            exponent=K,
+        )
 
-        assert sq_a.shape == (2,)
+        assert out["sigma_q_loc_prior"].shape == (2,)
+        assert out["sigma_q_scale_prior"].shape == (2,)
+
+    def test_hyperprior_loc_and_scale_use_same_formula(self):
+        a0_nat = jnp.array([3.0, 6.0])
+        P0_nat = jnp.eye(2)
+        sigma_loc = jnp.array([0.4, 0.2])
+        sigma_scale = jnp.array([0.05, 0.1])
+        positivity = jnp.array([True, True])
+
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_nat, sigma_loc=sigma_loc, sigma_scale=sigma_scale),
+            positivity,
+            exponent=K,
+        )
+
+        for i in range(2):
+            _, loc_var_ref = _closed_form(float(a0_nat[i]), float(sigma_loc[i] ** 2))
+            _, scale_var_ref = _closed_form(float(a0_nat[i]), float(sigma_scale[i] ** 2))
+            assert jnp.allclose(out["sigma_q_loc_prior"][i] ** 2, loc_var_ref, atol=1e-12)
+            assert jnp.allclose(out["sigma_q_scale_prior"][i] ** 2, scale_var_ref, atol=1e-12)
 
     def test_raises_on_mismatched_obs(self):
-        a0 = jnp.array([1.0])
-        P0 = jnp.eye(1)
+        a0_nat = jnp.array([1.0])
+        P0_nat = jnp.eye(1)
         positivity = jnp.array([True])
         obs = jnp.zeros((2, 1))
 
         with pytest.raises(ValueError, match="both be provided or both be None"):
-            to_a_space(a0, P0, 0.0, obs, None, positivity)
+            transform_to_ekf(
+                _make_priors(a0_nat, P0_nat, a_obs_nat=obs, P_obs_nat=None),
+                positivity,
+            )
 
     def test_returns_none_when_obs_none(self):
-        a0 = jnp.array([1.0])
-        P0 = jnp.eye(1)
+        a0_nat = jnp.array([1.0])
+        P0_nat = jnp.eye(1)
         positivity = jnp.array([True])
 
-        _, _, _, loc_a, var_a = to_a_space(a0, P0, 0.0, None, None, positivity)
+        out = transform_to_ekf(_make_priors(a0_nat, P0_nat), positivity)
 
-        assert loc_a is None
-        assert var_a is None
+        assert out["a_obs"] is None
+        assert out["P_obs"] is None
+
+    def test_obs_idx_passthrough(self):
+        a0_nat = jnp.array([1.0])
+        P0_nat = jnp.eye(1)
+        positivity = jnp.array([True])
+        idx = jnp.array([3, 7, 11])
+
+        priors = _make_priors(a0_nat, P0_nat)
+        priors["obs_idx"] = idx
+        out = transform_to_ekf(priors, positivity)
+
+        assert jnp.array_equal(out["obs_idx"], idx)
