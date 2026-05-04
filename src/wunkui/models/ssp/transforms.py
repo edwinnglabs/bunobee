@@ -59,6 +59,14 @@ def transform_to_ekf(
         - ``sigma_q_scale_prior_nat`` : jnp.ndarray, same shape as
           ``sigma_q_loc_prior_nat`` — hyperprior scale for ``sigma_q``;
           transformed via the same per-element formula as the loc.
+        - ``sigma_q_low_prior_nat`` : jnp.ndarray | float | None, optional —
+          lower truncation bound for the ``sigma_q`` TruncatedNormal in
+          natural scale. Scalar or shape matching ``sigma_q_loc_prior_nat``;
+          transformed via the same per-element formula as the loc. Returned
+          as ``None`` when not provided.
+        - ``sigma_q_high_prior_nat`` : jnp.ndarray | float | None, optional —
+          upper truncation bound for the ``sigma_q`` TruncatedNormal in
+          natural scale. Same shape rules as ``sigma_q_low_prior_nat``.
         - ``a_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
           externally disclosed means.
         - ``P_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
@@ -76,7 +84,10 @@ def transform_to_ekf(
     dict
         a-space prior dictionary with un-suffixed keys: ``a0``, ``P0``
         (full covariance, symmetrised), ``sigma_q_loc_prior``,
-        ``sigma_q_scale_prior``, ``a_obs``, ``P_obs``, ``obs_idx``.
+        ``sigma_q_scale_prior``, ``sigma_q_low_prior``,
+        ``sigma_q_high_prior``, ``a_obs``, ``P_obs``, ``obs_idx``.
+        The ``sigma_q_low_prior`` / ``sigma_q_high_prior`` entries are
+        ``None`` when the corresponding ``_nat`` input is omitted.
 
     Raises
     ------
@@ -95,6 +106,8 @@ def transform_to_ekf(
     P0_nat = ssp_priors_nat["P0_nat"]
     sigma_q_loc_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"])
     sigma_q_scale_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"])
+    sigma_q_low_prior_nat = ssp_priors_nat.get("sigma_q_low_prior_nat")
+    sigma_q_high_prior_nat = ssp_priors_nat.get("sigma_q_high_prior_nat")
     a_obs_nat = ssp_priors_nat.get("a_obs_nat")
     P_obs_nat = ssp_priors_nat.get("P_obs_nat")
     obs_idx = ssp_priors_nat.get("obs_idx")
@@ -136,6 +149,17 @@ def transform_to_ekf(
     sigma_q_loc_prior = _moment_match_sigma(sigma_q_loc_prior_nat, sigma_ref_level, sigma_positivity, k)
     sigma_q_scale_prior = _moment_match_sigma(sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k)
 
+    sigma_q_low_prior = (
+        _moment_match_sigma(jnp.asarray(sigma_q_low_prior_nat), sigma_ref_level, sigma_positivity, k)
+        if sigma_q_low_prior_nat is not None
+        else None
+    )
+    sigma_q_high_prior = (
+        _moment_match_sigma(jnp.asarray(sigma_q_high_prior_nat), sigma_ref_level, sigma_positivity, k)
+        if sigma_q_high_prior_nat is not None
+        else None
+    )
+
     if a_obs_nat is None:
         a_obs = None
         P_obs = None
@@ -156,6 +180,8 @@ def transform_to_ekf(
         "P0": P0,
         "sigma_q_loc_prior": sigma_q_loc_prior,
         "sigma_q_scale_prior": sigma_q_scale_prior,
+        "sigma_q_low_prior": sigma_q_low_prior,
+        "sigma_q_high_prior": sigma_q_high_prior,
         "a_obs": a_obs,
         "P_obs": P_obs,
         "obs_idx": obs_idx,
