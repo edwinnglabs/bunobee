@@ -4,7 +4,7 @@ import logging
 
 import jax.numpy as jnp
 
-logger = logging.getLogger("wunkui")
+logger = logging.getLogger("bunobee")
 
 
 def transform_to_ekf(

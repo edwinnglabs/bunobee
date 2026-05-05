@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from wunkui.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)

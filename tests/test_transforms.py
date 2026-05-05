@@ -6,7 +6,7 @@ import pytest
 
 jax.config.update("jax_enable_x64", True)
 
-from wunkui.models.ssp.transforms import transform_to_ekf
+from bunobee.models.ssp.transforms import transform_to_ekf
 
 
 K = 0.5

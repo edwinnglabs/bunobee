@@ -8,7 +8,7 @@ The M5 forecasting problem requires fitting 30,490 independent daily series (eac
 
 ## Tier 1: Batch Kalman Filter with `jax.vmap` (biggest win)
 
-**File:** `src/wunkui/models/ssp/univariate.py`
+**File:** `src/bunobee/models/ssp/univariate.py`
 
 Add `kalman_filter_1d_batch` — a thin `vmap` wrapper around the existing `kalman_filter_1d`:
 
@@ -26,7 +26,7 @@ Add `kalman_filter_1d_batch` — a thin `vmap` wrapper around the existing `kalm
 
 ## Tier 2: Batch Optimizer Loop in JAX
 
-**File:** `src/wunkui/models/m5/m5_ssp_optim.py`
+**File:** `src/bunobee/models/m5/m5_ssp_optim.py`
 
 Add `fit_batch_series_opt(sales_matrix, n_iter, lr, Z)` → fits **all B series in one JIT call**:
 
@@ -48,7 +48,7 @@ Add `fit_batch_series_opt(sales_matrix, n_iter, lr, Z)` → fits **all B series 
 
 ## Tier 3: Multi-Device with `pmap`
 
-**File:** `src/wunkui/models/m5/m5_ssp_optim.py`
+**File:** `src/bunobee/models/m5/m5_ssp_optim.py`
 
 Thin wrapper: `pmap` over devices, `vmap` within each device. Pad series count to be divisible by `jax.local_device_count()`, reshape to `(n_devices, B_per_device, ...)`, apply `pmap(fit_batch_series_opt)`.
 
@@ -58,7 +58,7 @@ Linear speedup with device count. Only worthwhile if multiple GPUs/TPUs are avai
 
 ## Tier 4: Hierarchical Parameter Sharing
 
-**Files:** `src/wunkui/models/m5/m5_ssp_optim.py`, potentially new `src/wunkui/models/m5/m5_hierarchy.py`
+**Files:** `src/bunobee/models/m5/m5_ssp_optim.py`, potentially new `src/bunobee/models/m5/m5_hierarchy.py`
 
 Share `sigma_q_seas` at the department × store level (70 groups instead of 30K params). Each series keeps its own `sigma_h` and `sigma_q_level`. This regularizes estimates for sparse/intermittent series.
 
@@ -92,8 +92,8 @@ Tier 1 (batch KF) → Tier 2 (batch optimizer) → Tier 3 (pmap)
 
 | File | Changes |
 |---|---|
-| `src/wunkui/models/ssp/univariate.py` | Add `kalman_filter_1d_batch` (vmap wrapper) |
-| `src/wunkui/models/m5/m5_ssp_optim.py` | Add `fit_batch_series_opt`, `predict_batch_series_opt` |
+| `src/bunobee/models/ssp/univariate.py` | Add `kalman_filter_1d_batch` (vmap wrapper) |
+| `src/bunobee/models/m5/m5_ssp_optim.py` | Add `fit_batch_series_opt`, `predict_batch_series_opt` |
 | `playground/m5_prototype/m5_accuracy.ipynb` | Replace per-series loop with single batch call |
 
 Existing single-series APIs (`fit_one_series_opt`, `predict_one_series_opt`) are preserved for debugging.

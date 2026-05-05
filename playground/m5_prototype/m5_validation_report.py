@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from wunkui.models.ssp.univariate import kalman_filter_1d_batch
+from bunobee.models.ssp.univariate import kalman_filter_1d_batch
 
 from m5_score_submission import compute_hierarchical_wrmsse
 
