@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Optional
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
 
-logger = logging.getLogger("wunkui")
+logger = logging.getLogger("bunobee")
 
 
 def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: float):
@@ -45,7 +45,7 @@ def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: floa
     Examples
     --------
     >>> from jax import lax
-    >>> from wunkui.models.dlt import dlt_transition_step
+    >>> from bunobee.models.dlt import dlt_transition_step
     >>> _, (levs, slps, dlt_comp) = lax.scan(
     ...     lambda carry, y_t: dlt_transition_step(carry, y_t, lev_sm, slp_sm, theta),
     ...     (y[0], 0.0), y

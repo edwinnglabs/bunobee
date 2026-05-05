@@ -3,12 +3,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from wunkui.models.ssp.kalman_1d import (
+from bunobee.models.ssp.kalman_1d import (
     kalman_dk_smoother_1d,
     kalman_filter_1d,
     kalman_rts_smoother_1d,
 )
-from wunkui.models.ssp.kalman_1d_ekf import (
+from bunobee.models.ssp.kalman_1d_ekf import (
     kalman_dk_smoother_1d_ekf,
     kalman_filter_1d_ekf,
     kalman_rts_smoother_1d_ekf,
