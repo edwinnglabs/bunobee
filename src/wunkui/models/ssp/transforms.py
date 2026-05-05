@@ -49,16 +49,16 @@ def transform_to_ekf(
           positive.
         - ``P0_nat`` : jnp.ndarray, shape ``(n_states, n_states)`` — initial
           state covariance.
-        - ``sigma_q_loc_prior_nat`` : jnp.ndarray, shape ``(n_states,)`` or
-          ``(2,)`` — hyperprior loc for ``sigma_q``. Per-state form is
-          transformed element-wise against ``a0_nat``. Compressed form
-          ``[first_state, shared_remaining]`` is transformed against
-          ``a0_nat[:2]`` as representatives; callers using the compressed
-          form must arrange states ``1:`` to share a common positivity flag
-          and reference level.
-        - ``sigma_q_scale_prior_nat`` : jnp.ndarray, same shape as
-          ``sigma_q_loc_prior_nat`` — hyperprior scale for ``sigma_q``;
-          transformed via the same per-element formula as the loc.
+                - ``sigma_q_loc_prior_nat`` : jnp.ndarray, shape ``(n_states,)`` or
+                    ``(2,)`` — hyperprior loc for ``sigma_q``. Per-state form is
+                    transformed element-wise against ``a0_nat``. Compressed form
+                    ``[first_state, shared_remaining]`` is transformed against
+                    ``a0_nat[:2]`` as representatives; callers using the compressed
+                    form must arrange states ``1:`` to share a common positivity flag
+                    and reference level.
+                - ``sigma_q_scale_prior_nat`` : jnp.ndarray, same shape as
+                    ``sigma_q_loc_prior_nat`` — hyperprior scale for ``sigma_q``;
+                    transformed via the same per-element formula as the loc.
         - ``sigma_q_low_prior_nat`` : jnp.ndarray | float | None, optional —
           lower truncation bound for the ``sigma_q`` TruncatedNormal in
           natural scale. Scalar or shape matching ``sigma_q_loc_prior_nat``;
@@ -96,11 +96,17 @@ def transform_to_ekf(
 
     Notes
     -----
-    The hyperprior loc/scale transform is a pragmatic per-element
-    approximation: a TruncatedNormal in a-space is not strictly preserved
-    by the nonlinear map, but applying the same lognormal moment-match
-    formula to each element is the natural choice consistent with the
-    ``sigma_q`` transform.
+    The ``sigma_q`` hyperprior is not a latent-state moment; it parameterises
+    the process-noise scale itself. In the EKF a-space there is no exact
+    state-independent analogue of a natural-scale additive ``sigma_q`` for a
+    positivity state, so the transform keeps the TruncatedNormal prior family
+    and applies a local positive scale conversion against the reference level
+    from ``a0_nat``. For positivity entries this uses::
+
+        sigma_a = sqrt(log(1 + (sigma_nat / ref_level)^2)) / exponent
+
+    which stays positive and matches the small-noise limit
+    ``sigma_a ≈ sigma_nat / (exponent · ref_level)``.
     """
     a0_nat = ssp_priors_nat["a0_nat"]
     P0_nat = ssp_priors_nat["P0_nat"]
@@ -146,8 +152,12 @@ def transform_to_ekf(
     sigma_ref_level, sigma_positivity = _resolve_sigma_alignment(
         sigma_q_loc_prior_nat.shape, n_states, safe_init, positivity
     )
-    sigma_q_loc_prior = _moment_match_sigma(sigma_q_loc_prior_nat, sigma_ref_level, sigma_positivity, k)
-    sigma_q_scale_prior = _moment_match_sigma(sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k)
+    sigma_q_loc_prior = _moment_match_sigma(
+        sigma_q_loc_prior_nat, sigma_ref_level, sigma_positivity, k
+    )
+    sigma_q_scale_prior = _moment_match_sigma(
+        sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k
+    )
 
     sigma_q_low_prior = (
         _moment_match_sigma(jnp.asarray(sigma_q_low_prior_nat), sigma_ref_level, sigma_positivity, k)
@@ -194,7 +204,46 @@ def _moment_match_sigma(
     positivity: jnp.ndarray,
     k: float,
 ) -> jnp.ndarray:
-    """Apply per-state lognormal moment-match to a sigma-like array."""
+    """Convert natural-scale increment standard deviations into a-space scales.
+
+    For positivity states the EKF uses the latent parameterisation
+    ``lambda = exp(k * a)``, so an additive standard deviation specified on the
+    natural scale must be converted into the corresponding standard deviation of
+    the latent increment ``eta_a``. Using a local reference level
+    ``lambda_ref = ref_level``, this helper applies the same variance map as the
+    diagonal ``P0`` transform, but without the mean-shift term required for
+    state-level moment matching:
+
+    ``sigma_a^2 = log(1 + sigma_nat^2 / lambda_ref^2) / k^2``
+
+    and therefore
+
+    ``sigma_a = sqrt(log(1 + sigma_nat^2 / lambda_ref^2)) / k``.
+
+    This is appropriate for ``sigma_q`` because it parameterises the scale of a
+    zero-mean increment, not the mean/variance pair of a latent state level.
+    Linear states pass through unchanged.
+
+    Parameters
+    ----------
+    sigma_nat : jnp.ndarray
+        Natural-scale standard deviation(s) to convert.
+    ref_level : jnp.ndarray
+        Reference level(s) in the natural scale used to localise the lognormal
+        variance map. For ``sigma_q`` this is typically derived from
+        ``a0_nat``.
+    positivity : jnp.ndarray
+        Boolean mask selecting the states that use the nonlinear
+        ``lambda = exp(k * a)`` mapping.
+    k : float
+        Exponent in the forward map ``lambda = exp(k * a)``.
+
+    Returns
+    -------
+    jnp.ndarray
+        Converted a-space standard deviation(s), with linear-state entries left
+        unchanged.
+    """
     sigma_arr = jnp.broadcast_to(jnp.asarray(sigma_nat), ref_level.shape)
     sq_sigma_y_sq = jnp.log1p(jnp.square(sigma_arr) / jnp.square(ref_level))
     return jnp.where(positivity, jnp.sqrt(sq_sigma_y_sq) / k, sigma_arr)

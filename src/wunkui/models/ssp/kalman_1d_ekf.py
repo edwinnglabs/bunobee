@@ -363,3 +363,91 @@ def kalman_dk_smoother_1d_ekf(
 
     return a_pred + P_pred * r_all
 
+
+def kalman_rts_smoother_1d_ekf(
+    at: jnp.ndarray,
+    Pt: jnp.ndarray,
+    sigma_q: jnp.ndarray | float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Approximate RTS smoother for the diagonal 1D EKF state-space model.
+
+    Runs an extended Rauch-Tung-Striebel backward pass using the EKF filtered
+    posterior means and diagonal variances. The state transition is still the
+    identity random walk,
+
+        α_t = α_{t-1} + η_t,   η_t ~ N(0, σ_q² I),
+
+    so the transition Jacobian is exactly the identity even though the
+    observation model is nonlinear. Under the EKF approximation, the standard
+    RTS recursion therefore specialises element-wise to
+
+        P_{t+1|t} = P_{t|t} + σ_q²
+        J_t       = P_{t|t} / P_{t+1|t}
+        a_{t|T}   = a_{t|t} + J_t · (a_{t+1|T} - a_{t+1|t})
+        P_{t|T}   = P_{t|t} + J_t² · (P_{t+1|T} - P_{t+1|t})
+
+    with ``a_{t+1|t} = a_{t|t}`` because the transition is the identity.
+
+    Unlike :func:`kalman_filter_1d`, :func:`kalman_filter_1d_ekf` stores the
+    pure posterior variance ``Pt[t] = P_{t|t}``, so the predicted covariance
+    needed by RTS is recovered as ``Pt[t] + σ_q²``. The terminal condition is
+    therefore simply ``a_{T-1|T} = at[-1]`` and ``P_{T-1|T} = Pt[-1]``.
+
+    The smoother is approximate for the same reason the EKF itself is
+    approximate: the observation model is linearised around the filter's
+    forward pass. Disclosure fusion (``a_obs``, ``P_obs``) is already absorbed
+    into the filtered posterior ``at``, ``Pt``, so no extra smoother arguments
+    are required.
+
+    Parameters
+    ----------
+    at : jnp.ndarray, shape (T, n_states)
+        Filtered state means in a-space from :func:`kalman_filter_1d_ekf`.
+    Pt : jnp.ndarray, shape (T, n_states)
+        Filtered state variances (pure posterior ``P_{t|t}``) from
+        :func:`kalman_filter_1d_ekf`.
+    sigma_q : float or jnp.ndarray, shape () or (n_states,)
+        Process noise standard deviation, the same value passed to the filter.
+
+    Returns
+    -------
+    at_smooth : jnp.ndarray, shape (T, n_states)
+        Smoothed state means ``E[α_t | Y_n]`` in a-space.
+    Pt_smooth : jnp.ndarray, shape (T, n_states)
+        Approximate marginal smoothed state variances ``Var[α_t | Y_n]`` in
+        a-space.
+    """
+    logger.debug(
+        "kalman_rts_smoother_1d_ekf inputs — at: %s, Pt: %s, sigma_q: %s",
+        at.shape, Pt.shape, getattr(sigma_q, "shape", sigma_q),
+    )
+
+    if at.shape[0] == 1:
+        return at, Pt
+
+    sigma_q_sq = jnp.square(sigma_q)
+    P_pred_next = Pt[:-1] + sigma_q_sq
+    smoother_gain = Pt[:-1] / P_pred_next
+
+    def _step(carry: tuple[jnp.ndarray, jnp.ndarray], t: int) -> tuple[
+        tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]
+    ]:
+        """Single backward extended RTS step at time t."""
+        a_smooth_next, P_smooth_next = carry
+        a_smooth_t = at[t] + smoother_gain[t] * (a_smooth_next - at[t])
+        P_smooth_t = Pt[t] + jnp.square(smoother_gain[t]) * (P_smooth_next - P_pred_next[t])
+        return (a_smooth_t, P_smooth_t), (a_smooth_t, P_smooth_t)
+
+    init = (at[-1], Pt[-1])
+    _, (at_prefix, Pt_prefix) = lax.scan(
+        _step,
+        init,
+        jnp.arange(at.shape[0] - 1),
+        reverse=True,
+        length=at.shape[0] - 1,
+    )
+
+    at_smooth = jnp.concatenate([at_prefix, at[-1][None]], axis=0)
+    Pt_smooth = jnp.concatenate([Pt_prefix, Pt[-1][None]], axis=0)
+    return at_smooth, Pt_smooth
+

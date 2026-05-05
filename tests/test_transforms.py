@@ -172,6 +172,24 @@ class TestTransformToEkf:
             assert jnp.allclose(out["sigma_q_loc_prior"][i] ** 2, loc_var_ref, atol=1e-12)
             assert jnp.allclose(out["sigma_q_scale_prior"][i] ** 2, scale_var_ref, atol=1e-12)
 
+    def test_sigma_q_bounds_use_same_formula(self):
+        a0_nat = jnp.array([2.0, 3.0])
+        P0_nat = jnp.eye(2)
+        positivity = jnp.array([True, False])
+
+        priors = _make_priors(a0_nat, P0_nat, sigma_loc=jnp.array([0.4, 0.2]), sigma_scale=jnp.array([0.05, 0.1]))
+        priors["sigma_q_low_prior_nat"] = jnp.array([0.1, 0.05])
+        priors["sigma_q_high_prior_nat"] = jnp.array([0.8, 0.25])
+
+        out = transform_to_ekf(priors, positivity, exponent=K)
+
+        _, low_var_ref = _closed_form(2.0, 0.1**2)
+        _, high_var_ref = _closed_form(2.0, 0.8**2)
+        assert jnp.allclose(out["sigma_q_low_prior"][0] ** 2, low_var_ref, atol=1e-12)
+        assert jnp.allclose(out["sigma_q_high_prior"][0] ** 2, high_var_ref, atol=1e-12)
+        assert jnp.allclose(out["sigma_q_low_prior"][1], 0.05, atol=1e-12)
+        assert jnp.allclose(out["sigma_q_high_prior"][1], 0.25, atol=1e-12)
+
     def test_raises_on_mismatched_obs(self):
         a0_nat = jnp.array([1.0])
         P0_nat = jnp.eye(1)
