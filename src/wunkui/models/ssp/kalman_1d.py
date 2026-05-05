@@ -323,6 +323,87 @@ def kalman_dk_smoother_1d(
     return a_pred + P_pred * r_all
 
 
+def kalman_rts_smoother_1d(
+    at: jnp.ndarray,
+    Pt: jnp.ndarray,
+    sigma_q: jnp.ndarray | float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Rauch-Tung-Striebel smoother for the diagonal 1D state-space model.
+
+    Returns smoothed state means **and** marginal variances by walking a single
+    backward pass over the filter outputs.  The model is
+
+        α_t = α_{t-1} + η_t,   η_t ~ N(0, σ_q² I)
+        y_t = Z_t' α_t + ε_t,   ε_t ~ N(0, σ_h²)
+
+    so the transition is the identity with diagonal additive noise, and
+    :func:`kalman_filter_1d` stores ``at[t] = a_{t|t}`` together with
+    ``Pt[t] = P_{t|t} + σ_q² = P_{t+1|t}`` (the predicted variance for the
+    next step).  Both ``P_{t|t}`` and ``P_{t+1|t}`` are therefore recoverable
+    from filter outputs alone, and the standard RTS recursion specialises to
+
+        J_t       = P_{t|t} / P_{t+1|t}                          (element-wise)
+        a_{t|T}   = a_{t|t} + J_t · (a_{t+1|T} - a_{t+1|t})
+        P_{t|T}   = P_{t|t} + J_t² · (P_{t+1|T} - P_{t+1|t})
+
+    where ``a_{t+1|t} = a_{t|t}`` because the transition is the identity.
+
+    Setting the scan's initial carry to ``(at[-1], Pt[-1])`` exploits the
+    boundary condition: at ``t = T-1`` the difference terms collapse and the
+    iteration evaluates ``a_{T-1|T} = at[-1]``, ``P_{T-1|T} = Pt[-1] - σ_q²``.
+
+    Fusion observations (``a_obs``, ``P_obs``) and the soft positivity floor
+    are already absorbed into ``at``, ``Pt`` by :func:`kalman_filter_1d`, so
+    this smoother conditions on them implicitly — no extra arguments are
+    needed.  The positivity floor is non-Gaussian, so smoothed quantities
+    through clipped steps are an approximation rather than exact (same caveat
+    as :func:`kalman_dk_smoother_1d`).
+
+    Parameters
+    ----------
+    at : jnp.ndarray, shape (T, n_states)
+        Filtered state means from :func:`kalman_filter_1d`.
+    Pt : jnp.ndarray, shape (T, n_states)
+        Filtered state variances from :func:`kalman_filter_1d`.  Each
+        ``Pt[t]`` stores ``P_{t|t} + σ_q²``.
+    sigma_q : float or jnp.ndarray, shape () or (n_states,)
+        Process noise standard deviation, the same value passed to the
+        filter.  Broadcasts against ``Pt``.
+
+    Returns
+    -------
+    at_smooth : jnp.ndarray, shape (T, n_states)
+        Smoothed state means ``E[α_t | Y_n]``.
+    Pt_smooth : jnp.ndarray, shape (T, n_states)
+        Marginal smoothed state variances ``Var[α_t | Y_n]`` (diagonal).
+    """
+    logger.debug("kalman_rts_smoother_1d inputs — at: %s, Pt: %s, sigma_q: %s",
+                 at.shape, Pt.shape, getattr(sigma_q, "shape", sigma_q))
+
+    sigma_q_sq = jnp.square(sigma_q)
+    P_filt = Pt - sigma_q_sq
+    smoother_gain = P_filt / Pt
+
+    def _step(carry: tuple[jnp.ndarray, jnp.ndarray], t: int) -> tuple[
+        tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]
+    ]:
+        """Single backward RTS step at time t."""
+        a_smooth_next, P_smooth_next = carry
+        a_smooth_t = at[t] + smoother_gain[t] * (a_smooth_next - at[t])
+        P_smooth_t = P_filt[t] + jnp.square(smoother_gain[t]) * (P_smooth_next - Pt[t])
+        return (a_smooth_t, P_smooth_t), (a_smooth_t, P_smooth_t)
+
+    init = (at[-1], Pt[-1])
+    _, (at_smooth, Pt_smooth) = lax.scan(
+        _step,
+        init,
+        jnp.arange(at.shape[0]),
+        reverse=True,
+        length=at.shape[0],
+    )
+    return at_smooth, Pt_smooth
+
+
 # def simulate_forecast(
 #     # (n_sample, )
 #     a0: jnp.ndarray,
