@@ -177,4 +177,6 @@ push_package.sh
 *.npz
 *.pdf
 
-.research/
+# avoid dictating claude performance
+.claude/
+CLAUDE.md
