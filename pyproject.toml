@@ -1,6 +1,6 @@
 [project]
 name = "bunobee"
-version = "0.0.1"
+version = "0.0.2dev"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
