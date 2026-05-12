@@ -125,7 +125,6 @@ def kalman_filter_1d(
 
     _has_positivity = positivity_idx is not None
     _positivity_idx = positivity_idx if positivity_idx is not None else jnp.zeros(n_states, dtype=bool)
-    p = len(y)
 
     def _transition_fn(carry, xs):
         """transition function for Kalman filter"""
@@ -165,7 +164,7 @@ def kalman_filter_1d(
 
         # scalar + scalar -> scalar
         if logp:
-            log_p += -0.5 * (p * jnp.log(2 * jnp.pi) + jnp.sum(jnp.log(Ft) + jnp.square(vt) / Ft))
+            log_p += -0.5 * (jnp.log(2 * jnp.pi) + jnp.sum(jnp.log(Ft) + jnp.square(vt) / Ft))
 
         # ------ Update step ------
         # to enforce positivity after Kalman update, we can either
