@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -141,7 +142,7 @@ def plot_states(
     dates: np.ndarray,
     state_labels: list[str],
     *,
-    states_key: str = "at_smooth",
+    states_key: str | Sequence[str] = "at_smooth",
     coefs_df: pd.DataFrame | None = None,
     obs_idx: np.ndarray | None = None,
     a_obs: np.ndarray | None = None,
@@ -149,24 +150,27 @@ def plot_states(
     title: str | None = None,
     n_cols: int = 4,
     ci: tuple[float, float, float] = (0.05, 0.5, 0.95),
+    colors: Sequence[str] | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Plot posterior quantile ribbons for latent states across MCMC samples.
 
     Works for filtered states (``"at"``), smoothed states (``"at_smooth"``), or
-    EKF multiplicative intensities (``"lam"``); just pass the appropriate
-    ``states_key``.
+    EKF multiplicative intensities (``"lam"``).  Pass a single key for one
+    ribbon, or a list of keys to overlay multiple posteriors on the same axes
+    (e.g. ``["at", "at_smooth"]`` to compare filtered vs. smoothed).
 
     Parameters
     ----------
     posterior : dict[str, np.ndarray]
-        Sample dict from ``mcmc.get_samples()``.  Must contain ``states_key``
-        with shape ``(n_samples, T, n_states)``.
+        Sample dict from ``mcmc.get_samples()``.  Must contain every entry in
+        ``states_key`` with shape ``(n_samples, T, n_states)``.
     dates : np.ndarray
         Length-T array of date values used as the x-axis.
     state_labels : list[str]
         Human-readable name for each state dimension (length ``n_states``).
-    states_key : str, optional
-        Key in ``posterior`` to visualise, by default ``"at_smooth"``.
+    states_key : str or sequence of str, optional
+        Key(s) in ``posterior`` to visualise, by default ``"at_smooth"``.  When
+        a sequence is given, each key is overlaid with its own colour.
     coefs_df : pd.DataFrame or None, optional
         DataFrame with columns ``["regressor", "coef"]`` providing ground-truth
         reference lines.  Skipped when ``None``.
@@ -185,6 +189,10 @@ def plot_states(
         Number of subplot columns, by default 4.
     ci : tuple[float, float, float], optional
         Quantile triple ``(lo, mid, hi)``, by default ``(0.05, 0.5, 0.95)``.
+    colors : sequence of str or None, optional
+        Per-overlay colours, one per entry in ``states_key``.  Defaults to
+        ``matplotlib``'s ``tab10`` cycle, with ``"darkgreen"`` as the first
+        colour to preserve the original single-overlay appearance.
 
     Returns
     -------
@@ -192,8 +200,19 @@ def plot_states(
     axes : np.ndarray
         Flattened array of all ``Axes`` objects (including hidden ones).
     """
-    states = np.asarray(posterior[states_key])
-    lo, mid, hi = np.quantile(states, ci, axis=0)
+    keys = [states_key] if isinstance(states_key, str) else list(states_key)
+    if not keys:
+        raise ValueError("states_key must contain at least one key")
+
+    default_colors = ["darkgreen", *plt.get_cmap("tab10").colors]
+    palette = list(colors) if colors is not None else default_colors
+    if len(palette) < len(keys):
+        raise ValueError(
+            f"need at least {len(keys)} colours for {len(keys)} overlays, got {len(palette)}"
+        )
+
+    quantiles = [np.quantile(np.asarray(posterior[k]), ci, axis=0) for k in keys]
+    ci_pct = int(round((ci[2] - ci[0]) * 100))
 
     coefs_lookup = coefs_df.set_index("regressor")["coef"] if coefs_df is not None else None
 
@@ -210,9 +229,15 @@ def plot_states(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 3.2 * n_rows), sharex=False)
     axes = np.atleast_1d(axes).flatten()
 
+    single = len(keys) == 1
     for i, (ax, label) in enumerate(zip(axes, state_labels)):
-        ax.plot(dates, mid[:, i], color="darkgreen", linewidth=0.9, label="median")
-        ax.fill_between(dates, lo[:, i], hi[:, i], alpha=0.25, color="darkgreen", label=f"{int(round((ci[2]-ci[0])*100))}% CI")
+        for key, (lo, mid, hi), color in zip(keys, quantiles, palette):
+            median_label = "median" if single else f"{key} median"
+            ribbon_label = f"{ci_pct}% CI" if single else f"{key} {ci_pct}% CI"
+            ax.plot(dates, mid[:, i], color=color, linewidth=0.9, label=median_label)
+            ax.fill_between(
+                dates, lo[:, i], hi[:, i], alpha=0.25, color=color, label=ribbon_label
+            )
 
         if i > 0 and coefs_lookup is not None and label in coefs_lookup.index:
             ax.axhline(coefs_lookup[label], color="grey", linestyle=":", linewidth=1.0, label="true coef")
@@ -240,7 +265,7 @@ def plot_states(
     axes[0].legend(fontsize=7)
 
     if title is None:
-        title = states_key
+        title = keys[0] if single else " vs ".join(keys)
     fig.suptitle(title, y=1.01)
     plt.tight_layout()
 
