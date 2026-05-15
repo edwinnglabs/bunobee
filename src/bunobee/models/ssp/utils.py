@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import xarray as xr
 from jax import numpy as jnp
 
 
@@ -137,8 +138,108 @@ def lam_to_a(
     return out
 
 
+def posterior_to_xarray(
+    posterior: Mapping[str, np.ndarray],
+    *,
+    dims: Mapping[str, Sequence[str]] | None = None,
+    coords: Mapping[str, Sequence] | None = None,
+    drop: Sequence[str] | None = None,
+    keep: Sequence[str] | None = None,
+) -> xr.Dataset:
+    """Convert a chain-grouped numpyro posterior dict to an ``xarray.Dataset``.
+
+    Each value of ``posterior`` must have leading ``(chain, draw, ...)`` axes,
+    matching the output of ``mcmc.get_samples(group_by_chain=True)``. The
+    resulting dataset is suitable for wrapping in
+    ``arviz.InferenceData(posterior=ds)`` for downstream diagnostics
+    (``az.summary``, ``az.plot_trace``, ``az.plot_rank``, ...).
+
+    Parameters
+    ----------
+    posterior : mapping[str, np.ndarray]
+        Mapping from site name to draws of shape ``(n_chains, n_draws, *event)``.
+    dims : mapping[str, sequence of str], optional
+        Names for each variable's event axes (everything past ``chain`` and
+        ``draw``). Variables omitted here get auto-named axes
+        ``"<name>_dim_<i>"``.
+    coords : mapping[str, sequence], optional
+        Coordinate values keyed by dimension name. Dimensions without an entry
+        fall back to a plain integer range.
+    drop : sequence of str, optional
+        Site names to omit from the dataset. Mutually exclusive with ``keep``.
+    keep : sequence of str, optional
+        Site names to retain; everything else is dropped. Mutually exclusive
+        with ``drop``.
+
+    Returns
+    -------
+    xarray.Dataset
+        One ``DataArray`` per kept variable with dims
+        ``(chain, draw, *event_dims)``.
+    """
+    if drop is not None and keep is not None:
+        raise ValueError("pass at most one of `drop` or `keep`, not both")
+
+    drop_set = set(drop or ())
+    keep_set = set(keep) if keep is not None else None
+    items = {
+        k: np.asarray(v)
+        for k, v in posterior.items()
+        if k not in drop_set and (keep_set is None or k in keep_set)
+    }
+    if not items:
+        raise ValueError("no variables left to convert after applying drop/keep")
+
+    dims = dict(dims or {})
+    user_coords = dict(coords or {})
+
+    data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
+    out_coords: dict[str, np.ndarray] = {}
+
+    for name, arr in items.items():
+        if arr.ndim < 2:
+            raise ValueError(
+                f"variable {name!r} has shape {arr.shape}; expected leading "
+                "(chain, draw) axes from group_by_chain=True samples"
+            )
+        event_shape = arr.shape[2:]
+        event_dims = list(dims.get(name) or [f"{name}_dim_{i}" for i in range(len(event_shape))])
+        if len(event_dims) != len(event_shape):
+            raise ValueError(
+                f"dims for {name!r} has length {len(event_dims)} but event "
+                f"shape is {event_shape}"
+            )
+
+        for d, size in zip(event_dims, event_shape):
+            if d in out_coords:
+                if len(out_coords[d]) != size:
+                    raise ValueError(
+                        f"dim {d!r} reused with inconsistent size: "
+                        f"{len(out_coords[d])} vs {size} (from {name!r})"
+                    )
+                continue
+            if d in user_coords:
+                values = np.asarray(user_coords[d])
+                if values.shape != (size,):
+                    raise ValueError(
+                        f"coord {d!r} has shape {values.shape} but {name!r} "
+                        f"expects size {size}"
+                    )
+                out_coords[d] = values
+            else:
+                out_coords[d] = np.arange(size)
+
+        data_vars[name] = (("chain", "draw", *event_dims), arr)
+
+    sample_arr = next(iter(items.values()))
+    out_coords.setdefault("chain", np.arange(sample_arr.shape[0]))
+    out_coords.setdefault("draw", np.arange(sample_arr.shape[1]))
+
+    return xr.Dataset(data_vars=data_vars, coords=out_coords)
+
+
 def plot_states(
-    posterior: dict[str, np.ndarray],
+    posterior: Mapping[str, np.ndarray] | xr.Dataset,
     dates: np.ndarray,
     state_labels: list[str],
     *,
@@ -150,7 +251,7 @@ def plot_states(
     title: str | None = None,
     n_cols: int = 4,
     ci: tuple[float, float, float] = (0.05, 0.5, 0.95),
-    colors: Sequence[str] | None = None,
+    colors: dict[str, str] | Sequence[str] | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Plot posterior quantile ribbons for latent states across MCMC samples.
 
@@ -161,9 +262,13 @@ def plot_states(
 
     Parameters
     ----------
-    posterior : dict[str, np.ndarray]
-        Sample dict from ``mcmc.get_samples()``.  Must contain every entry in
-        ``states_key`` with shape ``(n_samples, T, n_states)``.
+    posterior : mapping[str, np.ndarray] or xarray.Dataset
+        Either a flat sample dict from ``mcmc.get_samples()`` (each entry shape
+        ``(n_samples, T, n_states)``) or an ``xarray.Dataset`` produced by
+        :func:`posterior_to_xarray` whose variables have dims
+        ``(chain, draw, ...)``.  In the dataset case the chain and draw axes
+        are flattened internally before computing quantiles.  Must contain
+        every entry in ``states_key``.
     dates : np.ndarray
         Length-T array of date values used as the x-axis.
     state_labels : list[str]
@@ -189,8 +294,11 @@ def plot_states(
         Number of subplot columns, by default 4.
     ci : tuple[float, float, float], optional
         Quantile triple ``(lo, mid, hi)``, by default ``(0.05, 0.5, 0.95)``.
-    colors : sequence of str or None, optional
-        Per-overlay colours, one per entry in ``states_key``.  Defaults to
+    colors : dict[str, str] or sequence of str or None, optional
+        Per-overlay colours.  Pass a dict mapping each key in ``states_key``
+        to a colour (e.g. ``{"at": "steelblue", "at_smooth": "darkgreen"}``),
+        or a plain sequence ordered the same as ``states_key``.  Keys missing
+        from the dict fall back to the default palette.  Defaults to
         ``matplotlib``'s ``tab10`` cycle, with ``"darkgreen"`` as the first
         colour to preserve the original single-overlay appearance.
 
@@ -204,12 +312,26 @@ def plot_states(
     if not keys:
         raise ValueError("states_key must contain at least one key")
 
+    if isinstance(posterior, xr.Dataset):
+        posterior = {
+            k: posterior[k]
+                .stack(sample=("chain", "draw"))
+                .transpose("sample", ...)
+                .values
+            for k in keys
+        }
+
     default_colors = ["darkgreen", *plt.get_cmap("tab10").colors]
-    palette = list(colors) if colors is not None else default_colors
-    if len(palette) < len(keys):
-        raise ValueError(
-            f"need at least {len(keys)} colours for {len(keys)} overlays, got {len(palette)}"
-        )
+    if colors is None:
+        palette = default_colors[: len(keys)]
+    elif isinstance(colors, dict):
+        palette = [colors.get(k, default_colors[i]) for i, k in enumerate(keys)]
+    else:
+        palette = list(colors)
+        if len(palette) < len(keys):
+            raise ValueError(
+                f"need at least {len(keys)} colours for {len(keys)} overlays, got {len(palette)}"
+            )
 
     quantiles = [np.quantile(np.asarray(posterior[k]), ci, axis=0) for k in keys]
     ci_pct = int(round((ci[2] - ci[0]) * 100))
