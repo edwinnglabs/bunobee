@@ -31,23 +31,38 @@ def _make_priors(
     obs_idx: jnp.ndarray | None = None,
     sigma_low: jnp.ndarray | None = None,
     sigma_high: jnp.ndarray | None = None,
+    family: str = "truncated_normal",
+    alpha: jnp.ndarray | float | None = None,
+    beta: jnp.ndarray | float | None = None,
 ) -> xr.Dataset:
     n_states = a0_nat.shape[0]
-    loc_arr = np.broadcast_to(np.asarray(sigma_loc, dtype=float), (n_states,)).copy()
-    scale_src = sigma_loc if sigma_scale is None else sigma_scale
-    scale_arr = np.broadcast_to(np.asarray(scale_src, dtype=float), (n_states,)).copy()
 
     data_vars: dict = {
         "a0_nat": (("state",), np.asarray(a0_nat)),
         "P0_nat": (("state", "state_dual"), np.asarray(P0_nat)),
-        "sigma_q_loc_prior_nat": (("state",), loc_arr),
-        "sigma_q_scale_prior_nat": (("state",), scale_arr),
         "positivity_idx": (("state",), np.asarray(positivity_idx, dtype=bool)),
     }
-    if sigma_low is not None:
-        data_vars["sigma_q_low_prior_nat"] = (("state",), np.asarray(sigma_low))
-    if sigma_high is not None:
-        data_vars["sigma_q_high_prior_nat"] = (("state",), np.asarray(sigma_high))
+
+    if family == "truncated_normal":
+        loc_arr = np.broadcast_to(np.asarray(sigma_loc, dtype=float), (n_states,)).copy()
+        scale_src = sigma_loc if sigma_scale is None else sigma_scale
+        scale_arr = np.broadcast_to(np.asarray(scale_src, dtype=float), (n_states,)).copy()
+        data_vars["sigma_q_loc_prior_nat"] = (("state",), loc_arr)
+        data_vars["sigma_q_scale_prior_nat"] = (("state",), scale_arr)
+        if sigma_low is not None:
+            data_vars["sigma_q_low_prior_nat"] = (("state",), np.asarray(sigma_low))
+        if sigma_high is not None:
+            data_vars["sigma_q_high_prior_nat"] = (("state",), np.asarray(sigma_high))
+    elif family == "beta":
+        if alpha is None or beta is None or sigma_scale is None:
+            raise ValueError("Beta family requires alpha, beta, and sigma_scale")
+        alpha_arr = np.broadcast_to(np.asarray(alpha, dtype=float), (n_states,)).copy()
+        beta_arr = np.broadcast_to(np.asarray(beta, dtype=float), (n_states,)).copy()
+        scale_arr = np.broadcast_to(np.asarray(sigma_scale, dtype=float), (n_states,)).copy()
+        data_vars["sigma_q_alpha_prior"] = (("state",), alpha_arr)
+        data_vars["sigma_q_beta_prior"] = (("state",), beta_arr)
+        data_vars["sigma_q_scale_prior_nat"] = (("state",), scale_arr)
+
     if a_obs_nat is not None:
         data_vars["a_obs_nat"] = (("time", "state"), np.asarray(a_obs_nat))
     if P_obs_nat is not None:
@@ -55,7 +70,7 @@ def _make_priors(
     if obs_idx is not None:
         data_vars["obs_idx"] = (("obs_point",), np.asarray(obs_idx))
 
-    return xr.Dataset(data_vars)
+    return xr.Dataset(data_vars, attrs={"sigma_q_family": family})
 
 
 class TestTransformToEkf:
@@ -268,3 +283,132 @@ class TestTransformToEkf:
 
         assert list(out.coords["state"].values) == state_labels
         assert list(out.coords["state_dual"].values) == state_labels
+
+    def test_default_family_attr_propagates(self):
+        a0_nat = jnp.array([1.0, 2.0])
+        P0_nat = jnp.eye(2)
+        positivity = jnp.array([True, True])
+
+        out = transform_to_ekf(_make_priors(a0_nat, P0_nat, positivity))
+
+        assert out.attrs["sigma_q_family"] == "truncated_normal"
+
+
+def _beta_scale_a(mu_x: float, scale_nat: float, alpha: float, beta: float, k: float = K) -> float:
+    mode_frac = (alpha - 1.0) / (alpha + beta - 2.0)
+    mode_nat = scale_nat * mode_frac
+    sigma_y_sq = jnp.log1p(mode_nat ** 2 / mu_x ** 2)
+    mode_a = jnp.sqrt(sigma_y_sq) / k
+    return float(mode_a / mode_frac)
+
+
+class TestTransformToEkfBeta:
+    def test_alpha_beta_passthrough_and_scale_mode_match(self):
+        a0_nat = jnp.array([2.0, 5.0])
+        P0_nat = jnp.diag(jnp.array([0.25, 1.0]))
+        positivity = jnp.array([True, True])
+        scale_nat = jnp.array([0.2, 0.5])
+
+        out = transform_to_ekf(
+            _make_priors(
+                a0_nat, P0_nat, positivity,
+                family="beta", alpha=2.0, beta=10.0, sigma_scale=scale_nat,
+            ),
+            exponent=K,
+        )
+
+        assert out.attrs["sigma_q_family"] == "beta"
+        assert jnp.allclose(out["sigma_q_alpha_prior"].values, 2.0)
+        assert jnp.allclose(out["sigma_q_beta_prior"].values, 10.0)
+
+        for i in range(2):
+            ref = _beta_scale_a(float(a0_nat[i]), float(scale_nat[i]), 2.0, 10.0)
+            assert jnp.allclose(out["sigma_q_scale_prior"].values[i], ref, atol=1e-12)
+
+    def test_linear_state_scale_passthrough(self):
+        a0_nat = jnp.array([2.0, -1.0])
+        P0_nat = jnp.eye(2)
+        positivity = jnp.array([True, False])
+        scale_nat = jnp.array([0.3, 0.7])
+
+        out = transform_to_ekf(
+            _make_priors(
+                a0_nat, P0_nat, positivity,
+                family="beta", alpha=jnp.array([3.0, 4.0]), beta=jnp.array([8.0, 6.0]),
+                sigma_scale=scale_nat,
+            ),
+            exponent=K,
+        )
+
+        # positivity entry: mode-matched
+        ref = _beta_scale_a(2.0, 0.3, 3.0, 8.0)
+        assert jnp.allclose(out["sigma_q_scale_prior"].values[0], ref, atol=1e-12)
+        # linear entry: passthrough
+        assert jnp.allclose(out["sigma_q_scale_prior"].values[1], 0.7, atol=1e-12)
+        # alpha/beta pass through on both
+        assert jnp.allclose(out["sigma_q_alpha_prior"].values, jnp.array([3.0, 4.0]))
+        assert jnp.allclose(out["sigma_q_beta_prior"].values, jnp.array([8.0, 6.0]))
+
+    def test_ssp_v2_style_scaled_beta(self):
+        # Mirrors the v2 notebook: scale_nat = sdy * 0.1 for intercept,
+        # sdy_over_sdx * 0.1 for regressors; Beta(2, 10).
+        sdy = 0.078
+        sdy_over_sdx = jnp.array([0.58, 0.29, 0.45])
+        # state 0 = intercept (linear); states 1..3 = regressors (positivity)
+        a0_nat = jnp.array([0.0, 1.2, 0.8, 1.5])
+        P0_nat = jnp.eye(4)
+        positivity = jnp.array([False, True, True, True])
+        scale_nat = jnp.concatenate([jnp.array([sdy * 0.1]), sdy_over_sdx * 0.1])
+
+        out = transform_to_ekf(
+            _make_priors(
+                a0_nat, P0_nat, positivity,
+                family="beta", alpha=2.0, beta=10.0, sigma_scale=scale_nat,
+            ),
+            exponent=K,
+        )
+
+        # intercept passes through unchanged
+        assert jnp.allclose(out["sigma_q_scale_prior"].values[0], sdy * 0.1, atol=1e-12)
+        # regressors mode-matched against their reference levels
+        for i in range(1, 4):
+            ref = _beta_scale_a(float(a0_nat[i]), float(scale_nat[i]), 2.0, 10.0)
+            assert jnp.allclose(out["sigma_q_scale_prior"].values[i], ref, atol=1e-12)
+
+    def test_raises_when_alpha_le_one(self):
+        a0_nat = jnp.array([1.0, 2.0])
+        P0_nat = jnp.eye(2)
+        positivity = jnp.array([True, True])
+
+        priors = _make_priors(
+            a0_nat, P0_nat, positivity,
+            family="beta", alpha=jnp.array([1.0, 2.0]), beta=jnp.array([5.0, 5.0]),
+            sigma_scale=jnp.array([0.1, 0.2]),
+        )
+        with pytest.raises(ValueError, match="alpha > 1 and beta > 1"):
+            transform_to_ekf(priors)
+
+    def test_raises_when_required_var_missing(self):
+        a0_nat = jnp.array([1.0])
+        P0_nat = jnp.eye(1)
+        positivity = jnp.array([True])
+
+        priors = _make_priors(
+            a0_nat, P0_nat, positivity,
+            family="beta", alpha=2.0, beta=10.0, sigma_scale=0.1,
+        )
+        priors = priors.drop_vars("sigma_q_alpha_prior")
+
+        with pytest.raises(ValueError, match="sigma_q_alpha_prior"):
+            transform_to_ekf(priors)
+
+    def test_raises_on_unknown_family(self):
+        a0_nat = jnp.array([1.0])
+        P0_nat = jnp.eye(1)
+        positivity = jnp.array([True])
+
+        priors = _make_priors(a0_nat, P0_nat, positivity)
+        priors.attrs["sigma_q_family"] = "lognormal"
+
+        with pytest.raises(ValueError, match="unknown sigma_q_family"):
+            transform_to_ekf(priors)
