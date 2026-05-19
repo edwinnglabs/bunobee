@@ -3,27 +3,29 @@ from __future__ import annotations
 import logging
 
 import jax.numpy as jnp
+import numpy as np
+import xarray as xr
 
 logger = logging.getLogger("bunobee")
 
 
 def transform_to_ekf(
-    ssp_priors_nat: dict,
-    positivity_idx: jnp.ndarray,
+    ssp_priors_nat: xr.Dataset,
     exponent: float = 0.5,
-) -> dict:
-    """Transform a natural-scale prior dict into the EKF a-space prior dict.
+) -> xr.Dataset:
+    """Transform a natural-scale prior dataset into the EKF a-space prior dataset.
 
     The input ``ssp_priors_nat`` is structured as if for a vanilla Kalman
     filter — every entry lives in the natural / intensity scale and carries
-    the ``_nat`` suffix. The returned dict drops the suffix and contains the
-    same quantities expressed in a-space, ready for ``kalman_filter_1d_ekf``
-    (which uses the forward map ``x = exp(exponent · a)`` for positivity
-    states).
+    the ``_nat`` suffix. The returned dataset drops the suffix and contains
+    the same quantities expressed in a-space, ready for
+    ``kalman_filter_1d_ekf`` (which uses the forward map
+    ``x = exp(exponent · a)`` for positivity states).
 
-    Only entries selected by ``positivity_idx`` are transformed; linear
-    states pass through unchanged. Entries of ``P_obs_nat`` equal to
-    ``jnp.inf`` are preserved as undisclosed-timestep no-ops.
+    Only entries selected by ``positivity_idx`` (read from
+    ``ssp_priors_nat["positivity_idx"]``) are transformed; linear states pass
+    through unchanged. Entries of ``P_obs_nat`` equal to ``jnp.inf`` are
+    preserved as undisclosed-timestep no-ops.
 
     For each positivity state ``i`` with reference level ``μ_x_i > 0`` and
     variance ``σ_x_i² ≥ 0`` (with ``k = exponent``)::
@@ -41,58 +43,57 @@ def transform_to_ekf(
 
     Parameters
     ----------
-    ssp_priors_nat : dict
-        Natural-scale prior dictionary. Required keys:
+    ssp_priors_nat : xr.Dataset
+        Natural-scale prior dataset. Required variables:
 
-        - ``a0_nat`` : jnp.ndarray, shape ``(n_states,)`` — initial state
-          mean. Entries selected by ``positivity_idx`` must be strictly
-          positive.
-        - ``P0_nat`` : jnp.ndarray, shape ``(n_states, n_states)`` — initial
-          state covariance.
-                - ``sigma_q_loc_prior_nat`` : jnp.ndarray, shape ``(n_states,)`` or
-                    ``(2,)`` — hyperprior loc for ``sigma_q``. Per-state form is
-                    transformed element-wise against ``a0_nat``. Compressed form
-                    ``[first_state, shared_remaining]`` is transformed against
-                    ``a0_nat[:2]`` as representatives; callers using the compressed
-                    form must arrange states ``1:`` to share a common positivity flag
-                    and reference level.
-                - ``sigma_q_scale_prior_nat`` : jnp.ndarray, same shape as
-                    ``sigma_q_loc_prior_nat`` — hyperprior scale for ``sigma_q``;
-                    transformed via the same per-element formula as the loc.
-        - ``sigma_q_low_prior_nat`` : jnp.ndarray | float | None, optional —
-          lower truncation bound for the ``sigma_q`` TruncatedNormal in
-          natural scale. Scalar or shape matching ``sigma_q_loc_prior_nat``;
-          transformed via the same per-element formula as the loc. Returned
-          as ``None`` when not provided.
-        - ``sigma_q_high_prior_nat`` : jnp.ndarray | float | None, optional —
-          upper truncation bound for the ``sigma_q`` TruncatedNormal in
-          natural scale. Same shape rules as ``sigma_q_low_prior_nat``.
-        - ``a_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
-          externally disclosed means.
-        - ``P_obs_nat`` : jnp.ndarray | None, shape ``(n_steps, n_states)`` —
-          externally disclosed variances; ``jnp.inf`` marks undisclosed steps.
-        - ``obs_idx`` : array — disclosure index, passed through unchanged.
+        - ``a0_nat`` : dims ``(state,)`` — initial state mean. Entries
+          selected by ``positivity_idx`` must be strictly positive.
+        - ``P0_nat`` : dims ``(state, state_dual)`` — initial state
+          covariance.
+        - ``sigma_q_loc_prior_nat`` : dims ``(state,)`` or compressed ``(2,)``
+          — hyperprior loc for ``sigma_q``. Per-state form is transformed
+          element-wise against ``a0_nat``. Compressed form
+          ``[first_state, shared_remaining]`` is transformed against
+          ``a0_nat[:2]`` as representatives; callers using the compressed
+          form must arrange states ``1:`` to share a common positivity flag
+          and reference level.
+        - ``sigma_q_scale_prior_nat`` : same dims as
+          ``sigma_q_loc_prior_nat``; transformed via the same per-element
+          formula as the loc.
+        - ``positivity_idx`` : dims ``(state,)``, boolean — ``True`` selects
+          states that use the nonlinear ``exp`` mapping in
+          ``kalman_filter_1d_ekf``.
 
-    positivity_idx : jnp.ndarray, shape ``(n_states,)``
-        Boolean mask — ``True`` selects states that use the nonlinear
-        ``exp`` mapping in ``kalman_filter_1d_ekf``.
+        Optional variables:
+
+        - ``sigma_q_low_prior_nat`` / ``sigma_q_high_prior_nat`` : truncation
+          bounds for the ``sigma_q`` TruncatedNormal in natural scale; same
+          shape rules as ``sigma_q_loc_prior_nat``; transformed via the same
+          per-element formula as the loc. Omitted variables are absent from
+          the returned dataset.
+        - ``a_obs_nat`` / ``P_obs_nat`` : dims ``(time, state)`` — externally
+          disclosed means / variances; ``jnp.inf`` in ``P_obs_nat`` marks
+          undisclosed steps. Must be both present or both absent.
+        - ``obs_idx`` : disclosure index, passed through unchanged.
+
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k·a)``. Default 0.5.
 
     Returns
     -------
-    dict
-        a-space prior dictionary with un-suffixed keys: ``a0``, ``P0``
-        (full covariance, symmetrised), ``sigma_q_loc_prior``,
-        ``sigma_q_scale_prior``, ``sigma_q_low_prior``,
-        ``sigma_q_high_prior``, ``a_obs``, ``P_obs``, ``obs_idx``.
-        The ``sigma_q_low_prior`` / ``sigma_q_high_prior`` entries are
-        ``None`` when the corresponding ``_nat`` input is omitted.
+    xr.Dataset
+        a-space prior dataset with un-suffixed variable names: ``a0``,
+        ``P0`` (full covariance, symmetrised), ``sigma_q_loc_prior``,
+        ``sigma_q_scale_prior``, optionally ``sigma_q_low_prior``,
+        ``sigma_q_high_prior``, ``a_obs``, ``P_obs``, ``obs_idx``, and the
+        passthrough ``positivity_idx``. Dimensions and coordinates are
+        preserved from the input.
 
     Raises
     ------
     ValueError
-        If exactly one of ``a_obs_nat`` / ``P_obs_nat`` is ``None``.
+        If ``positivity_idx`` is missing, or if exactly one of ``a_obs_nat``
+        / ``P_obs_nat`` is present.
 
     Notes
     -----
@@ -108,18 +109,19 @@ def transform_to_ekf(
     which stays positive and matches the small-noise limit
     ``sigma_a ≈ sigma_nat / (exponent · ref_level)``.
     """
-    a0_nat = ssp_priors_nat["a0_nat"]
-    P0_nat = ssp_priors_nat["P0_nat"]
-    sigma_q_loc_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"])
-    sigma_q_scale_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"])
-    sigma_q_low_prior_nat = ssp_priors_nat.get("sigma_q_low_prior_nat")
-    sigma_q_high_prior_nat = ssp_priors_nat.get("sigma_q_high_prior_nat")
-    a_obs_nat = ssp_priors_nat.get("a_obs_nat")
-    P_obs_nat = ssp_priors_nat.get("P_obs_nat")
-    obs_idx = ssp_priors_nat.get("obs_idx")
+    if "positivity_idx" not in ssp_priors_nat:
+        raise ValueError("ssp_priors_nat must contain a `positivity_idx` variable")
 
-    if (a_obs_nat is None) != (P_obs_nat is None):
-        raise ValueError("a_obs_nat and P_obs_nat must both be provided or both be None")
+    has_a_obs = "a_obs_nat" in ssp_priors_nat
+    has_P_obs = "P_obs_nat" in ssp_priors_nat
+    if has_a_obs != has_P_obs:
+        raise ValueError("a_obs_nat and P_obs_nat must both be present or both be absent")
+
+    positivity = jnp.asarray(ssp_priors_nat["positivity_idx"].values, dtype=bool)
+    a0_nat = jnp.asarray(ssp_priors_nat["a0_nat"].values)
+    P0_nat = jnp.asarray(ssp_priors_nat["P0_nat"].values)
+    sigma_q_loc_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"].values)
+    sigma_q_scale_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"].values)
 
     if sigma_q_loc_prior_nat.shape != sigma_q_scale_prior_nat.shape:
         raise ValueError(
@@ -128,7 +130,6 @@ def transform_to_ekf(
         )
 
     k = exponent
-    positivity = jnp.asarray(positivity_idx, dtype=bool)
     n_states = a0_nat.shape[0]
 
     safe_init = jnp.where(positivity, a0_nat, 1.0)
@@ -143,9 +144,7 @@ def transform_to_ekf(
     denom_i = jnp.where(positivity, k * safe_init, 1.0)[:, None]
     denom_j = jnp.where(positivity, k * safe_init, 1.0)[None, :]
     cov_mixed = P0_nat / (denom_i * denom_j)
-    pos_i = positivity[:, None]
-    pos_j = positivity[None, :]
-    both_pos = pos_i & pos_j
+    both_pos = positivity[:, None] & positivity[None, :]
     P0 = jnp.where(both_pos, cov_both, cov_mixed)
     P0 = 0.5 * (P0 + P0.T)
 
@@ -159,21 +158,32 @@ def transform_to_ekf(
         sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k
     )
 
-    sigma_q_low_prior = (
-        _moment_match_sigma(jnp.asarray(sigma_q_low_prior_nat), sigma_ref_level, sigma_positivity, k)
-        if sigma_q_low_prior_nat is not None
-        else None
-    )
-    sigma_q_high_prior = (
-        _moment_match_sigma(jnp.asarray(sigma_q_high_prior_nat), sigma_ref_level, sigma_positivity, k)
-        if sigma_q_high_prior_nat is not None
-        else None
-    )
+    sigma_dims = ssp_priors_nat["sigma_q_loc_prior_nat"].dims
+    data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
+        "a0": (ssp_priors_nat["a0_nat"].dims, np.asarray(a0)),
+        "P0": (ssp_priors_nat["P0_nat"].dims, np.asarray(P0)),
+        "sigma_q_loc_prior": (sigma_dims, np.asarray(sigma_q_loc_prior)),
+        "sigma_q_scale_prior": (sigma_dims, np.asarray(sigma_q_scale_prior)),
+    }
 
-    if a_obs_nat is None:
-        a_obs = None
-        P_obs = None
-    else:
+    if "sigma_q_low_prior_nat" in ssp_priors_nat:
+        sigma_q_low_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_low_prior_nat"].values)
+        sigma_q_low_prior = _moment_match_sigma(
+            sigma_q_low_prior_nat, sigma_ref_level, sigma_positivity, k
+        )
+        data_vars["sigma_q_low_prior"] = (sigma_dims, np.asarray(sigma_q_low_prior))
+
+    if "sigma_q_high_prior_nat" in ssp_priors_nat:
+        sigma_q_high_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_high_prior_nat"].values)
+        sigma_q_high_prior = _moment_match_sigma(
+            sigma_q_high_prior_nat, sigma_ref_level, sigma_positivity, k
+        )
+        data_vars["sigma_q_high_prior"] = (sigma_dims, np.asarray(sigma_q_high_prior))
+
+    if has_a_obs:
+        a_obs_nat = jnp.asarray(ssp_priors_nat["a_obs_nat"].values)
+        P_obs_nat = jnp.asarray(ssp_priors_nat["P_obs_nat"].values)
+
         finite_var = jnp.isfinite(P_obs_nat)
         safe_var_obs = jnp.where(finite_var, P_obs_nat, 0.0)
         safe_loc_obs = jnp.where(a_obs_nat > 0, a_obs_nat, 1.0)
@@ -185,17 +195,18 @@ def transform_to_ekf(
         a_obs = jnp.where(transform_mask, mu_y_obs / k, a_obs_nat)
         P_obs = jnp.where(transform_mask, sigma_y_sq_obs / (k * k), P_obs_nat)
 
-    return {
-        "a0": a0,
-        "P0": P0,
-        "sigma_q_loc_prior": sigma_q_loc_prior,
-        "sigma_q_scale_prior": sigma_q_scale_prior,
-        "sigma_q_low_prior": sigma_q_low_prior,
-        "sigma_q_high_prior": sigma_q_high_prior,
-        "a_obs": a_obs,
-        "P_obs": P_obs,
-        "obs_idx": obs_idx,
-    }
+        obs_dims = ssp_priors_nat["a_obs_nat"].dims
+        data_vars["a_obs"] = (obs_dims, np.asarray(a_obs))
+        data_vars["P_obs"] = (obs_dims, np.asarray(P_obs))
+
+    if "obs_idx" in ssp_priors_nat:
+        obs_idx_var = ssp_priors_nat["obs_idx"]
+        data_vars["obs_idx"] = (obs_idx_var.dims, np.asarray(obs_idx_var.values))
+
+    pos_var = ssp_priors_nat["positivity_idx"]
+    data_vars["positivity_idx"] = (pos_var.dims, np.asarray(pos_var.values))
+
+    return xr.Dataset(data_vars=data_vars, coords=ssp_priors_nat.coords)
 
 
 def _moment_match_sigma(

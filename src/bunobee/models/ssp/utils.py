@@ -19,7 +19,8 @@ def construct_states_prior(
     n_points: int = 7,
     seed: int = 42,
     obs_scale: float = 0.1,
-) -> dict[str, np.ndarray]:
+    positivity_idx: np.ndarray | None = None,
+) -> xr.Dataset:
     """Construct a_obs and P_obs by disclosing the ground-truth latent
     state over n_periods randomly drawn windows of n_points consecutive steps.
 
@@ -42,16 +43,18 @@ def construct_states_prior(
     obs_scale : float
         Standard deviation expressing confidence in the disclosed state.
         Smaller → tighter prior; larger → more diffuse.
+    positivity_idx : np.ndarray or None, optional
+        Boolean mask of length ``n_states`` indicating which states use the
+        positivity (log-space) transform.  Defaults to ``[False, True, …]``
+        — intercept is linear, all regressors are positivity states.
 
     Returns
     -------
-    a_obs : jnp.ndarray, shape (n_steps, n_states)
-        Disclosed state means; zero where not disclosed.
-    P_obs : jnp.ndarray, shape (n_steps, n_states)
-        Disclosed state variances; inf where no information is provided
-        (intercept column always inf, undisclosed timesteps always inf).
-    obs_idx : np.ndarray
-        Sorted array of all disclosed time indices (for plotting).
+    xr.Dataset
+        Variables ``a_obs`` and ``P_obs`` with dims ``(time, state)``,
+        ``obs_idx`` with dim ``obs_point``, and ``positivity_idx`` with dim
+        ``state``.  Coords: ``time`` (0…n_steps-1),
+        ``state`` (["intercept", *regressors]), ``obs_point`` (integer range).
     """
     rng = np.random.default_rng(seed)
     # sample n_periods window starts; ensure each window fits within n_steps
@@ -67,7 +70,25 @@ def construct_states_prior(
     var_row = jnp.array([jnp.inf] + [obs_scale ** 2] * len(regressors))
     P_obs = P_obs.at[obs_idx].set(var_row)
 
-    return {"a_obs": a_obs, "P_obs": P_obs, "obs_idx": obs_idx}
+    if positivity_idx is None:
+        positivity_idx = np.array([False] + [True] * len(regressors))
+    else:
+        positivity_idx = np.asarray(positivity_idx, dtype=bool)
+
+    state_labels = ["intercept", *regressors]
+    return xr.Dataset(
+        {
+            "a_obs": (("time", "state"), np.asarray(a_obs)),
+            "P_obs": (("time", "state"), np.asarray(P_obs)),
+            "obs_idx": (("obs_point",), obs_idx),
+            "positivity_idx": (("state",), positivity_idx),
+        },
+        coords={
+            "time": np.arange(n_steps),
+            "state": state_labels,
+            "obs_point": np.arange(len(obs_idx)),
+        },
+    )
 
 
 def a_to_lam(
