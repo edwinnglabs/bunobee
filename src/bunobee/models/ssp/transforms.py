@@ -41,6 +41,12 @@ def transform_to_ekf(
     * mixed (one positivity, one linear): ``Cov(A_i, X_j) = C_ij / (k · μ_x_i)``
     * both linear: unchanged
 
+    The ``sigma_q`` prior family is selected by
+    ``ssp_priors_nat.attrs["sigma_q_family"]`` (default
+    ``"truncated_normal"``); the chosen family is propagated to
+    ``attrs["sigma_q_family"]`` on the returned dataset so downstream
+    samplers can dispatch on the same key.
+
     Parameters
     ----------
     ssp_priors_nat : xr.Dataset
@@ -50,27 +56,38 @@ def transform_to_ekf(
           selected by ``positivity_idx`` must be strictly positive.
         - ``P0_nat`` : dims ``(state, state_dual)`` — initial state
           covariance.
-        - ``sigma_q_loc_prior_nat`` : dims ``(state,)`` or compressed ``(2,)``
-          — hyperprior loc for ``sigma_q``. Per-state form is transformed
-          element-wise against ``a0_nat``. Compressed form
-          ``[first_state, shared_remaining]`` is transformed against
-          ``a0_nat[:2]`` as representatives; callers using the compressed
-          form must arrange states ``1:`` to share a common positivity flag
-          and reference level.
-        - ``sigma_q_scale_prior_nat`` : same dims as
-          ``sigma_q_loc_prior_nat``; transformed via the same per-element
-          formula as the loc.
         - ``positivity_idx`` : dims ``(state,)``, boolean — ``True`` selects
           states that use the nonlinear ``exp`` mapping in
           ``kalman_filter_1d_ekf``.
 
-        Optional variables:
+        ``sigma_q`` block, family ``"truncated_normal"`` (default):
 
-        - ``sigma_q_low_prior_nat`` / ``sigma_q_high_prior_nat`` : truncation
-          bounds for the ``sigma_q`` TruncatedNormal in natural scale; same
-          shape rules as ``sigma_q_loc_prior_nat``; transformed via the same
-          per-element formula as the loc. Omitted variables are absent from
-          the returned dataset.
+        - ``sigma_q_loc_prior_nat`` : dims ``(state,)`` or compressed ``(2,)``
+          — TruncatedNormal loc for ``sigma_q``. Per-state form is
+          transformed element-wise against ``a0_nat``. Compressed form
+          ``[first_state, shared_remaining]`` is transformed against
+          ``a0_nat[:2]`` as representatives; callers using the compressed
+          form must arrange states ``1:`` to share a common positivity flag
+          and reference level.
+        - ``sigma_q_scale_prior_nat`` : same dims; transformed via the same
+          per-element formula as the loc.
+        - ``sigma_q_low_prior_nat`` / ``sigma_q_high_prior_nat`` (optional):
+          TruncatedNormal truncation bounds in natural scale; transformed
+          identically to the loc.
+
+        ``sigma_q`` block, family ``"beta"``:
+
+        - ``sigma_q_alpha_prior`` / ``sigma_q_beta_prior`` : same shape rules
+          as ``sigma_q_scale_prior_nat`` — dimensionless Beta shape
+          parameters; passed through unchanged. Both must be ``> 1``
+          element-wise so the Beta has a defined mode.
+        - ``sigma_q_scale_prior_nat`` : multiplicative scale of the natural-
+          scale prior ``sigma_q ~ scale_nat · Beta(α, β)``. Rescaled to a
+          new ``scale_a`` so the mode of ``scale_a · Beta(α, β)`` in a-space
+          equals the pushforward of the natural-scale mode.
+
+        Other optional variables:
+
         - ``a_obs_nat`` / ``P_obs_nat`` : dims ``(time, state)`` — externally
           disclosed means / variances; ``jnp.inf`` in ``P_obs_nat`` marks
           undisclosed steps. Must be both present or both absent.
@@ -83,31 +100,38 @@ def transform_to_ekf(
     -------
     xr.Dataset
         a-space prior dataset with un-suffixed variable names: ``a0``,
-        ``P0`` (full covariance, symmetrised), ``sigma_q_loc_prior``,
-        ``sigma_q_scale_prior``, optionally ``sigma_q_low_prior``,
-        ``sigma_q_high_prior``, ``a_obs``, ``P_obs``, ``obs_idx``, and the
-        passthrough ``positivity_idx``. Dimensions and coordinates are
-        preserved from the input.
+        ``P0`` (full covariance, symmetrised), the family-specific sigma_q
+        variables (see above; suffix ``_nat`` is dropped on transformed
+        outputs), optionally ``a_obs``, ``P_obs``, ``obs_idx``, and the
+        passthrough ``positivity_idx``. ``attrs["sigma_q_family"]`` records
+        the selected family. Dimensions and coordinates are preserved from
+        the input.
 
     Raises
     ------
     ValueError
-        If ``positivity_idx`` is missing, or if exactly one of ``a_obs_nat``
-        / ``P_obs_nat`` is present.
+        If ``positivity_idx`` is missing, if ``sigma_q_family`` is
+        unrecognised, if the family's required sigma_q variables are
+        missing or shape-mismatched, if Beta shape parameters are not all
+        ``> 1``, or if exactly one of ``a_obs_nat`` / ``P_obs_nat`` is
+        present.
 
     Notes
     -----
     The ``sigma_q`` hyperprior is not a latent-state moment; it parameterises
     the process-noise scale itself. In the EKF a-space there is no exact
     state-independent analogue of a natural-scale additive ``sigma_q`` for a
-    positivity state, so the transform keeps the TruncatedNormal prior family
-    and applies a local positive scale conversion against the reference level
+    positivity state, so the transform keeps the chosen prior family and
+    applies a local positive scale conversion against the reference level
     from ``a0_nat``. For positivity entries this uses::
 
         sigma_a = sqrt(log(1 + (sigma_nat / ref_level)^2)) / exponent
 
     which stays positive and matches the small-noise limit
-    ``sigma_a ≈ sigma_nat / (exponent · ref_level)``.
+    ``sigma_a ≈ sigma_nat / (exponent · ref_level)``. For the ``"beta"``
+    family the same map is applied to the natural-scale mode
+    ``scale_nat · (α − 1) / (α + β − 2)`` and the result is divided back by
+    the mode fraction to recover the a-space scale.
     """
     if "positivity_idx" not in ssp_priors_nat:
         raise ValueError("ssp_priors_nat must contain a `positivity_idx` variable")
@@ -117,17 +141,11 @@ def transform_to_ekf(
     if has_a_obs != has_P_obs:
         raise ValueError("a_obs_nat and P_obs_nat must both be present or both be absent")
 
+    family = ssp_priors_nat.attrs.get("sigma_q_family", "truncated_normal")
+
     positivity = jnp.asarray(ssp_priors_nat["positivity_idx"].values, dtype=bool)
     a0_nat = jnp.asarray(ssp_priors_nat["a0_nat"].values)
     P0_nat = jnp.asarray(ssp_priors_nat["P0_nat"].values)
-    sigma_q_loc_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"].values)
-    sigma_q_scale_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"].values)
-
-    if sigma_q_loc_prior_nat.shape != sigma_q_scale_prior_nat.shape:
-        raise ValueError(
-            "sigma_q_loc_prior_nat and sigma_q_scale_prior_nat must share the same shape; "
-            f"got {sigma_q_loc_prior_nat.shape} and {sigma_q_scale_prior_nat.shape}"
-        )
 
     k = exponent
     n_states = a0_nat.shape[0]
@@ -148,37 +166,13 @@ def transform_to_ekf(
     P0 = jnp.where(both_pos, cov_both, cov_mixed)
     P0 = 0.5 * (P0 + P0.T)
 
-    sigma_ref_level, sigma_positivity = _resolve_sigma_alignment(
-        sigma_q_loc_prior_nat.shape, n_states, safe_init, positivity
-    )
-    sigma_q_loc_prior = _moment_match_sigma(
-        sigma_q_loc_prior_nat, sigma_ref_level, sigma_positivity, k
-    )
-    sigma_q_scale_prior = _moment_match_sigma(
-        sigma_q_scale_prior_nat, sigma_ref_level, sigma_positivity, k
-    )
-
-    sigma_dims = ssp_priors_nat["sigma_q_loc_prior_nat"].dims
     data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
         "a0": (ssp_priors_nat["a0_nat"].dims, np.asarray(a0)),
         "P0": (ssp_priors_nat["P0_nat"].dims, np.asarray(P0)),
-        "sigma_q_loc_prior": (sigma_dims, np.asarray(sigma_q_loc_prior)),
-        "sigma_q_scale_prior": (sigma_dims, np.asarray(sigma_q_scale_prior)),
     }
-
-    if "sigma_q_low_prior_nat" in ssp_priors_nat:
-        sigma_q_low_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_low_prior_nat"].values)
-        sigma_q_low_prior = _moment_match_sigma(
-            sigma_q_low_prior_nat, sigma_ref_level, sigma_positivity, k
-        )
-        data_vars["sigma_q_low_prior"] = (sigma_dims, np.asarray(sigma_q_low_prior))
-
-    if "sigma_q_high_prior_nat" in ssp_priors_nat:
-        sigma_q_high_prior_nat = jnp.asarray(ssp_priors_nat["sigma_q_high_prior_nat"].values)
-        sigma_q_high_prior = _moment_match_sigma(
-            sigma_q_high_prior_nat, sigma_ref_level, sigma_positivity, k
-        )
-        data_vars["sigma_q_high_prior"] = (sigma_dims, np.asarray(sigma_q_high_prior))
+    data_vars.update(
+        _transform_sigma_q_block(ssp_priors_nat, family, n_states, safe_init, positivity, k)
+    )
 
     if has_a_obs:
         a_obs_nat = jnp.asarray(ssp_priors_nat["a_obs_nat"].values)
@@ -206,7 +200,11 @@ def transform_to_ekf(
     pos_var = ssp_priors_nat["positivity_idx"]
     data_vars["positivity_idx"] = (pos_var.dims, np.asarray(pos_var.values))
 
-    return xr.Dataset(data_vars=data_vars, coords=ssp_priors_nat.coords)
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=ssp_priors_nat.coords,
+        attrs={"sigma_q_family": family},
+    )
 
 
 def _moment_match_sigma(
@@ -283,3 +281,125 @@ def _resolve_sigma_alignment(
         "sigma_q prior shape must be (n_states,) or compressed (2,); "
         f"got shape {sigma_shape} for n_states={n_states}"
     )
+
+
+def _transform_sigma_q_block(
+    ssp_priors_nat: xr.Dataset,
+    family: str,
+    n_states: int,
+    safe_init: jnp.ndarray,
+    positivity: jnp.ndarray,
+    k: float,
+) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
+    """Dispatch sigma_q natural→a-space conversion on the chosen prior family.
+
+    See ``transform_to_ekf`` for the per-family schema. Both branches reuse
+    ``_moment_match_sigma`` for sigma-like quantities and
+    ``_resolve_sigma_alignment`` for the per-state vs compressed ``(2,)``
+    shape rules.
+    """
+    if family == "truncated_normal":
+        return _transform_sigma_q_truncated_normal(
+            ssp_priors_nat, n_states, safe_init, positivity, k
+        )
+    if family == "beta":
+        return _transform_sigma_q_beta(
+            ssp_priors_nat, n_states, safe_init, positivity, k
+        )
+    raise ValueError(
+        f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'"
+    )
+
+
+def _transform_sigma_q_truncated_normal(
+    ssp_priors_nat: xr.Dataset,
+    n_states: int,
+    safe_init: jnp.ndarray,
+    positivity: jnp.ndarray,
+    k: float,
+) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
+    for name in ("sigma_q_loc_prior_nat", "sigma_q_scale_prior_nat"):
+        if name not in ssp_priors_nat:
+            raise ValueError(f"sigma_q_family='truncated_normal' requires {name!r}")
+
+    loc_nat = jnp.asarray(ssp_priors_nat["sigma_q_loc_prior_nat"].values)
+    scale_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"].values)
+    if loc_nat.shape != scale_nat.shape:
+        raise ValueError(
+            "sigma_q_loc_prior_nat and sigma_q_scale_prior_nat must share the same shape; "
+            f"got {loc_nat.shape} and {scale_nat.shape}"
+        )
+
+    ref_level, sigma_positivity = _resolve_sigma_alignment(
+        loc_nat.shape, n_states, safe_init, positivity
+    )
+    sigma_dims = ssp_priors_nat["sigma_q_loc_prior_nat"].dims
+
+    out: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
+        "sigma_q_loc_prior": (
+            sigma_dims,
+            np.asarray(_moment_match_sigma(loc_nat, ref_level, sigma_positivity, k)),
+        ),
+        "sigma_q_scale_prior": (
+            sigma_dims,
+            np.asarray(_moment_match_sigma(scale_nat, ref_level, sigma_positivity, k)),
+        ),
+    }
+
+    for src_name, out_name in (
+        ("sigma_q_low_prior_nat", "sigma_q_low_prior"),
+        ("sigma_q_high_prior_nat", "sigma_q_high_prior"),
+    ):
+        if src_name in ssp_priors_nat:
+            arr = jnp.asarray(ssp_priors_nat[src_name].values)
+            out[out_name] = (
+                sigma_dims,
+                np.asarray(_moment_match_sigma(arr, ref_level, sigma_positivity, k)),
+            )
+
+    return out
+
+
+def _transform_sigma_q_beta(
+    ssp_priors_nat: xr.Dataset,
+    n_states: int,
+    safe_init: jnp.ndarray,
+    positivity: jnp.ndarray,
+    k: float,
+) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
+    required = ("sigma_q_alpha_prior", "sigma_q_beta_prior", "sigma_q_scale_prior_nat")
+    for name in required:
+        if name not in ssp_priors_nat:
+            raise ValueError(f"sigma_q_family='beta' requires {name!r}")
+
+    alpha = jnp.asarray(ssp_priors_nat["sigma_q_alpha_prior"].values)
+    beta = jnp.asarray(ssp_priors_nat["sigma_q_beta_prior"].values)
+    scale_nat = jnp.asarray(ssp_priors_nat["sigma_q_scale_prior_nat"].values)
+    if alpha.shape != beta.shape or alpha.shape != scale_nat.shape:
+        raise ValueError(
+            "sigma_q_alpha_prior, sigma_q_beta_prior, and sigma_q_scale_prior_nat must share the same shape; "
+            f"got {alpha.shape}, {beta.shape}, and {scale_nat.shape}"
+        )
+
+    # Mode-matching requires a defined mode for Beta(alpha, beta), i.e. both > 1.
+    if bool(jnp.any(alpha <= 1.0)) or bool(jnp.any(beta <= 1.0)):
+        raise ValueError(
+            "Beta mode-matching requires alpha > 1 and beta > 1 element-wise; "
+            f"got alpha={np.asarray(alpha)}, beta={np.asarray(beta)}"
+        )
+
+    ref_level, sigma_positivity = _resolve_sigma_alignment(
+        scale_nat.shape, n_states, safe_init, positivity
+    )
+    sigma_dims = ssp_priors_nat["sigma_q_scale_prior_nat"].dims
+
+    mode_frac = (alpha - 1.0) / (alpha + beta - 2.0)
+    mode_nat = scale_nat * mode_frac
+    mode_a = _moment_match_sigma(mode_nat, ref_level, sigma_positivity, k)
+    scale_a = jnp.where(sigma_positivity, mode_a / mode_frac, scale_nat)
+
+    return {
+        "sigma_q_alpha_prior": (sigma_dims, np.asarray(alpha)),
+        "sigma_q_beta_prior": (sigma_dims, np.asarray(beta)),
+        "sigma_q_scale_prior": (sigma_dims, np.asarray(scale_a)),
+    }
