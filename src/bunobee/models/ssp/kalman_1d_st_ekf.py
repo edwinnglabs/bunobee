@@ -5,7 +5,7 @@ import logging
 import jax.numpy as jnp
 from jax import lax
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("bunobee")
 
 
 def kalman_filter_1d_ekf_st(
