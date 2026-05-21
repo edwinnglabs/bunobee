@@ -6,20 +6,36 @@ This module converts a natural-scale prior dataset, written in the same
 variable names used by the linear filters, into the a-space prior dataset
 consumed by the EKF filters.
 
-Moment matching (per positivity state ``i`` with reference level ``mu_x_i > 0``
-and variance ``sigma_x_i^2 >= 0``)::
+The ``match`` argument selects how a positivity state with reference level
+``mu_x > 0`` and variance ``sigma_x^2 >= 0`` maps to ``(mu_a, sigma_a^2)``:
 
-    sigma_y_i^2 = log(1 + sigma_x_i^2 / mu_x_i^2)
-    mu_y_i      = log(mu_x_i) - 0.5 * sigma_y_i^2
-    mu_a_i      = mu_y_i / k
-    sigma_a_i^2 = sigma_y_i^2 / k^2
+``"mean"`` (default, lognormal mean-matching)::
 
-Linear states pass through unchanged. Entries of ``P_obs`` equal to ``jnp.inf``
-are preserved as undisclosed-timestep no-ops.
+    sigma_y^2 = log(1 + sigma_x^2 / mu_x^2)
+    mu_a      = (log(mu_x) - 0.5 * sigma_y^2) / k       # E[exp(k*A)] = mu_x
+    sigma_a^2 = sigma_y^2 / k^2
+
+``"median"`` (mode/median-matching; the filter's linearisation point
+``exp(k * a0) = mu_x`` exactly, but ``E[exp(k*A)] > mu_x``)::
+
+    sigma_y^2 = log(1 + sigma_x^2 / mu_x^2)
+    mu_a      = log(mu_x) / k
+    sigma_a^2 = sigma_y^2 / k^2
+
+``"linearize"`` (delta-method; same ``mu_a`` as median, variance from a local
+first-order expansion around ``mu_x``)::
+
+    mu_a      = log(mu_x) / k
+    sigma_a^2 = sigma_x^2 / (k * mu_x)^2
+
+Linear states pass through unchanged in all modes. Entries of ``P_obs`` equal
+to ``jnp.inf`` are preserved as undisclosed-timestep no-ops.
 
 The ``sigma_q`` hyperprior is not a state moment but a process-noise scale.
 The transform applies a local positive-scale conversion against the reference
-level from ``a0`` (see :func:`_moment_match_sigma`).
+level from ``a0`` (see :func:`_moment_match_sigma`) using the same ``match``
+mode -- ``"mean"`` and ``"median"`` share the lognormal variance map;
+``"linearize"`` uses ``sigma_a = sigma_x / (k * ref_level)``.
 
 Two public entry points target the two EKF filters:
 
@@ -30,12 +46,23 @@ Two public entry points target the two EKF filters:
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 
 logger = logging.getLogger("bunobee")
+
+MatchMode = Literal["mean", "median", "linearize"]
+_VALID_MATCH: tuple[str, ...] = ("mean", "median", "linearize")
+
+
+def _validate_match(match: str) -> None:
+    if match not in _VALID_MATCH:
+        raise ValueError(
+            f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}"
+        )
 
 
 def _validate_common(ssp_priors: xr.Dataset) -> None:
@@ -54,28 +81,45 @@ def _compute_a0_a_space(
     var_diag: jnp.ndarray,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Return ``(a0_a, safe_init, sigma_y_sq_diag)``.
+    """Return ``(a0_a, safe_init, var_a_diag)`` under the chosen match mode.
 
     ``var_diag`` is a 1-D vector of state variances (the caller passes ``P0``
-    directly when 1-D, or ``jnp.diag(P0)`` when 2-D).
+    directly when 1-D, or ``jnp.diag(P0)`` when 2-D). ``var_a_diag`` is the
+    a-space diagonal variance for positivity states and passes ``var_diag``
+    through unchanged for linear states. See the module docstring for the
+    per-mode formulas.
     """
     safe_init = jnp.where(positivity, a0_nat, 1.0)
     sigma_y_sq_diag = jnp.log1p(var_diag / jnp.square(safe_init))
-    mu_y = jnp.log(safe_init) - 0.5 * sigma_y_sq_diag
+
+    if match == "linearize":
+        var_a_pos = var_diag / jnp.square(k * safe_init)
+        mu_y = jnp.log(safe_init)
+    elif match == "median":
+        var_a_pos = sigma_y_sq_diag / (k * k)
+        mu_y = jnp.log(safe_init)
+    else:  # "mean"
+        var_a_pos = sigma_y_sq_diag / (k * k)
+        mu_y = jnp.log(safe_init) - 0.5 * sigma_y_sq_diag
+
     a0_a = jnp.where(positivity, mu_y / k, a0_nat)
-    return a0_a, safe_init, sigma_y_sq_diag
+    var_a_diag = jnp.where(positivity, var_a_pos, var_diag)
+    return a0_a, safe_init, var_a_diag
 
 
 def _transform_obs_block(
     ssp_priors: xr.Dataset,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
     """Transform ``a_obs`` / ``P_obs`` to a-space; return ``{}`` if absent.
 
     Element-wise on ``(time, state)``; independent of ``P0`` shape. Entries of
     ``P_obs`` equal to ``jnp.inf`` are preserved as undisclosed-step no-ops.
+    Uses the same ``match`` mode as ``a0`` -- see the module docstring.
     """
     if "a_obs" not in ssp_priors:
         return {}
@@ -88,11 +132,20 @@ def _transform_obs_block(
     safe_loc_obs = jnp.where(a_obs_nat > 0, a_obs_nat, 1.0)
 
     sigma_y_sq_obs = jnp.log1p(safe_var_obs / jnp.square(safe_loc_obs))
-    mu_y_obs = jnp.log(safe_loc_obs) - 0.5 * sigma_y_sq_obs
+
+    if match == "linearize":
+        var_a_obs = safe_var_obs / jnp.square(k * safe_loc_obs)
+        mu_y_obs = jnp.log(safe_loc_obs)
+    elif match == "median":
+        var_a_obs = sigma_y_sq_obs / (k * k)
+        mu_y_obs = jnp.log(safe_loc_obs)
+    else:  # "mean"
+        var_a_obs = sigma_y_sq_obs / (k * k)
+        mu_y_obs = jnp.log(safe_loc_obs) - 0.5 * sigma_y_sq_obs
 
     transform_mask = positivity[None, :] & finite_var
     a_obs = jnp.where(transform_mask, mu_y_obs / k, a_obs_nat)
-    P_obs = jnp.where(transform_mask, sigma_y_sq_obs / (k * k), P_obs_nat)
+    P_obs = jnp.where(transform_mask, var_a_obs, P_obs_nat)
 
     obs_dims = ssp_priors["a_obs"].dims
     return {
@@ -104,6 +157,7 @@ def _transform_obs_block(
 def transform_to_ekf(
     ssp_priors: xr.Dataset,
     exponent: float = 0.5,
+    match: MatchMode = "mean",
 ) -> xr.Dataset:
     """Transform natural-scale priors to a-space for ``kalman_filter_1d_ekf``.
 
@@ -111,7 +165,7 @@ def transform_to_ekf(
     output ``P0`` is also 1-D. For full-covariance ``P0``, use
     :func:`transform_to_ekf_st`.
 
-    See the module docstring for the moment-matching formulas and ``sigma_q``
+    See the module docstring for the per-mode formulas and ``sigma_q``
     conventions. The ``sigma_q`` prior family is selected by
     ``ssp_priors.attrs["sigma_q_family"]`` (default ``"truncated_normal"``);
     the chosen family is propagated to ``attrs["sigma_q_family"]`` on the
@@ -128,21 +182,28 @@ def transform_to_ekf(
         ``obs_idx`` (passed through).
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k * a)``. Default 0.5.
+    match : {"mean", "median", "linearize"}, optional
+        Moment-matching mode for positivity states. Default ``"mean"``
+        (lognormal mean-match, backward-compatible). See module docstring
+        for full formulas. Applied consistently to ``a0``/``P0``,
+        ``a_obs``/``P_obs``, and the ``sigma_q`` block.
 
     Returns
     -------
     xr.Dataset
         a-space prior dataset with ``P0`` dims ``(state,)``. Dimensions,
-        coordinates, and ``attrs["sigma_q_family"]`` are preserved.
+        coordinates, and ``attrs["sigma_q_family"]`` are preserved;
+        ``attrs["match"]`` records the mode used.
 
     Raises
     ------
     ValueError
         If ``P0`` is not 1-D, if ``positivity_idx`` is missing, if exactly one
-        of ``a_obs`` / ``P_obs`` is present, or if the ``sigma_q`` block
-        violates its family-specific constraints.
+        of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
+        or if the ``sigma_q`` block violates its family-specific constraints.
     """
     _validate_common(ssp_priors)
+    _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
     if P0.ndim != 1:
@@ -158,17 +219,18 @@ def transform_to_ekf(
     k = exponent
     n_states = a0_nat.shape[0]
 
-    a0_a, safe_init, sigma_y_sq_diag = _compute_a0_a_space(a0_nat, P0, positivity, k)
-    P0_a = jnp.where(positivity, sigma_y_sq_diag / (k * k), P0)
+    a0_a, safe_init, P0_a = _compute_a0_a_space(a0_nat, P0, positivity, k, match)
 
     data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
         "a0": (ssp_priors["a0"].dims, np.asarray(a0_a)),
         "P0": (("state",), np.asarray(P0_a)),
     }
     data_vars.update(
-        _transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k)
+        _transform_sigma_q_block(
+            ssp_priors, family, n_states, safe_init, positivity, k, match
+        )
     )
-    data_vars.update(_transform_obs_block(ssp_priors, positivity, k))
+    data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
     if "obs_idx" in ssp_priors:
         obs_idx_var = ssp_priors["obs_idx"]
@@ -180,13 +242,14 @@ def transform_to_ekf(
     return xr.Dataset(
         data_vars=data_vars,
         coords=dict(ssp_priors.coords),
-        attrs={"sigma_q_family": family},
+        attrs={"sigma_q_family": family, "match": match},
     )
 
 
 def transform_to_ekf_st(
     ssp_priors: xr.Dataset,
     exponent: float = 0.5,
+    match: MatchMode = "mean",
 ) -> xr.Dataset:
     """Transform natural-scale priors to a-space for ``kalman_filter_1d_ekf_st``.
 
@@ -194,11 +257,21 @@ def transform_to_ekf_st(
     ``(state, state_dual)``. The output ``P0`` preserves the input dims and is
     symmetrised. For diagonal ``P0``, use :func:`transform_to_ekf`.
 
-    See the module docstring for the moment-matching formulas on the diagonal.
-    Off-diagonals are transformed as follows (with ``k = exponent``):
+    See the module docstring for the per-mode diagonal formulas. Off-diagonals
+    are transformed as follows (with ``k = exponent``):
 
-    * both states positivity: ``Cov(A_i, A_j) = log(1 + C_ij / (mu_x_i mu_x_j)) / k^2``
-    * mixed (one positivity, one linear): ``Cov(A_i, X_j) = C_ij / (k * mu_x_i)``
+    * both states positivity, ``match in {"mean", "median"}``::
+
+          Cov(A_i, A_j) = log(1 + C_ij / (mu_x_i mu_x_j)) / k^2
+
+    * both states positivity, ``match = "linearize"``::
+
+          Cov(A_i, A_j) = C_ij / (k^2 * mu_x_i * mu_x_j)
+
+    * mixed (one positivity, one linear), all modes::
+
+          Cov(A_i, X_j) = C_ij / (k * mu_x_i)
+
     * both linear: unchanged
 
     Parameters
@@ -231,22 +304,28 @@ def transform_to_ekf_st(
         ``obs_idx`` (passed through).
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k * a)``. Default 0.5.
+    match : {"mean", "median", "linearize"}, optional
+        Moment-matching mode for positivity states. Default ``"mean"``
+        (lognormal mean-match, backward-compatible). Applied consistently
+        to ``a0``/``P0`` (diagonal and off-diagonal), ``a_obs``/``P_obs``,
+        and the ``sigma_q`` block.
 
     Returns
     -------
     xr.Dataset
         a-space prior dataset with ``P0`` dims ``(state, state_dual)``,
         symmetrised. Dimensions, coordinates, and ``attrs["sigma_q_family"]``
-        are preserved.
+        are preserved; ``attrs["match"]`` records the mode used.
 
     Raises
     ------
     ValueError
         If ``P0`` is not 2-D, if ``positivity_idx`` is missing, if exactly one
-        of ``a_obs`` / ``P_obs`` is present, or if the ``sigma_q`` block
-        violates its family-specific constraints.
+        of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
+        or if the ``sigma_q`` block violates its family-specific constraints.
     """
     _validate_common(ssp_priors)
+    _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
     if P0.ndim != 2:
@@ -262,15 +341,28 @@ def transform_to_ekf_st(
     k = exponent
     n_states = a0_nat.shape[0]
 
-    a0_a, safe_init, _ = _compute_a0_a_space(a0_nat, jnp.diag(P0), positivity, k)
+    a0_a, safe_init, var_a_diag = _compute_a0_a_space(
+        a0_nat, jnp.diag(P0), positivity, k, match
+    )
 
-    safe_init_outer = safe_init[:, None] * safe_init[None, :]
-    cov_both = jnp.log1p(P0 / safe_init_outer) / (k * k)
+    # Linearize/mixed-block formula: divide by k*mu for each positivity axis,
+    # leave linear axes alone (denom = 1). For "mean"/"median" the both-pos
+    # block instead uses the lognormal pushforward log1p(C/(mu_i mu_j))/k^2.
     denom_i = jnp.where(positivity, k * safe_init, 1.0)[:, None]
     denom_j = jnp.where(positivity, k * safe_init, 1.0)[None, :]
-    cov_mixed = P0 / (denom_i * denom_j)
+    cov_linearize = P0 / (denom_i * denom_j)
     both_pos = positivity[:, None] & positivity[None, :]
-    P0_a = jnp.where(both_pos, cov_both, cov_mixed)
+
+    if match == "linearize":
+        P0_a = cov_linearize
+    else:
+        safe_init_outer = safe_init[:, None] * safe_init[None, :]
+        cov_both = jnp.log1p(P0 / safe_init_outer) / (k * k)
+        P0_a = jnp.where(both_pos, cov_both, cov_linearize)
+
+    # Overwrite the diagonal with the per-mode diagonal computed by
+    # _compute_a0_a_space — keeps a single source of truth across variants.
+    P0_a = P0_a.at[jnp.diag_indices(n_states)].set(var_a_diag)
     P0_a = 0.5 * (P0_a + P0_a.T)
 
     data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
@@ -278,9 +370,11 @@ def transform_to_ekf_st(
         "P0": (ssp_priors["P0"].dims, np.asarray(P0_a)),
     }
     data_vars.update(
-        _transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k)
+        _transform_sigma_q_block(
+            ssp_priors, family, n_states, safe_init, positivity, k, match
+        )
     )
-    data_vars.update(_transform_obs_block(ssp_priors, positivity, k))
+    data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
     if "obs_idx" in ssp_priors:
         obs_idx_var = ssp_priors["obs_idx"]
@@ -292,7 +386,7 @@ def transform_to_ekf_st(
     return xr.Dataset(
         data_vars=data_vars,
         coords=dict(ssp_priors.coords),
-        attrs={"sigma_q_family": family},
+        attrs={"sigma_q_family": family, "match": match},
     )
 
 
@@ -301,26 +395,21 @@ def _moment_match_sigma(
     ref_level: jnp.ndarray,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> jnp.ndarray:
     """Convert natural-scale increment standard deviations into a-space scales.
 
     For positivity states the EKF uses the latent parameterisation
     ``lambda = exp(k * a)``, so an additive standard deviation specified on the
     natural scale must be converted into the corresponding standard deviation of
-    the latent increment ``eta_a``. Using a local reference level
-    ``lambda_ref = ref_level``, this helper applies the same variance map as the
-    diagonal ``P0`` transform, but without the mean-shift term required for
-    state-level moment matching:
+    the latent increment ``eta_a``. ``sigma_q`` is a zero-mean increment scale,
+    so the mean-correction term used for state-level moment matching does not
+    apply -- ``"mean"`` and ``"median"`` therefore share the same formula here:
 
-    ``sigma_a^2 = log(1 + sigma_nat^2 / lambda_ref^2) / k^2``
+    ``sigma_a = sqrt(log(1 + sigma_nat^2 / lambda_ref^2)) / k``       (mean, median)
+    ``sigma_a = sigma_nat / (k * lambda_ref)``                        (linearize)
 
-    and therefore
-
-    ``sigma_a = sqrt(log(1 + sigma_nat^2 / lambda_ref^2)) / k``.
-
-    This is appropriate for ``sigma_q`` because it parameterises the scale of a
-    zero-mean increment, not the mean/variance pair of a latent state level.
-    Linear states pass through unchanged.
+    Linear states pass through unchanged in all modes.
 
     Parameters
     ----------
@@ -335,6 +424,9 @@ def _moment_match_sigma(
         ``lambda = exp(k * a)`` mapping.
     k : float
         Exponent in the forward map ``lambda = exp(k * a)``.
+    match : {"mean", "median", "linearize"}, optional
+        Moment-matching mode. ``"mean"`` and ``"median"`` share the lognormal
+        variance map; ``"linearize"`` uses the delta-method approximation.
 
     Returns
     -------
@@ -343,8 +435,12 @@ def _moment_match_sigma(
         unchanged.
     """
     sigma_arr = jnp.broadcast_to(jnp.asarray(sigma_nat), ref_level.shape)
-    sq_sigma_y_sq = jnp.log1p(jnp.square(sigma_arr) / jnp.square(ref_level))
-    return jnp.where(positivity, jnp.sqrt(sq_sigma_y_sq) / k, sigma_arr)
+    if match == "linearize":
+        sigma_a = sigma_arr / (k * ref_level)
+    else:
+        sq_sigma_y_sq = jnp.log1p(jnp.square(sigma_arr) / jnp.square(ref_level))
+        sigma_a = jnp.sqrt(sq_sigma_y_sq) / k
+    return jnp.where(positivity, sigma_a, sigma_arr)
 
 
 def _resolve_sigma_alignment(
@@ -379,21 +475,22 @@ def _transform_sigma_q_block(
     safe_init: jnp.ndarray,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
     """Dispatch sigma_q natural to a-space conversion on the chosen prior family.
 
     See the module docstring for the per-family schema. Both branches reuse
     ``_moment_match_sigma`` for sigma-like quantities and
     ``_resolve_sigma_alignment`` for the per-state vs compressed ``(2,)``
-    shape rules.
+    shape rules; ``match`` is forwarded to ``_moment_match_sigma``.
     """
     if family == "truncated_normal":
         return _transform_sigma_q_truncated_normal(
-            ssp_priors, n_states, safe_init, positivity, k
+            ssp_priors, n_states, safe_init, positivity, k, match
         )
     if family == "beta":
         return _transform_sigma_q_beta(
-            ssp_priors, n_states, safe_init, positivity, k
+            ssp_priors, n_states, safe_init, positivity, k, match
         )
     raise ValueError(
         f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'"
@@ -406,6 +503,7 @@ def _transform_sigma_q_truncated_normal(
     safe_init: jnp.ndarray,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
     for name in ("sigma_q_loc_prior", "sigma_q_scale_prior"):
         if name not in ssp_priors:
@@ -427,11 +525,11 @@ def _transform_sigma_q_truncated_normal(
     out: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
         "sigma_q_loc_prior": (
             sigma_dims,
-            np.asarray(_moment_match_sigma(loc_nat, ref_level, sigma_positivity, k)),
+            np.asarray(_moment_match_sigma(loc_nat, ref_level, sigma_positivity, k, match)),
         ),
         "sigma_q_scale_prior": (
             sigma_dims,
-            np.asarray(_moment_match_sigma(scale_nat, ref_level, sigma_positivity, k)),
+            np.asarray(_moment_match_sigma(scale_nat, ref_level, sigma_positivity, k, match)),
         ),
     }
 
@@ -443,7 +541,7 @@ def _transform_sigma_q_truncated_normal(
             arr = jnp.asarray(ssp_priors[src_name].values)
             out[out_name] = (
                 sigma_dims,
-                np.asarray(_moment_match_sigma(arr, ref_level, sigma_positivity, k)),
+                np.asarray(_moment_match_sigma(arr, ref_level, sigma_positivity, k, match)),
             )
 
     return out
@@ -455,6 +553,7 @@ def _transform_sigma_q_beta(
     safe_init: jnp.ndarray,
     positivity: jnp.ndarray,
     k: float,
+    match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
     required = ("sigma_q_alpha_prior", "sigma_q_beta_prior", "sigma_q_scale_prior")
     for name in required:
@@ -484,7 +583,7 @@ def _transform_sigma_q_beta(
 
     mode_frac = (alpha - 1.0) / (alpha + beta - 2.0)
     mode_nat = scale_nat * mode_frac
-    mode_a = _moment_match_sigma(mode_nat, ref_level, sigma_positivity, k)
+    mode_a = _moment_match_sigma(mode_nat, ref_level, sigma_positivity, k, match)
     scale_a = jnp.where(sigma_positivity, mode_a / mode_frac, scale_nat)
 
     return {

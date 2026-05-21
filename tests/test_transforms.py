@@ -455,6 +455,127 @@ class TestTransformToEkfBeta:
             transform_to_ekf(priors)
 
 
+class TestMatchModes:
+    """`match` argument: mean / median / linearize."""
+
+    def test_median_drops_mean_correction(self):
+        # Median match: exp(k * a0_a) = mu_x exactly; variance unchanged from mean-match.
+        a0_nat = jnp.array([0.1, 0.1])
+        P0_diag = jnp.array([0.1, 0.1])
+        positivity = jnp.array([True, False])  # linear second state for sanity
+
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1),
+            exponent=K,
+            match="median",
+        )
+
+        # Positivity state: a0_a = log(mu_x)/k, lambda(a0_a) = mu_x.
+        assert jnp.allclose(out["a0"].values[0], float(jnp.log(0.1)) / K, atol=1e-12)
+        assert jnp.allclose(jnp.exp(K * out["a0"].values[0]), 0.1, atol=1e-12)
+        # Variance is the same as mean-match: log1p(0.1 / 0.01) / k^2.
+        _, var_ref = _closed_form(0.1, 0.1)
+        assert jnp.allclose(out["P0"].values[0], var_ref, atol=1e-12)
+        # Linear state passes through.
+        assert jnp.allclose(out["a0"].values[1], 0.1, atol=1e-12)
+        assert jnp.allclose(out["P0"].values[1], 0.1, atol=1e-12)
+        assert out.attrs["match"] == "median"
+
+    def test_linearize_uses_delta_method(self):
+        # Linearize: sigma_a = sigma_x / (k * mu_x); a0 same as median.
+        a0_nat = jnp.array([0.1, 0.1])
+        P0_diag = jnp.array([0.1, 0.1])
+        positivity = jnp.array([True, False])
+
+        out = transform_to_ekf(
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.05),
+            exponent=K,
+            match="linearize",
+        )
+
+        assert jnp.allclose(out["a0"].values[0], float(jnp.log(0.1)) / K, atol=1e-12)
+        # Delta-method variance: P0_a = P0_nat / (k * mu_x)^2 = 0.1 / 0.0025 = 40.
+        assert jnp.allclose(out["P0"].values[0], 0.1 / (K * 0.1) ** 2, atol=1e-12)
+        # sigma_q via delta: 0.05 / (0.5 * 0.1) = 1.0
+        assert jnp.allclose(out["sigma_q_loc_prior"].values[0], 0.05 / (K * 0.1), atol=1e-12)
+        # Linear state pass-through everywhere.
+        assert jnp.allclose(out["a0"].values[1], 0.1, atol=1e-12)
+        assert jnp.allclose(out["P0"].values[1], 0.1, atol=1e-12)
+        assert jnp.allclose(out["sigma_q_loc_prior"].values[1], 0.05, atol=1e-12)
+        assert out.attrs["match"] == "linearize"
+
+    def test_mean_is_backward_compatible_default(self):
+        # Calling without `match` should match the explicit mean-match formula.
+        a0_nat = jnp.array([0.3, 1.5])
+        P0_diag = jnp.array([0.1, 0.4])
+        positivity = jnp.array([True, True])
+
+        out_default = transform_to_ekf(
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1), exponent=K,
+        )
+        out_explicit = transform_to_ekf(
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1), exponent=K,
+            match="mean",
+        )
+
+        assert jnp.allclose(out_default["a0"].values, out_explicit["a0"].values)
+        assert jnp.allclose(out_default["P0"].values, out_explicit["P0"].values)
+        assert jnp.allclose(
+            out_default["sigma_q_loc_prior"].values,
+            out_explicit["sigma_q_loc_prior"].values,
+        )
+
+    def test_a_obs_uses_match_mode(self):
+        # a_obs/P_obs should follow the same match formula as a0/P0.
+        n_steps = 2
+        a0_nat = jnp.array([0.1])
+        P0_diag = jnp.array([0.01])
+        positivity = jnp.array([True])
+        a_obs_nat = jnp.array([[0.2], [0.5]])
+        P_obs_nat = jnp.array([[0.04], [jnp.inf]])
+
+        out = transform_to_ekf(
+            _make_priors(
+                a0_nat, P0_diag, positivity,
+                sigma_loc=0.05, a_obs_nat=a_obs_nat, P_obs_nat=P_obs_nat,
+            ),
+            exponent=K,
+            match="linearize",
+        )
+
+        # Disclosed step: linearize formula.
+        assert jnp.allclose(out["a_obs"].values[0, 0], float(jnp.log(0.2)) / K, atol=1e-12)
+        assert jnp.allclose(out["P_obs"].values[0, 0], 0.04 / (K * 0.2) ** 2, atol=1e-12)
+        # Undisclosed step: inf preserved, a_obs passed through.
+        assert jnp.isinf(out["P_obs"].values[1, 0])
+        assert jnp.allclose(out["a_obs"].values[1, 0], 0.5, atol=1e-12)
+
+    def test_st_linearize_off_diagonal(self):
+        # Both-positivity off-diag under linearize: C / (k^2 * mu_i * mu_j).
+        a0_nat = jnp.array([0.1, 0.2])
+        P0_nat = jnp.array([[0.01, 0.005], [0.005, 0.04]])
+        positivity = jnp.array([True, True])
+
+        out = transform_to_ekf_st(
+            _make_priors(a0_nat, P0_nat, positivity), exponent=K, match="linearize",
+        )
+
+        off_ref = 0.005 / (K * K * 0.1 * 0.2)
+        assert jnp.allclose(out["P0"].values[0, 1], off_ref, atol=1e-12)
+        assert jnp.allclose(out["P0"].values[1, 0], off_ref, atol=1e-12)
+        # Diagonal also delta-method.
+        assert jnp.allclose(out["P0"].values[0, 0], 0.01 / (K * 0.1) ** 2, atol=1e-12)
+        assert jnp.allclose(out["P0"].values[1, 1], 0.04 / (K * 0.2) ** 2, atol=1e-12)
+
+    def test_raises_on_unknown_match(self):
+        a0_nat = jnp.array([1.0])
+        P0_diag = jnp.ones(1)
+        positivity = jnp.array([True])
+
+        with pytest.raises(ValueError, match="unknown match mode"):
+            transform_to_ekf(_make_priors(a0_nat, P0_diag, positivity), match="mode")
+
+
 class TestTransformToEkfStBeta:
     """Full-covariance P0 variant, Beta sigma_q family."""
 
