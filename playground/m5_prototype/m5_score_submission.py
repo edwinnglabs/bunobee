@@ -35,7 +35,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-
 logger = logging.getLogger(__name__)
 
 N_STEPS = 28
@@ -96,12 +95,12 @@ def _level_stats(
 ) -> dict[str, float]:
     """Return WRMSSE plus bias diagnostics for one level."""
     diff = np.diff(y_train_agg, axis=1)
-    scale = np.mean(diff ** 2, axis=1)
+    scale = np.mean(diff**2, axis=1)
     scale = np.where(scale <= 0.0, 1.0, scale)
     denom = np.sqrt(scale)
 
     err = f_val_agg - y_val_agg
-    mse = np.mean(err ** 2, axis=1)
+    mse = np.mean(err**2, axis=1)
     rmsse = np.sqrt(mse) / denom
 
     weights = dollar_agg / dollar_agg.sum() if dollar_agg.sum() > 0 else np.ones_like(dollar_agg) / len(dollar_agg)
@@ -198,13 +197,26 @@ def main() -> None:
     logger.info("Per-level WRMSSE + bias (validation d_1914-d_1941):")
     logger.info(
         "  %-3s  %-22s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s",
-        "lvl", "name", "n", "wrmsse", "actual_mean", "fcst_mean", "bias", "bias_%",
+        "lvl",
+        "name",
+        "n",
+        "wrmsse",
+        "actual_mean",
+        "fcst_mean",
+        "bias",
+        "bias_%",
     )
     for _, row in per_level.iterrows():
         logger.info(
             "  L%-2d  %-22s  n=%-6d  %.4f    %10.2f  %10.2f  %+10.2f  %+7.1f%%",
-            int(row["level"]), row["name"], int(row["n_series"]), row["wrmsse"],
-            row["actual_mean"], row["forecast_mean"], row["bias_signed"], row["bias_pct"],
+            int(row["level"]),
+            row["name"],
+            int(row["n_series"]),
+            row["wrmsse"],
+            row["actual_mean"],
+            row["forecast_mean"],
+            row["bias_signed"],
+            row["bias_pct"],
         )
     logger.info("Hierarchical WRMSSE (mean of 12 levels): %.6f", final_wrmsse)
 

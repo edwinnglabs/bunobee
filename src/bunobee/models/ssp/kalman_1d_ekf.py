@@ -124,7 +124,10 @@ def kalman_filter_1d_ekf(
     """
     logger.debug(
         "kalman_filter_1d_ekf inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
-        a0.shape, P0.shape, Z.shape, y.shape,
+        a0.shape,
+        P0.shape,
+        Z.shape,
+        y.shape,
         getattr(sigma_h, "shape", sigma_h),
         getattr(sigma_q, "shape", sigma_q),
     )
@@ -345,9 +348,7 @@ def kalman_dk_smoother_1d_ekf(
         finite = jnp.isfinite(P_obs[t])
         safe_var = jnp.where(finite, P_obs[t], 1.0)
         F_fusion = P_pred[t] + safe_var
-        fusion_v_term = jnp.where(
-            finite, (a_obs[t] - a_pred[t]) / F_fusion, 0.0
-        )
+        fusion_v_term = jnp.where(finite, (a_obs[t] - a_pred[t]) / F_fusion, 0.0)
         Lt_fusion = jnp.where(finite, safe_var / F_fusion, 1.0)
         r_t = fusion_v_term + Lt_fusion * r_after_y
 
@@ -419,7 +420,9 @@ def kalman_rts_smoother_1d_ekf(
     """
     logger.debug(
         "kalman_rts_smoother_1d_ekf inputs — at: %s, Pt: %s, sigma_q: %s",
-        at.shape, Pt.shape, getattr(sigma_q, "shape", sigma_q),
+        at.shape,
+        Pt.shape,
+        getattr(sigma_q, "shape", sigma_q),
     )
 
     if at.shape[0] == 1:
@@ -429,9 +432,9 @@ def kalman_rts_smoother_1d_ekf(
     P_pred_next = Pt[:-1] + sigma_q_sq
     smoother_gain = Pt[:-1] / P_pred_next
 
-    def _step(carry: tuple[jnp.ndarray, jnp.ndarray], t: int) -> tuple[
-        tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]
-    ]:
+    def _step(
+        carry: tuple[jnp.ndarray, jnp.ndarray], t: int
+    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
         """Single backward extended RTS step at time t."""
         a_smooth_next, P_smooth_next = carry
         a_smooth_t = at[t] + smoother_gain[t] * (a_smooth_next - at[t])
@@ -450,4 +453,3 @@ def kalman_rts_smoother_1d_ekf(
     at_smooth = jnp.concatenate([at_prefix, at[-1][None]], axis=0)
     Pt_smooth = jnp.concatenate([Pt_prefix, Pt[-1][None]], axis=0)
     return at_smooth, Pt_smooth
-

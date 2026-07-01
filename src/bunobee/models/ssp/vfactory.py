@@ -1,4 +1,5 @@
 """factory design pattern for batched Kalman filters"""
+
 import jax.numpy as jnp
 from jax import vmap
 from typing import Callable
@@ -49,6 +50,7 @@ def make_kalman_batch(
     ...     sigma_h, sigma_q, y, a0=a0, P0=P0, Z=Z, logp=True, exponent=0.5,
     ... )
     """
+
     def _batched(
         sigma_h: jnp.ndarray,
         sigma_q: jnp.ndarray,

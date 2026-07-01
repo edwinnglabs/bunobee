@@ -109,10 +109,15 @@ def kalman_filter_1d(
         Kalman gain vector at each timestep.
     """
 
-    logger.debug("kalman_filter_1d inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
-                 a0.shape, P0.shape, Z.shape, y.shape,
-                 getattr(sigma_h, "shape", sigma_h),
-                 getattr(sigma_q, "shape", sigma_q))
+    logger.debug(
+        "kalman_filter_1d inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
+        a0.shape,
+        P0.shape,
+        Z.shape,
+        y.shape,
+        getattr(sigma_h, "shape", sigma_h),
+        getattr(sigma_q, "shape", sigma_q),
+    )
 
     sigma_h_sq = jnp.square(sigma_h)
     sigma_q_sq = jnp.square(sigma_q)
@@ -144,9 +149,9 @@ def kalman_filter_1d(
             # N(at_obs, Pt_obs).
             # Pt_obs = inf → prec_obs = 0 → no-op (pure filter carry-through).
             prec_filter = 1.0 / Pt
-            prec_obs    = 1.0 / Pt_obs
-            Pt          = 1.0 / (prec_filter + prec_obs)
-            at          = Pt * (prec_filter * at + prec_obs * at_obs)
+            prec_obs = 1.0 / Pt_obs
+            Pt = 1.0 / (prec_filter + prec_obs)
+            at = Pt * (prec_filter * at + prec_obs * at_obs)
 
             # TODO: add logp if we observe latent states?
 
@@ -183,11 +188,11 @@ def kalman_filter_1d(
             # the previous unconditional fusion silently halved Pt every step for non-enforced
             # states, collapsing the filter variance and corrupting the smoother.
             prec_filter = 1.0 / Pt
-            prec_obs    = 1.0 / 1e-3
-            Pt_fused    = 1.0 / (prec_filter + prec_obs)
-            at_fused    = Pt_fused * (prec_filter * at + prec_obs * 1e-3)
-            Pt          = jnp.where(enforce, Pt_fused, Pt)
-            at          = jnp.where(enforce, at_fused, at)
+            prec_obs = 1.0 / 1e-3
+            Pt_fused = 1.0 / (prec_filter + prec_obs)
+            at_fused = Pt_fused * (prec_filter * at + prec_obs * 1e-3)
+            Pt = jnp.where(enforce, Pt_fused, Pt)
+            at = jnp.where(enforce, at_fused, at)
             # avoid exact boundary issues
             at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
 
@@ -303,9 +308,7 @@ def kalman_dk_smoother_1d(
         finite = jnp.isfinite(P_obs[t])
         safe_var = jnp.where(finite, P_obs[t], 1.0)
         F_fusion = P_pred[t] + safe_var
-        fusion_v_term = jnp.where(
-            finite, (a_obs[t] - a_pred[t]) / F_fusion, 0.0
-        )
+        fusion_v_term = jnp.where(finite, (a_obs[t] - a_pred[t]) / F_fusion, 0.0)
         Lt_fusion = jnp.where(finite, safe_var / F_fusion, 1.0)
         r_t = fusion_v_term + Lt_fusion * r_after_y
 
@@ -376,16 +379,20 @@ def kalman_rts_smoother_1d(
     Pt_smooth : jnp.ndarray, shape (T, n_states)
         Marginal smoothed state variances ``Var[α_t | Y_n]`` (diagonal).
     """
-    logger.debug("kalman_rts_smoother_1d inputs — at: %s, Pt: %s, sigma_q: %s",
-                 at.shape, Pt.shape, getattr(sigma_q, "shape", sigma_q))
+    logger.debug(
+        "kalman_rts_smoother_1d inputs — at: %s, Pt: %s, sigma_q: %s",
+        at.shape,
+        Pt.shape,
+        getattr(sigma_q, "shape", sigma_q),
+    )
 
     sigma_q_sq = jnp.square(sigma_q)
     P_filt = Pt - sigma_q_sq
     smoother_gain = P_filt / Pt
 
-    def _step(carry: tuple[jnp.ndarray, jnp.ndarray], t: int) -> tuple[
-        tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]
-    ]:
+    def _step(
+        carry: tuple[jnp.ndarray, jnp.ndarray], t: int
+    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
         """Single backward RTS step at time t."""
         a_smooth_next, P_smooth_next = carry
         a_smooth_t = at[t] + smoother_gain[t] * (a_smooth_next - at[t])

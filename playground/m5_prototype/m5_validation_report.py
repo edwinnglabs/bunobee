@@ -29,7 +29,6 @@ from bunobee.models.ssp.univariate import kalman_filter_1d_batch
 
 from m5_score_submission import compute_hierarchical_wrmsse
 
-
 logger = logging.getLogger(__name__)
 
 HORIZON_VAL = 28
@@ -132,7 +131,7 @@ def _reconstruct_val_forecasts(
     mu_future = a_last @ Z_val_np.T
 
     # Use P_last + σ_h² for Jensen correction — see predict_batch_series_opt.
-    Z_sq = Z_val_np ** 2
+    Z_sq = Z_val_np**2
     var_future = P_last @ Z_sq.T + (np.asarray(sigma_h) ** 2)[:, None]
 
     forecasts = np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
@@ -178,13 +177,26 @@ def main() -> None:
     logger.info("Per-level WRMSSE + bias (validation d_1914-d_1941):")
     logger.info(
         "  %-3s  %-22s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s",
-        "lvl", "name", "n", "wrmsse", "actual_mean", "fcst_mean", "bias", "bias_%",
+        "lvl",
+        "name",
+        "n",
+        "wrmsse",
+        "actual_mean",
+        "fcst_mean",
+        "bias",
+        "bias_%",
     )
     for _, row in per_level.iterrows():
         logger.info(
             "  L%-2d  %-22s  n=%-6d  %.4f    %10.2f  %10.2f  %+10.2f  %+7.1f%%",
-            int(row["level"]), row["name"], int(row["n_series"]), row["wrmsse"],
-            row["actual_mean"], row["forecast_mean"], row["bias_signed"], row["bias_pct"],
+            int(row["level"]),
+            row["name"],
+            int(row["n_series"]),
+            row["wrmsse"],
+            row["actual_mean"],
+            row["forecast_mean"],
+            row["bias_signed"],
+            row["bias_pct"],
         )
     logger.info("Hierarchical WRMSSE (mean of 12 levels): %.6f", final_wrmsse)
 

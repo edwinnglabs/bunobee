@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-
 logger = logging.getLogger(__name__)
 
 N_STEPS = 28
@@ -100,7 +99,7 @@ def _row_pearson(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     a_centered = a - a.mean(axis=1, keepdims=True)
     b_centered = b - b.mean(axis=1, keepdims=True)
     num = (a_centered * b_centered).sum(axis=1)
-    denom = np.sqrt((a_centered ** 2).sum(axis=1) * (b_centered ** 2).sum(axis=1))
+    denom = np.sqrt((a_centered**2).sum(axis=1) * (b_centered**2).sum(axis=1))
     with np.errstate(invalid="ignore", divide="ignore"):
         corr = np.where(denom > 0.0, num / denom, np.nan)
     return corr
@@ -131,11 +130,11 @@ def _global_diff_stats(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     flat_b = b.ravel()
     flat_a_c = flat_a - flat_a.mean()
     flat_b_c = flat_b - flat_b.mean()
-    denom = np.sqrt((flat_a_c ** 2).sum() * (flat_b_c ** 2).sum())
+    denom = np.sqrt((flat_a_c**2).sum() * (flat_b_c**2).sum())
     corr = float((flat_a_c * flat_b_c).sum() / denom) if denom > 0.0 else float("nan")
     return {
         "diff_mae": float(abs_diff.mean()),
-        "diff_rmse": float(np.sqrt((diff ** 2).mean())),
+        "diff_rmse": float(np.sqrt((diff**2).mean())),
         "diff_median_abs": float(np.median(abs_diff)),
         "diff_bias_signed": float(diff.mean()),
         "diff_pearson_corr": corr,

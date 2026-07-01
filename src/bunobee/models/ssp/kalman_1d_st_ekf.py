@@ -111,7 +111,10 @@ def kalman_filter_1d_ekf_st(
     """
     logger.debug(
         "kalman_filter_1d_ekf_st inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
-        a0.shape, P0.shape, Z.shape, y.shape,
+        a0.shape,
+        P0.shape,
+        Z.shape,
+        y.shape,
         getattr(sigma_h, "shape", sigma_h),
         getattr(sigma_q, "shape", sigma_q),
     )

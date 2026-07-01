@@ -48,8 +48,8 @@ import xarray as xr
 _DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
 
 # Competition split boundaries (day indices, 1-based)
-_TRAIN_END_D = 1913   # sales_train_validation.csv ends here
-_VALID_END_D = 1941   # sales_train_evaluation.csv ends here
+_TRAIN_END_D = 1913  # sales_train_validation.csv ends here
+_VALID_END_D = 1941  # sales_train_evaluation.csv ends here
 # Calendar ends at d_1969 → test window is d_1942–d_1969
 
 
@@ -93,9 +93,7 @@ def build_m5_dataset(
 
     # Strip the competition suffix ("_validation" / "_evaluation") from id
     meta["series_id"] = (
-        meta["id"]
-        .str.replace("_validation$", "", regex=True)
-        .str.replace("_evaluation$", "", regex=True)
+        meta["id"].str.replace("_validation$", "", regex=True).str.replace("_evaluation$", "", regex=True)
     )
     series_ids = meta["series_id"].values  # (30490,)
 
@@ -107,7 +105,8 @@ def build_m5_dataset(
     all_dates = calendar["date"].values  # np.datetime64[ns], shape (1969,)
 
     split_labels = np.where(
-        day_numbers <= _TRAIN_END_D, "train",
+        day_numbers <= _TRAIN_END_D,
+        "train",
         np.where(day_numbers <= _VALID_END_D, "validation", "test"),
     )
 
@@ -175,22 +174,22 @@ def build_m5_dataset(
     print("Assembling xarray Dataset …")
     ds = xr.Dataset(
         data_vars={
-            "sales":      (["series_id", "date"], sales_mat),
+            "sales": (["series_id", "date"], sales_mat),
             "sell_price": (["series_id", "date"], price_mat),
-            "snap":       (["series_id", "date"], snap_mat),
+            "snap": (["series_id", "date"], snap_mat),
             # date-stamp features (re-derivable from date, stored for convenience)
-            "day_of_week":   ("date", pd.DatetimeIndex(all_dates).day_of_week.astype(np.int8)),
-            "day_of_month":  ("date", pd.DatetimeIndex(all_dates).day.astype(np.int8)),
+            "day_of_week": ("date", pd.DatetimeIndex(all_dates).day_of_week.astype(np.int8)),
+            "day_of_month": ("date", pd.DatetimeIndex(all_dates).day.astype(np.int8)),
             "month_of_year": ("date", pd.DatetimeIndex(all_dates).month.astype(np.int8)),
         },
         coords={
             # dimension coordinates
             "series_id": series_ids,
-            "date":      all_dates,
+            "date": all_dates,
             # series metadata (indexed by series_id)
-            "item_id":  ("series_id", meta["item_id"].values),
-            "dept_id":  ("series_id", meta["dept_id"].values),
-            "cat_id":   ("series_id", meta["cat_id"].values),
+            "item_id": ("series_id", meta["item_id"].values),
+            "dept_id": ("series_id", meta["dept_id"].values),
+            "cat_id": ("series_id", meta["cat_id"].values),
             "store_id": ("series_id", meta["store_id"].values),
             "state_id": ("series_id", meta["state_id"].values),
             # calendar metadata (indexed by date)
@@ -201,15 +200,15 @@ def build_m5_dataset(
             "snap_CA": ("date", calendar["snap_CA"].values.astype(np.int8)),
             "snap_TX": ("date", calendar["snap_TX"].values.astype(np.int8)),
             "snap_WI": ("date", calendar["snap_WI"].values.astype(np.int8)),
-            "split":   ("date", split_labels),
+            "split": ("date", split_labels),
         },
         attrs={
-            "train_end_date":    str(calendar.loc[calendar["d"] == f"d_{_TRAIN_END_D}", "date"].iloc[0].date()),
-            "valid_end_date":    str(calendar.loc[calendar["d"] == f"d_{_VALID_END_D}", "date"].iloc[0].date()),
+            "train_end_date": str(calendar.loc[calendar["d"] == f"d_{_TRAIN_END_D}", "date"].iloc[0].date()),
+            "valid_end_date": str(calendar.loc[calendar["d"] == f"d_{_VALID_END_D}", "date"].iloc[0].date()),
             "calendar_end_date": str(calendar["date"].iloc[-1].date()),
-            "train_steps":       int(_TRAIN_END_D),
-            "valid_steps":       int(_VALID_END_D - _TRAIN_END_D),
-            "test_steps":        int(len(all_dates) - _VALID_END_D),
+            "train_steps": int(_TRAIN_END_D),
+            "valid_steps": int(_VALID_END_D - _TRAIN_END_D),
+            "test_steps": int(len(all_dates) - _VALID_END_D),
         },
     )
 
