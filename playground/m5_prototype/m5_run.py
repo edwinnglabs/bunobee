@@ -12,6 +12,7 @@ Usage examples
 # Fit all 30,490 series and generate a submission CSV:
     python m5_run.py --n-demo 0
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,34 +43,59 @@ _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fit M5 SSP model and generate forecasts.")
-    p.add_argument("--data-dir", type=Path, default=_DEFAULT_DATA_DIR, metavar="DIR",
-                   help="Directory containing m5_ds.nc and sample_submission.csv.")
-    p.add_argument("--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR, metavar="DIR",
-                   help="Root output directory; a timestamped sub-dir is created inside.")
-    p.add_argument("--n-demo", type=int, default=10, metavar="N",
-                   help="Number of series to fit. 0 = all 30,490 series.")
-    p.add_argument("--sample-mode", choices=["random", "top"], default="random",
-                   help="How to select demo series: random sample or top by total volume.")
-    p.add_argument("--seed", type=int, default=2026,
-                   help="RNG seed for reproducible random sampling.")
-    p.add_argument("--n-iter", type=int, default=100,
-                   help="Adam optimisation steps per series.")
-    p.add_argument("--lr", type=float, default=3e-2,
-                   help="Adam learning rate.")
-    p.add_argument("--chunk-size", type=int, default=4096, metavar="N",
-                   help="Max series per vmap chunk (memory guard). 0 = no chunking.")
-    p.add_argument("--n-plot", type=int, default=50, metavar="N",
-                   help="Number of series to include in forecasts.pdf. 0 = all fitted series.")
-    p.add_argument("--plots-per-page", type=int, default=5, metavar="N",
-                   help="Forecast subplots per PDF page, by default 5.")
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=_DEFAULT_DATA_DIR,
+        metavar="DIR",
+        help="Directory containing m5_ds.nc and sample_submission.csv.",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=_DEFAULT_OUTPUT_DIR,
+        metavar="DIR",
+        help="Root output directory; a timestamped sub-dir is created inside.",
+    )
+    p.add_argument(
+        "--n-demo", type=int, default=10, metavar="N", help="Number of series to fit. 0 = all 30,490 series."
+    )
+    p.add_argument(
+        "--sample-mode",
+        choices=["random", "top"],
+        default="random",
+        help="How to select demo series: random sample or top by total volume.",
+    )
+    p.add_argument("--seed", type=int, default=2026, help="RNG seed for reproducible random sampling.")
+    p.add_argument("--n-iter", type=int, default=100, help="Adam optimisation steps per series.")
+    p.add_argument("--lr", type=float, default=3e-2, help="Adam learning rate.")
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="Max series per vmap chunk (memory guard). 0 = no chunking.",
+    )
+    p.add_argument(
+        "--n-plot",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Number of series to include in forecasts.pdf. 0 = all fitted series.",
+    )
+    p.add_argument(
+        "--plots-per-page", type=int, default=5, metavar="N", help="Forecast subplots per PDF page, by default 5."
+    )
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _dow_dummies(dow: np.ndarray) -> np.ndarray:
     """Day-of-week dummies with Monday dropped as the reference category."""
@@ -108,9 +134,9 @@ def _make_submission(
 
     sub = sample_submission[["id"]].merge(full, on="id", how="left")
 
-    assert sub.shape[0] == sample_submission.shape[0], (
-        f"Row count mismatch: got {sub.shape[0]}, expected {sample_submission.shape[0]}"
-    )
+    assert (
+        sub.shape[0] == sample_submission.shape[0]
+    ), f"Row count mismatch: got {sub.shape[0]}, expected {sample_submission.shape[0]}"
     assert not sub[f_cols].isna().any().any(), "Missing forecasts detected — ensure all series are fitted."
 
     sub.to_csv(output_path, index=False)
@@ -121,6 +147,7 @@ def _make_submission(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     args = _parse_args()
@@ -139,18 +166,19 @@ def main() -> None:
 
     train_mask = ds["split"].values == "train"
     val_mask = ds["split"].values == "validation"
-    sales_matrix = ds["sales"].values[:, train_mask]          # (n_series, n_train_steps)
+    sales_matrix = ds["sales"].values[:, train_mask]  # (n_series, n_train_steps)
     series_ids = np.array([f"{sid}_validation" for sid in ds["series_id"].values])
     n_series_total = sales_matrix.shape[0]
-    logger.info("sales_matrix: %s  (n_series=%d, n_steps=%d)",
-                sales_matrix.shape, sales_matrix.shape[0], sales_matrix.shape[1])
+    logger.info(
+        "sales_matrix: %s  (n_series=%d, n_steps=%d)", sales_matrix.shape, sales_matrix.shape[0], sales_matrix.shape[1]
+    )
 
     # ------------------------------------------------------------------
     # 2. Build design matrices
     # ------------------------------------------------------------------
     dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))          # (n_train_steps, 6)
-    Z_future_shared = jnp.asarray(_dow_dummies(dow[val_mask]))     # (horizon, 6)
+    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))  # (n_train_steps, 6)
+    Z_future_shared = jnp.asarray(_dow_dummies(dow[val_mask]))  # (horizon, 6)
     logger.info("Z_shared: %s  Z_future_shared: %s", Z_shared.shape, Z_future_shared.shape)
 
     # ------------------------------------------------------------------
@@ -239,8 +267,7 @@ def main() -> None:
                 actual = sales_matrix[idx]
                 forecast = forecasts[rank]
                 ax.plot(range(tail), actual[-tail:], label="Actual", alpha=0.7)
-                ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast",
-                        linestyle="--", color="tomato")
+                ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast", linestyle="--", color="tomato")
                 ax.axvline(tail, color="grey", linestyle=":", alpha=0.5)
                 ax.set_title(series_ids[idx], fontsize=9, loc="left")
                 ax.set_ylabel("Units")
@@ -248,7 +275,8 @@ def main() -> None:
 
             axes[-1].set_xlabel("Day")
             fig.suptitle(
-                f"SSP batch forecast — {label}  (page {page + 1}/{n_pages})", y=1.01,
+                f"SSP batch forecast — {label}  (page {page + 1}/{n_pages})",
+                y=1.01,
             )
             plt.tight_layout()
             pdf.savefig(fig, bbox_inches="tight")
@@ -279,8 +307,9 @@ def main() -> None:
         sample_sub = pd.read_csv(args.data_dir / "sample_submission.csv")
         _make_submission(predictions, sample_sub, output_path=run_dir / "submission.csv")
     else:
-        logger.info("Skipping submission — only %d / %d series fitted (use --n-demo 0 to fit all).",
-                    n_fit, n_series_total)
+        logger.info(
+            "Skipping submission — only %d / %d series fitted (use --n-demo 0 to fit all).", n_fit, n_series_total
+        )
 
     logger.info("Done. Outputs in %s", run_dir)
 

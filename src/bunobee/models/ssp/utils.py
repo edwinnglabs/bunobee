@@ -67,7 +67,7 @@ def construct_states_prior(
 
     a_obs = a_obs.at[obs_idx].set(true_states)
     # intercept has no priors so its variance stays inf
-    var_row = jnp.array([jnp.inf] + [obs_scale ** 2] * len(regressors))
+    var_row = jnp.array([jnp.inf] + [obs_scale**2] * len(regressors))
     P_obs = P_obs.at[obs_idx].set(var_row)
 
     if positivity_idx is None:
@@ -116,11 +116,7 @@ def a_to_lam(
     """
     out = np.array(arr, dtype=float)
     n_states = out.shape[-1]
-    mask = (
-        np.ones(n_states, dtype=bool)
-        if positivity_idx is None
-        else np.asarray(positivity_idx, dtype=bool)
-    )
+    mask = np.ones(n_states, dtype=bool) if positivity_idx is None else np.asarray(positivity_idx, dtype=bool)
     out[..., mask] = np.exp(exponent * out[..., mask])
     return out
 
@@ -150,11 +146,7 @@ def lam_to_a(
     """
     out = np.array(arr, dtype=float)
     n_states = out.shape[-1]
-    mask = (
-        np.ones(n_states, dtype=bool)
-        if positivity_idx is None
-        else np.asarray(positivity_idx, dtype=bool)
-    )
+    mask = np.ones(n_states, dtype=bool) if positivity_idx is None else np.asarray(positivity_idx, dtype=bool)
     out[..., mask] = np.log(out[..., mask]) / exponent
     return out
 
@@ -204,9 +196,7 @@ def posterior_to_xarray(
     drop_set = set(drop or ())
     keep_set = set(keep) if keep is not None else None
     items = {
-        k: np.asarray(v)
-        for k, v in posterior.items()
-        if k not in drop_set and (keep_set is None or k in keep_set)
+        k: np.asarray(v) for k, v in posterior.items() if k not in drop_set and (keep_set is None or k in keep_set)
     }
     if not items:
         raise ValueError("no variables left to convert after applying drop/keep")
@@ -226,26 +216,19 @@ def posterior_to_xarray(
         event_shape = arr.shape[2:]
         event_dims = list(dims.get(name) or [f"{name}_dim_{i}" for i in range(len(event_shape))])
         if len(event_dims) != len(event_shape):
-            raise ValueError(
-                f"dims for {name!r} has length {len(event_dims)} but event "
-                f"shape is {event_shape}"
-            )
+            raise ValueError(f"dims for {name!r} has length {len(event_dims)} but event " f"shape is {event_shape}")
 
         for d, size in zip(event_dims, event_shape):
             if d in out_coords:
                 if len(out_coords[d]) != size:
                     raise ValueError(
-                        f"dim {d!r} reused with inconsistent size: "
-                        f"{len(out_coords[d])} vs {size} (from {name!r})"
+                        f"dim {d!r} reused with inconsistent size: " f"{len(out_coords[d])} vs {size} (from {name!r})"
                     )
                 continue
             if d in user_coords:
                 values = np.asarray(user_coords[d])
                 if values.shape != (size,):
-                    raise ValueError(
-                        f"coord {d!r} has shape {values.shape} but {name!r} "
-                        f"expects size {size}"
-                    )
+                    raise ValueError(f"coord {d!r} has shape {values.shape} but {name!r} " f"expects size {size}")
                 out_coords[d] = values
             else:
                 out_coords[d] = np.arange(size)
@@ -334,13 +317,7 @@ def plot_states(
         raise ValueError("states_key must contain at least one key")
 
     if isinstance(posterior, xr.Dataset):
-        posterior = {
-            k: posterior[k]
-                .stack(sample=("chain", "draw"))
-                .transpose("sample", ...)
-                .values
-            for k in keys
-        }
+        posterior = {k: posterior[k].stack(sample=("chain", "draw")).transpose("sample", ...).values for k in keys}
 
     default_colors = ["darkgreen", *plt.get_cmap("tab10").colors]
     if colors is None:
@@ -350,21 +327,14 @@ def plot_states(
     else:
         palette = list(colors)
         if len(palette) < len(keys):
-            raise ValueError(
-                f"need at least {len(keys)} colours for {len(keys)} overlays, got {len(palette)}"
-            )
+            raise ValueError(f"need at least {len(keys)} colours for {len(keys)} overlays, got {len(palette)}")
 
     quantiles = [np.quantile(np.asarray(posterior[k]), ci, axis=0) for k in keys]
     ci_pct = int(round((ci[2] - ci[0]) * 100))
 
     coefs_lookup = coefs_df.set_index("regressor")["coef"] if coefs_df is not None else None
 
-    has_disclosure = (
-        obs_idx is not None
-        and len(obs_idx) > 0
-        and a_obs is not None
-        and P_obs is not None
-    )
+    has_disclosure = obs_idx is not None and len(obs_idx) > 0 and a_obs is not None and P_obs is not None
     obs_dates = dates[obs_idx] if has_disclosure else []
 
     n_states = len(state_labels)
@@ -378,9 +348,7 @@ def plot_states(
             median_label = "median" if single else f"{key} median"
             ribbon_label = f"{ci_pct}% CI" if single else f"{key} {ci_pct}% CI"
             ax.plot(dates, mid[:, i], color=color, linewidth=0.9, label=median_label)
-            ax.fill_between(
-                dates, lo[:, i], hi[:, i], alpha=0.25, color=color, label=ribbon_label
-            )
+            ax.fill_between(dates, lo[:, i], hi[:, i], alpha=0.25, color=color, label=ribbon_label)
 
         if i > 0 and coefs_lookup is not None and label in coefs_lookup.index:
             ax.axhline(coefs_lookup[label], color="grey", linestyle=":", linewidth=1.0, label="true coef")

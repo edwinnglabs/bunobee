@@ -13,6 +13,7 @@ from ..ssp.univariate import kalman_filter_1d, kalman_filter_1d_batch
 
 logger = logging.getLogger(__name__)
 
+
 def _softplus(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.log1p(jnp.exp(x))
 
@@ -76,14 +77,21 @@ def fit_one_series_opt(
         sigma_h = _softplus(params[0])
         sigma_q_level = _softplus(params[1])
         sigma_q_seas = _softplus(params[2])
-        sigma_q = jnp.concatenate([
-            sigma_q_level[None],
-            jnp.repeat(sigma_q_seas[None], n_states - 1),
-        ])
+        sigma_q = jnp.concatenate(
+            [
+                sigma_q_level[None],
+                jnp.repeat(sigma_q_seas[None], n_states - 1),
+            ]
+        )
 
         lp, _, _, _, _, _ = kalman_filter_1d(
-            a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
-            y=y, Z=Z, logp=True,
+            a0=a0,
+            P0=P0,
+            sigma_h=sigma_h,
+            sigma_q=sigma_q,
+            y=y,
+            Z=Z,
+            logp=True,
         )
 
         log_prior = (
@@ -93,11 +101,13 @@ def fit_one_series_opt(
         )
         return -(lp + log_prior)
 
-    params = jnp.array([
-        _softplus_inv(0.30),   # sigma_h midpoint of U(0.1, 0.5)
-        _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
-        _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
-    ])
+    params = jnp.array(
+        [
+            _softplus_inv(0.30),  # sigma_h midpoint of U(0.1, 0.5)
+            _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
+            _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+        ]
+    )
 
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params)
@@ -133,19 +143,26 @@ def fit_one_series_opt(
     sigma_h = float(_softplus(params[0]))
     sigma_q_level = float(_softplus(params[1]))
     sigma_q_seas = float(_softplus(params[2]))
-    sigma_q = jnp.concatenate([
-        jnp.array([sigma_q_level]),
-        jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1),
-    ])
+    sigma_q = jnp.concatenate(
+        [
+            jnp.array([sigma_q_level]),
+            jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1),
+        ]
+    )
 
     _, at, Pt, _, _, _ = kalman_filter_1d(
-        a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
-        y=y, Z=Z, logp=False,
+        a0=a0,
+        P0=P0,
+        sigma_h=sigma_h,
+        sigma_q=sigma_q,
+        y=y,
+        Z=Z,
+        logp=False,
     )
 
     return {
         "at": np.array(at),
-        "Pt": np.array(Pt),          # (n_steps, n_states) filtered diagonal covariances
+        "Pt": np.array(Pt),  # (n_steps, n_states) filtered diagonal covariances
         "sigma_h": sigma_h,
         "sigma_q": np.array(sigma_q),
         "response_norm": response_norm,
@@ -179,14 +196,14 @@ def predict_one_series_opt(
         Point forecasts of shape (horizon,).
     """
     at = fit_result["at"]
-    Pt = fit_result["Pt"]                # (n_steps, n_states) diagonal covariances
+    Pt = fit_result["Pt"]  # (n_steps, n_states) diagonal covariances
     sigma_h = float(fit_result["sigma_h"])
     response_norm = fit_result["response_norm"]
 
-    Z_future = np.asarray(Z_future)      # (horizon, n_states)
-    a_last = at[-1]                      # (n_states,)
-    P_last = Pt[-1]                      # (n_states,) diagonal
-    mu_future = Z_future @ a_last        # (horizon,)
+    Z_future = np.asarray(Z_future)  # (horizon, n_states)
+    a_last = at[-1]  # (n_states,)
+    P_last = Pt[-1]  # (n_states,) diagonal
+    mu_future = Z_future @ a_last  # (horizon,)
 
     # Use P_last (terminal filtered variance) + σ_h² for Jensen correction.
     # The daily random-walk drift h·σ_q² is excluded: the state transitions run
@@ -194,8 +211,8 @@ def predict_one_series_opt(
     # daily accumulation inflates week-4 forecasts relative to week-1 with no
     # basis in the observations. P_last already encodes σ_q implicitly via the
     # converged Kalman filter, so the correction remains meaningful but horizon-flat.
-    Z_sq = Z_future ** 2                 # (horizon, n_states)
-    var_future = Z_sq @ P_last + sigma_h ** 2
+    Z_sq = Z_future**2  # (horizon, n_states)
+    var_future = Z_sq @ P_last + sigma_h**2
 
     return np.exp(mu_future + 0.5 * var_future) * response_norm
 
@@ -243,7 +260,7 @@ def fit_batch_series_opt(
     B = sales_matrix.shape[0]
 
     sales_clipped = np.clip(sales_matrix, 1e-1, None).astype(np.float32)
-    response_norm = sales_clipped.mean(axis=1)                   # (B,)
+    response_norm = sales_clipped.mean(axis=1)  # (B,)
     y = jnp.array(np.log(sales_clipped / response_norm[:, None]))  # (B, n_steps)
 
     n_states = Z.shape[1]
@@ -251,11 +268,13 @@ def fit_batch_series_opt(
     P0 = jnp.ones(n_states)
 
     init_params = jnp.tile(
-        jnp.array([
-            _softplus_inv(0.30),   # sigma_h midpoint of U(0.1, 0.5)
-            _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
-            _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
-        ]),
+        jnp.array(
+            [
+                _softplus_inv(0.30),  # sigma_h midpoint of U(0.1, 0.5)
+                _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
+                _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+            ]
+        ),
         (B, 1),
     )  # (B, 3)
 
@@ -264,17 +283,26 @@ def fit_batch_series_opt(
 
     def _loss_fn(params: jnp.ndarray) -> jnp.ndarray:
         """Batched neg-log-posterior. params: (B, 3) -> scalar (sum over series)."""
-        sigma_h = _softplus(params[:, 0])            # (B,)
-        sigma_q_level = _softplus(params[:, 1])      # (B,)
-        sigma_q_seas = _softplus(params[:, 2])       # (B,)
-        sigma_q = jnp.concatenate([
-            sigma_q_level[:, None],
-            jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
-        ], axis=1)  # (B, n_states)
+        sigma_h = _softplus(params[:, 0])  # (B,)
+        sigma_q_level = _softplus(params[:, 1])  # (B,)
+        sigma_q_seas = _softplus(params[:, 2])  # (B,)
+        sigma_q = jnp.concatenate(
+            [
+                sigma_q_level[:, None],
+                jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
+            ],
+            axis=1,
+        )  # (B, n_states)
 
         log_p, _, _, _, _, _ = kalman_filter_1d_batch(
-            a0=a0, P0=P0, Z=Z, sigma_h=sigma_h, sigma_q=sigma_q,
-            y=y, logp=True, chunk_size=chunk_size,
+            a0=a0,
+            P0=P0,
+            Z=Z,
+            sigma_h=sigma_h,
+            sigma_q=sigma_q,
+            y=y,
+            logp=True,
+            chunk_size=chunk_size,
         )
 
         log_prior = (
@@ -304,7 +332,10 @@ def fit_batch_series_opt(
     steps = tqdm(range(n_iter), desc=f"fitting {B} series", unit="step") if show_progress else range(n_iter)
     for i in steps:
         params, opt_state, best_params, best_loss, per_series_loss = _step(
-            params, opt_state, best_params, best_loss,
+            params,
+            opt_state,
+            best_params,
+            best_loss,
         )
         mean_loss = float(jnp.mean(per_series_loss))
         if show_progress:
@@ -316,23 +347,32 @@ def fit_batch_series_opt(
     sigma_h = jnp.asarray(_softplus(best_params[:, 0]))
     sigma_q_level = _softplus(best_params[:, 1])
     sigma_q_seas = _softplus(best_params[:, 2])
-    sigma_q = jnp.concatenate([
-        sigma_q_level[:, None],
-        jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
-    ], axis=1)
+    sigma_q = jnp.concatenate(
+        [
+            sigma_q_level[:, None],
+            jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
+        ],
+        axis=1,
+    )
 
     # Final forward pass to get filtered states and diagonal covariances
     _, at, Pt, _, _, _ = kalman_filter_1d_batch(
-        a0=a0, P0=P0, Z=Z, sigma_h=sigma_h, sigma_q=sigma_q,
-        y=y, logp=False, chunk_size=chunk_size,
+        a0=a0,
+        P0=P0,
+        Z=Z,
+        sigma_h=sigma_h,
+        sigma_q=sigma_q,
+        y=y,
+        logp=False,
+        chunk_size=chunk_size,
     )
 
     return {
-        "at": np.array(at),            # (B, n_steps, n_states)
-        "Pt": np.array(Pt),            # (B, n_steps, n_states) filtered diagonal covariances
+        "at": np.array(at),  # (B, n_steps, n_states)
+        "Pt": np.array(Pt),  # (B, n_steps, n_states) filtered diagonal covariances
         "sigma_h": np.array(sigma_h),  # (B,)
         "sigma_q": np.array(sigma_q),  # (B, n_states)
-        "response_norm": response_norm, # (B,)
+        "response_norm": response_norm,  # (B,)
         "Z": Z,
         "a0": a0,
         "P0": P0,
@@ -361,15 +401,15 @@ def predict_batch_series_opt(
     np.ndarray
         Point forecasts of shape (B, horizon).
     """
-    at = fit_result["at"]                          # (B, n_steps, n_states)
-    Pt = fit_result["Pt"]                          # (B, n_steps, n_states) diagonal covariances
-    sigma_h = np.asarray(fit_result["sigma_h"])    # (B,)
-    response_norm = fit_result["response_norm"]    # (B,)
+    at = fit_result["at"]  # (B, n_steps, n_states)
+    Pt = fit_result["Pt"]  # (B, n_steps, n_states) diagonal covariances
+    sigma_h = np.asarray(fit_result["sigma_h"])  # (B,)
+    response_norm = fit_result["response_norm"]  # (B,)
 
-    Z_future = np.asarray(Z_future)                # (horizon, n_states)
-    a_last = at[:, -1, :]                          # (B, n_states)
-    P_last = Pt[:, -1, :]                          # (B, n_states) diagonal
-    mu_future = a_last @ Z_future.T                # (B, horizon)
+    Z_future = np.asarray(Z_future)  # (horizon, n_states)
+    a_last = at[:, -1, :]  # (B, n_states)
+    P_last = Pt[:, -1, :]  # (B, n_states) diagonal
+    mu_future = a_last @ Z_future.T  # (B, horizon)
 
     # Use P_last (terminal filtered variance) + σ_h² for Jensen correction.
     # The daily random-walk drift h·σ_q² is excluded: the state transitions run
@@ -377,7 +417,7 @@ def predict_batch_series_opt(
     # daily accumulation inflates week-4 forecasts relative to week-1 with no
     # basis in the observations. P_last already encodes σ_q implicitly via the
     # converged Kalman filter, so the correction remains meaningful but horizon-flat.
-    Z_sq = Z_future ** 2                           # (horizon, n_states)
-    var_future = P_last @ Z_sq.T + (sigma_h ** 2)[:, None]            # (B, horizon)
+    Z_sq = Z_future**2  # (horizon, n_states)
+    var_future = P_last @ Z_sq.T + (sigma_h**2)[:, None]  # (B, horizon)
 
     return np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]

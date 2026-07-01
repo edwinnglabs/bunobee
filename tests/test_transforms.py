@@ -10,7 +10,6 @@ jax.config.update("jax_enable_x64", True)
 
 from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st
 
-
 K = 0.5
 
 
@@ -134,8 +133,12 @@ class TestTransformToEkf:
 
         out = transform_to_ekf(
             _make_priors(
-                a0_nat, P0_diag, positivity,
-                sigma_loc=0.1, a_obs_nat=a_obs_nat, P_obs_nat=P_obs_nat,
+                a0_nat,
+                P0_diag,
+                positivity,
+                sigma_loc=0.1,
+                a_obs_nat=a_obs_nat,
+                P_obs_nat=P_obs_nat,
             ),
             exponent=K,
         )
@@ -255,8 +258,12 @@ class TestTransformToEkfSt:
 
         out = transform_to_ekf_st(
             _make_priors(
-                a0_nat, P0_nat, positivity,
-                sigma_loc=0.1, a_obs_nat=a_obs_nat, P_obs_nat=P_obs_nat,
+                a0_nat,
+                P0_nat,
+                positivity,
+                sigma_loc=0.1,
+                a_obs_nat=a_obs_nat,
+                P_obs_nat=P_obs_nat,
             ),
             exponent=K,
         )
@@ -348,7 +355,9 @@ class TestTransformToEkfSt:
         positivity = jnp.array([True, False])
 
         priors = _make_priors(
-            a0_nat, P0_nat, positivity,
+            a0_nat,
+            P0_nat,
+            positivity,
             sigma_loc=jnp.array([0.4, 0.2]),
             sigma_scale=jnp.array([0.05, 0.1]),
             sigma_low=jnp.array([0.1, 0.05]),
@@ -371,7 +380,8 @@ class TestTransformToEkfSt:
         state_labels = ["intercept", "channel_a"]
 
         ds = _make_priors(a0_nat, P0_nat, positivity).assign_coords(
-            state=state_labels, state_dual=state_labels,
+            state=state_labels,
+            state_dual=state_labels,
         )
 
         out = transform_to_ekf_st(ds)
@@ -400,9 +410,7 @@ class TestTransformToEkfSt:
         a0_nat = jnp.array([1.0, 2.0])
         positivity = jnp.array([True, True])
         priors = _make_priors(a0_nat, jnp.eye(2), positivity)
-        priors = priors.drop_vars("P0").assign(
-            P0=(("state", "state_dual", "extra"), np.zeros((2, 2, 2)))
-        )
+        priors = priors.drop_vars("P0").assign(P0=(("state", "state_dual", "extra"), np.zeros((2, 2, 2))))
 
         with pytest.raises(ValueError, match="2-D"):
             transform_to_ekf_st(priors)
@@ -411,7 +419,7 @@ class TestTransformToEkfSt:
 def _beta_scale_a(mu_x: float, scale_nat: float, alpha: float, beta: float, k: float = K) -> float:
     mode_frac = (alpha - 1.0) / (alpha + beta - 2.0)
     mode_nat = scale_nat * mode_frac
-    sigma_y_sq = jnp.log1p(mode_nat ** 2 / mu_x ** 2)
+    sigma_y_sq = jnp.log1p(mode_nat**2 / mu_x**2)
     mode_a = jnp.sqrt(sigma_y_sq) / k
     return float(mode_a / mode_frac)
 
@@ -427,8 +435,13 @@ class TestTransformToEkfBeta:
 
         out = transform_to_ekf(
             _make_priors(
-                a0_nat, P0_diag, positivity,
-                family="beta", alpha=2.0, beta=10.0, sigma_scale=scale_nat,
+                a0_nat,
+                P0_diag,
+                positivity,
+                family="beta",
+                alpha=2.0,
+                beta=10.0,
+                sigma_scale=scale_nat,
             ),
             exponent=K,
         )
@@ -447,8 +460,12 @@ class TestTransformToEkfBeta:
         positivity = jnp.array([True, True])
 
         priors = _make_priors(
-            a0_nat, P0_diag, positivity,
-            family="beta", alpha=jnp.array([1.0, 2.0]), beta=jnp.array([5.0, 5.0]),
+            a0_nat,
+            P0_diag,
+            positivity,
+            family="beta",
+            alpha=jnp.array([1.0, 2.0]),
+            beta=jnp.array([5.0, 5.0]),
             sigma_scale=jnp.array([0.1, 0.2]),
         )
         with pytest.raises(ValueError, match="alpha > 1 and beta > 1"):
@@ -511,10 +528,12 @@ class TestMatchModes:
         positivity = jnp.array([True, True])
 
         out_default = transform_to_ekf(
-            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1), exponent=K,
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1),
+            exponent=K,
         )
         out_explicit = transform_to_ekf(
-            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1), exponent=K,
+            _make_priors(a0_nat, P0_diag, positivity, sigma_loc=0.1),
+            exponent=K,
             match="mean",
         )
 
@@ -536,8 +555,12 @@ class TestMatchModes:
 
         out = transform_to_ekf(
             _make_priors(
-                a0_nat, P0_diag, positivity,
-                sigma_loc=0.05, a_obs_nat=a_obs_nat, P_obs_nat=P_obs_nat,
+                a0_nat,
+                P0_diag,
+                positivity,
+                sigma_loc=0.05,
+                a_obs_nat=a_obs_nat,
+                P_obs_nat=P_obs_nat,
             ),
             exponent=K,
             match="linearize",
@@ -557,7 +580,9 @@ class TestMatchModes:
         positivity = jnp.array([True, True])
 
         out = transform_to_ekf_st(
-            _make_priors(a0_nat, P0_nat, positivity), exponent=K, match="linearize",
+            _make_priors(a0_nat, P0_nat, positivity),
+            exponent=K,
+            match="linearize",
         )
 
         off_ref = 0.005 / (K * K * 0.1 * 0.2)
@@ -587,8 +612,13 @@ class TestTransformToEkfStBeta:
 
         out = transform_to_ekf_st(
             _make_priors(
-                a0_nat, P0_nat, positivity,
-                family="beta", alpha=2.0, beta=10.0, sigma_scale=scale_nat,
+                a0_nat,
+                P0_nat,
+                positivity,
+                family="beta",
+                alpha=2.0,
+                beta=10.0,
+                sigma_scale=scale_nat,
             ),
             exponent=K,
         )
@@ -609,8 +639,12 @@ class TestTransformToEkfStBeta:
 
         out = transform_to_ekf_st(
             _make_priors(
-                a0_nat, P0_nat, positivity,
-                family="beta", alpha=jnp.array([3.0, 4.0]), beta=jnp.array([8.0, 6.0]),
+                a0_nat,
+                P0_nat,
+                positivity,
+                family="beta",
+                alpha=jnp.array([3.0, 4.0]),
+                beta=jnp.array([8.0, 6.0]),
                 sigma_scale=scale_nat,
             ),
             exponent=K,
@@ -638,8 +672,13 @@ class TestTransformToEkfStBeta:
 
         out = transform_to_ekf_st(
             _make_priors(
-                a0_nat, P0_nat, positivity,
-                family="beta", alpha=2.0, beta=10.0, sigma_scale=scale_nat,
+                a0_nat,
+                P0_nat,
+                positivity,
+                family="beta",
+                alpha=2.0,
+                beta=10.0,
+                sigma_scale=scale_nat,
             ),
             exponent=K,
         )
@@ -657,8 +696,12 @@ class TestTransformToEkfStBeta:
         positivity = jnp.array([True, True])
 
         priors = _make_priors(
-            a0_nat, P0_nat, positivity,
-            family="beta", alpha=jnp.array([1.0, 2.0]), beta=jnp.array([5.0, 5.0]),
+            a0_nat,
+            P0_nat,
+            positivity,
+            family="beta",
+            alpha=jnp.array([1.0, 2.0]),
+            beta=jnp.array([5.0, 5.0]),
             sigma_scale=jnp.array([0.1, 0.2]),
         )
         with pytest.raises(ValueError, match="alpha > 1 and beta > 1"):
@@ -670,8 +713,13 @@ class TestTransformToEkfStBeta:
         positivity = jnp.array([True])
 
         priors = _make_priors(
-            a0_nat, P0_nat, positivity,
-            family="beta", alpha=2.0, beta=10.0, sigma_scale=0.1,
+            a0_nat,
+            P0_nat,
+            positivity,
+            family="beta",
+            alpha=2.0,
+            beta=10.0,
+            sigma_scale=0.1,
         )
         priors = priors.drop_vars("sigma_q_alpha_prior")
 

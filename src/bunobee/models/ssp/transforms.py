@@ -60,9 +60,7 @@ _VALID_MATCH: tuple[str, ...] = ("mean", "median", "linearize")
 
 def _validate_match(match: str) -> None:
     if match not in _VALID_MATCH:
-        raise ValueError(
-            f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}"
-        )
+        raise ValueError(f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}")
 
 
 def _validate_common(ssp_priors: xr.Dataset) -> None:
@@ -225,11 +223,7 @@ def transform_to_ekf(
         "a0": (ssp_priors["a0"].dims, np.asarray(a0_a)),
         "P0": (("state",), np.asarray(P0_a)),
     }
-    data_vars.update(
-        _transform_sigma_q_block(
-            ssp_priors, family, n_states, safe_init, positivity, k, match
-        )
-    )
+    data_vars.update(_transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k, match))
     data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
     if "obs_idx" in ssp_priors:
@@ -341,9 +335,7 @@ def transform_to_ekf_st(
     k = exponent
     n_states = a0_nat.shape[0]
 
-    a0_a, safe_init, var_a_diag = _compute_a0_a_space(
-        a0_nat, jnp.diag(P0), positivity, k, match
-    )
+    a0_a, safe_init, var_a_diag = _compute_a0_a_space(a0_nat, jnp.diag(P0), positivity, k, match)
 
     # Linearize/mixed-block formula: divide by k*mu for each positivity axis,
     # leave linear axes alone (denom = 1). For "mean"/"median" the both-pos
@@ -369,11 +361,7 @@ def transform_to_ekf_st(
         "a0": (ssp_priors["a0"].dims, np.asarray(a0_a)),
         "P0": (ssp_priors["P0"].dims, np.asarray(P0_a)),
     }
-    data_vars.update(
-        _transform_sigma_q_block(
-            ssp_priors, family, n_states, safe_init, positivity, k, match
-        )
-    )
+    data_vars.update(_transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k, match))
     data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
     if "obs_idx" in ssp_priors:
@@ -485,16 +473,10 @@ def _transform_sigma_q_block(
     shape rules; ``match`` is forwarded to ``_moment_match_sigma``.
     """
     if family == "truncated_normal":
-        return _transform_sigma_q_truncated_normal(
-            ssp_priors, n_states, safe_init, positivity, k, match
-        )
+        return _transform_sigma_q_truncated_normal(ssp_priors, n_states, safe_init, positivity, k, match)
     if family == "beta":
-        return _transform_sigma_q_beta(
-            ssp_priors, n_states, safe_init, positivity, k, match
-        )
-    raise ValueError(
-        f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'"
-    )
+        return _transform_sigma_q_beta(ssp_priors, n_states, safe_init, positivity, k, match)
+    raise ValueError(f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'")
 
 
 def _transform_sigma_q_truncated_normal(
@@ -517,9 +499,7 @@ def _transform_sigma_q_truncated_normal(
             f"got {loc_nat.shape} and {scale_nat.shape}"
         )
 
-    ref_level, sigma_positivity = _resolve_sigma_alignment(
-        loc_nat.shape, n_states, safe_init, positivity
-    )
+    ref_level, sigma_positivity = _resolve_sigma_alignment(loc_nat.shape, n_states, safe_init, positivity)
     sigma_dims = ssp_priors["sigma_q_loc_prior"].dims
 
     out: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
@@ -576,9 +556,7 @@ def _transform_sigma_q_beta(
             f"got alpha={np.asarray(alpha)}, beta={np.asarray(beta)}"
         )
 
-    ref_level, sigma_positivity = _resolve_sigma_alignment(
-        scale_nat.shape, n_states, safe_init, positivity
-    )
+    ref_level, sigma_positivity = _resolve_sigma_alignment(scale_nat.shape, n_states, safe_init, positivity)
     sigma_dims = ssp_priors["sigma_q_scale_prior"].dims
 
     mode_frac = (alpha - 1.0) / (alpha + beta - 2.0)
