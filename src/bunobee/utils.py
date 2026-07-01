@@ -10,10 +10,21 @@ def generate_seed():
     return int(time.time())
 
 
-def summarize_posteriors(posteriors: xr.Dataset) -> pd.DataFrame:
-    """ """
-    # idata = az.from_xarray(posterior=posteriors)
-    summary_df = az.summary(posteriors)
+def summarize_idata(idata: xr.Dataset) -> pd.DataFrame:
+    """Summarize an inference dataset with ArviZ.
+
+    Parameters
+    ----------
+    idata : xr.Dataset
+        Inference dataset, with the usual ``(chain, draw, ...)`` layout.
+
+    Returns
+    -------
+    pd.DataFrame
+        ArviZ summary table (mean, sd, HDI, diagnostics) for each variable.
+    """
+    # idata = az.from_xarray(posterior=idata)
+    summary_df = az.summary(idata)
     return summary_df
 
 
