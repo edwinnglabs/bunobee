@@ -15,6 +15,12 @@ dependencies = [
     "ipywidgets",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "black==26.1.0",
+]
+
 [build-system]
 requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
