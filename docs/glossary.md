@@ -5,22 +5,25 @@ same concept reads the same way everywhere.
 
 ## Prior / posterior
 
-Follow the [ArviZ](https://python.arviz.org/) / [NumPyro](https://num.pyro.ai/) community convention:
+Follow the [ArviZ](https://python.arviz.org/) / [NumPyro](https://num.pyro.ai/) community convention.
+The two libraries name **different objects at different layers**, so we split by *data structure*, not
+by pluralization:
 
-- **The noun is always singular** — `prior`, `posterior`. It names a *distribution* (or a
-  specification of one). ArviZ `InferenceData` groups are all singular (`posterior`, `prior`,
-  `posterior_predictive`), and the plurality of draws is carried by the `chain` / `draw` dimensions,
-  not by pluralizing the noun.
-- **A collection of draws gets the `_samples` suffix** — `posterior_samples`, `prior_samples`. Never
-  use the bare plurals `posteriors` / `priors` as an identifier for a draw collection. NumPyro follows
-  the same pattern: `Predictive(model, posterior_samples=...)`.
+- **`posterior` / `prior` (singular)** — the structured inference object: an `xr.Dataset` with
+  `(chain, draw, ...)` dims, i.e. an ArviZ `InferenceData` group. ArviZ groups are all singular
+  (`posterior`, `prior`, `posterior_predictive`) and there is **no `*_samples` group** — the plurality
+  of draws is carried by the `chain` / `draw` dimensions, not by the name. Use this for anything you
+  build with, pass around as, or return as an `xr.Dataset`.
+- **`posterior_samples` (raw dict)** — the *unstructured* draws straight out of
+  `mcmc.get_samples()`: a plain `dict[str, array]` before it is wrapped in an `xr.Dataset`. This
+  matches NumPyro's `Predictive(model, posterior_samples=...)`. Reserve the `_samples` suffix for this
+  raw layer only.
+- **Never** use the bare plurals `posteriors` / `priors` as an identifier.
 
-| Use | Don't use | Means |
-|-----|-----------|-------|
-| `posterior` | `posteriors` | a single posterior distribution (e.g. a Kalman `P_{t|t}`) |
-| `posterior_samples` | `posteriors` | an `xr.Dataset` / dict of posterior draws from MCMC |
-| `prior` | `priors` | a single prior distribution or its specification |
-| `prior_samples` | `priors` | a collection of prior draws |
+| Use | For | Don't use |
+|-----|-----|-----------|
+| `posterior` / `prior` | an `xr.Dataset` inference object, or a single distribution/spec | `posteriors` / `priors` |
+| `posterior_samples` | a raw `dict` of draws from `mcmc.get_samples()` | `posteriors` |
 
 Plain prose may still say "the coefficient priors" when describing several prior *distributions*
 (one per coefficient) — the rule above governs *identifiers* (variable names, function names, dict
