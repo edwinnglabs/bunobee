@@ -28,7 +28,7 @@ def fit_one_series(
     Returns
     -------
     dict
-        Keys: ``posterior_samples`` (MCMC samples), ``response_norm`` (float),
+        Keys: ``posterior_dict`` (MCMC samples), ``response_norm`` (float),
         ``Z`` (design matrix), ``a0``, ``P0``.
     """
     sales_clipped = np.clip(sales, 1e-1, None).astype(np.float32)
@@ -83,7 +83,7 @@ def fit_one_series(
     mcmc.run(random.split(rng_key, 1)[0], a0, P0)
 
     return {
-        "posterior_samples": mcmc.get_samples(),
+        "posterior_dict": mcmc.get_samples(),
         "response_norm": response_norm,
         "Z": Z,
         "a0": a0,
@@ -114,11 +114,11 @@ def predict_one_series(
     np.ndarray
         Point forecasts of shape (horizon,).
     """
-    posterior_samples = fit_result["posterior_samples"]
+    posterior_dict = fit_result["posterior_dict"]
     response_norm = fit_result["response_norm"]
 
-    at_samples = np.array(posterior_samples["at"])
-    sigma_h_samples = np.array(posterior_samples["sigma_h"])
+    at_samples = np.array(posterior_dict["at"])
+    sigma_h_samples = np.array(posterior_dict["sigma_h"])
 
     n_steps = at_samples.shape[1]
 

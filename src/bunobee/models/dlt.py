@@ -185,7 +185,7 @@ def run_dlt_model(
     regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: Optional[pd.DataFrame] = None,
 ) -> xr.Dataset:
-    """Run NUTS/MCMC on the DLT model and return posterior samples as an ``xr.Dataset``.
+    """Run NUTS/MCMC on the DLT model and return an inference dataset (``idata``) as an ``xr.Dataset``.
 
     Args
     ----
@@ -243,23 +243,23 @@ def run_dlt_model(
 
     mcmc.run(rng_key, lev_sm=lev_sm, slp_sm=slp_sm, theta=theta, y=y, reg_input=reg_input)
 
-    posterior_samples_dict = mcmc.get_samples(group_by_chain=True)
+    posterior_dict = mcmc.get_samples(group_by_chain=True)
 
     # transform them into xr.Dataset
-    n_chains, n_draws, n_steps = posterior_samples_dict["dlt_comp"].shape
+    n_chains, n_draws, n_steps = posterior_dict["dlt_comp"].shape
 
-    dlt_comp_p50 = jnp.median(posterior_samples_dict["dlt_comp"], axis=(0, 1))
+    dlt_comp_p50 = jnp.median(posterior_dict["dlt_comp"], axis=(0, 1))
 
     data_vars = {
-        "dlt_comp": (["chain", "draw", "time"], posterior_samples_dict["dlt_comp"]),
+        "dlt_comp": (["chain", "draw", "time"], posterior_dict["dlt_comp"]),
         "dlt_comp_p50": (["time"], dlt_comp_p50),  # median of in-sample forecast
         # in-sample prediction before reverse transform with original covariates
-        "yhat": (["chain", "draw", "time"], posterior_samples_dict["yhat"]),
-        "resid": (["chain", "draw", "time"], y - posterior_samples_dict["yhat"]),
-        "reg_comp": (["chain", "draw", "time"], posterior_samples_dict["reg_comp"]),
-        "sigma": (["chain", "draw"], posterior_samples_dict["sigma"]),
-        "last_lev": (["chain", "draw"], posterior_samples_dict["last_lev"]),
-        "last_slp": (["chain", "draw"], posterior_samples_dict["last_slp"]),
+        "yhat": (["chain", "draw", "time"], posterior_dict["yhat"]),
+        "resid": (["chain", "draw", "time"], y - posterior_dict["yhat"]),
+        "reg_comp": (["chain", "draw", "time"], posterior_dict["reg_comp"]),
+        "sigma": (["chain", "draw"], posterior_dict["sigma"]),
+        "last_lev": (["chain", "draw"], posterior_dict["last_lev"]),
+        "last_slp": (["chain", "draw"], posterior_dict["last_slp"]),
     }
     coords = {
         "draw": np.arange(n_draws),
@@ -269,14 +269,14 @@ def run_dlt_model(
 
     if regression_scheme is not None:
         # add seasonal regressor coefficient samples
-        coef_p50 = jnp.median(posterior_samples_dict["coef"], axis=(0, 1))
+        coef_p50 = jnp.median(posterior_dict["coef"], axis=(0, 1))
         # (n_steps, )
         reg_comp_p50 = np.sum(coef_p50 * covariates_df[var_name].values, axis=-1)
         # (n_steps, )
         yhat_p50 = dlt_comp_p50 + reg_comp_p50
         data_vars.update(
             {
-                "coef": (["chain", "draw", "var_name"], posterior_samples_dict["coef"]),
+                "coef": (["chain", "draw", "var_name"], posterior_dict["coef"]),
                 "coef_p50": (["var_name"], coef_p50),
                 "reg_comp_p50": (["time"], reg_comp_p50),
                 "yhat_p50": (["time"], yhat_p50),
@@ -302,14 +302,14 @@ def run_dlt_model(
         }
     )
 
-    posterior = xr.Dataset(data_vars=data_vars, coords=coords)
+    idata = xr.Dataset(data_vars=data_vars, coords=coords)
 
-    return posterior
+    return idata
 
 
 def generate_dlt_components(
     rng_key: jnp.ndarray,
-    posterior: xr.Dataset,
+    idata: xr.Dataset,
     end_step: int,
     lev_sm: float,
     slp_sm: float,
@@ -331,7 +331,7 @@ def generate_dlt_components(
     Args
     ----
     rng_key: JAX random key used to draw noise for out-of-sample steps.
-    posterior: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
+    idata: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
         ``dlt_comp``, ``sigma``, ``last_lev``, and ``last_slp``.
     end_step: Total number of time steps to generate (in-sample + out-of-sample).
     lev_sm: Level smoothing factor.
@@ -348,12 +348,12 @@ def generate_dlt_components(
     jnp.ndarray of shape ``(n_samples, end_step)`` containing the DLT component
     draws across all requested time steps.
     """
-    if posterior.get("dlt_comp") is None:
-        raise ValueError("posterior must contain 'dlt_comp' variable.")
+    if idata.get("dlt_comp") is None:
+        raise ValueError("idata must contain 'dlt_comp' variable.")
     else:
         # in-sample forecast
         # (n_samples, n__train_steps)
-        dlt_comp_is_samples = flatten_front_dim(posterior["dlt_comp"].to_numpy(), n=2)
+        dlt_comp_is_samples = flatten_front_dim(idata["dlt_comp"].to_numpy(), n=2)
         n_samples, n_train_steps = dlt_comp_is_samples.shape
         logger.debug(f"dlt_comp_is_samples shape: {dlt_comp_is_samples.shape}")
         logger.info(f"Collecting in-sample forecasts from step 0 to {n_train_steps}.")
@@ -362,8 +362,8 @@ def generate_dlt_components(
         n_oos_steps = end_step - n_train_steps
 
         # (n_samples, )
-        last_lev = flatten_front_dim(posterior["last_lev"].to_numpy(), n=2)
-        last_slp = flatten_front_dim(posterior["last_slp"].to_numpy(), n=2)
+        last_lev = flatten_front_dim(idata["last_lev"].to_numpy(), n=2)
+        last_slp = flatten_front_dim(idata["last_slp"].to_numpy(), n=2)
 
         # float64 to make sure it works with both 32 or 64 bit
         last_lev = jnp.asarray(last_lev, dtype=jnp.float64)
@@ -380,7 +380,7 @@ def generate_dlt_components(
 
         oos_steps = end_step - n_train_steps
         # (n_oos_steps, n_samples)
-        eps_samples = generate_noise_components(rng_key, posterior, oos_steps).transpose()
+        eps_samples = generate_noise_components(rng_key, idata, oos_steps).transpose()
 
         # scan with the partial function
         _, all_states = lax.scan(
@@ -406,7 +406,7 @@ def generate_dlt_components(
 
 def generate_noise_components(
     rng_key: jnp.ndarray,
-    posterior: xr.Dataset,
+    idata: xr.Dataset,
     steps: int,
 ) -> jnp.ndarray:
     """Draw observation-noise samples scaled by posterior ``sigma``.
@@ -414,7 +414,7 @@ def generate_noise_components(
     Args
     ----
     rng_key: JAX random key.
-    posterior: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
+    idata: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
         ``sigma`` with dimensions ``(chain, draw)``.
     steps: Number of time steps to generate noise for.
 
@@ -424,7 +424,7 @@ def generate_noise_components(
     independent draw from ``Normal(0, sigma_i)`` for posterior sample ``i``.
     """
     # (n_samples, )
-    sigma = flatten_front_dim(posterior["sigma"].to_numpy(), n=2)
+    sigma = flatten_front_dim(idata["sigma"].to_numpy(), n=2)
     # samples with broadcasting sigma from (n_samples, ) to (n_samples, steps)
     eps_samples = jax.random.normal(rng_key, shape=(sigma.shape[0], steps)) * sigma[:, None]
     return eps_samples
@@ -432,7 +432,7 @@ def generate_noise_components(
 
 def make_inference(
     rng_key: jnp.ndarray,
-    posterior: xr.Dataset,
+    idata: xr.Dataset,
     lev_sm: float,
     slp_sm: float,
     theta: float,
@@ -446,21 +446,21 @@ def make_inference(
     Calls ``generate_dlt_comp_samples`` for the trend, adds the regression component
     (when covariates are provided), and optionally applies a back-transform.
 
-    When ``covariates_df`` is supplied and ``"coef"`` is present in ``posterior``,
+    When ``covariates_df`` is supplied and ``"coef"`` is present in ``idata``,
     ``end_step`` is inferred from the length of the covariates and must not be set
     manually.  Without covariates, ``end_step`` is required.
 
     Args
     ----
     rng_key: JAX random key for reproducibility.
-    posterior: ``xr.Dataset`` returned by ``run_dlt_model``.
+    idata: ``xr.Dataset`` returned by ``run_dlt_model``.
     lev_sm: Level smoothing factor.
     slp_sm: Slope smoothing factor.
     theta: Damping factor.
     end_step: Total steps to forecast. Ignored (overridden) when covariates are given;
         required otherwise.
     covariates_df: Optional DataFrame of covariates, shape ``(n_steps, n_var)``.
-        Column names must match the ``var_name`` coordinate in ``posterior``.
+        Column names must match the ``var_name`` coordinate in ``idata``.
     transform_callback: Optional callable applied element-wise to ``forecast_samples``
         (e.g. to reverse a log transform).
     noise_embed: If ``True``, adds a draw from ``Normal(0, sigma)`` to
@@ -477,10 +477,10 @@ def make_inference(
         dimension.  ``forecast_samples`` equals
         ``dlt_comp + reg_comp [+ eps]`` depending on ``noise_embed``.
     """
-    if "coef" in posterior and covariates_df is not None:
+    if "coef" in idata and covariates_df is not None:
         # (n_samples, n_var)
-        coef = flatten_front_dim(posterior["coef"].to_numpy(), n=2)
-        var_names = list(posterior["coef"].var_name.values)
+        coef = flatten_front_dim(idata["coef"].to_numpy(), n=2)
+        var_names = list(idata["coef"].var_name.values)
         covariates = covariates_df[var_names].values
         logger.debug(f"var_names: {var_names}")
         logger.debug(f"coef shape: {coef.shape}")
@@ -503,11 +503,11 @@ def make_inference(
         has_regression = False
 
     rng_key = jax.random.split(rng_key, num=1)[0]
-    dlt_comp_samples = generate_dlt_components(rng_key, posterior, end_step, lev_sm, slp_sm, theta)
+    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta)
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
     rng_key = jax.random.split(rng_key, num=1)[0]
-    eps_samples = generate_noise_components(rng_key, posterior, end_step)
+    eps_samples = generate_noise_components(rng_key, idata, end_step)
 
     forecast_samples = dlt_comp_samples + reg_comp_samples_total
     if noise_embed:
