@@ -93,7 +93,7 @@ class RegressionScheme:
         loc_prior: Union[float, List[str]] = 0.0,
         scale_prior: Union[float, List[float]] = 1.0,
     ) -> None:
-        """A lazy interface to add multiple regressors at once with flat values of priors"""
+        """A lazy interface to add multiple regressors at once with flat prior values"""
 
         new_scheme_to_combine = pd.DataFrame(
             {
@@ -186,8 +186,8 @@ def make_fourier_series_with_ts(dt_arr: pd.Series, period: Union[int, float], or
 
 
 def make_fourier_series(
-    n_steps: int, 
-    period: float, 
+    n_steps: int,
+    period: float,
     order: int,
 ) -> np.ndarray:
     """Build Fourier design matrix of shape (n_steps, 2*order)."""

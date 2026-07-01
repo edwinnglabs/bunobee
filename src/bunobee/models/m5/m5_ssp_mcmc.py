@@ -28,7 +28,7 @@ def fit_one_series(
     Returns
     -------
     dict
-        Keys: ``posteriors`` (MCMC samples), ``response_norm`` (float),
+        Keys: ``posterior_samples`` (MCMC samples), ``response_norm`` (float),
         ``Z`` (design matrix), ``a0``, ``P0``.
     """
     sales_clipped = np.clip(sales, 1e-1, None).astype(np.float32)
@@ -56,15 +56,23 @@ def fit_one_series(
         sigma_q_raw = numpyro.sample(
             "sigma_q",
             dist.TruncatedNormal(
-                sigma_q_loc_prior, sigma_q_scale_prior, high=0.1, low=1e-5,
+                sigma_q_loc_prior,
+                sigma_q_scale_prior,
+                high=0.1,
+                low=1e-5,
             ),
         )
         n_seas = n_states - 1
         sigma_q = jnp.concatenate([sigma_q_raw[:1], jnp.repeat(sigma_q_raw[1:], n_seas)])
 
         lp, at, _, _, _, _ = kalman_filter_1d(
-            a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q,
-            y=y, Z=Z, logp=True,
+            a0=a0,
+            P0=P0,
+            sigma_h=sigma_h,
+            sigma_q=sigma_q,
+            y=y,
+            Z=Z,
+            logp=True,
         )
         numpyro.factor("lp", lp)
         numpyro.deterministic("at", at)
@@ -75,7 +83,7 @@ def fit_one_series(
     mcmc.run(random.split(rng_key, 1)[0], a0, P0)
 
     return {
-        "posteriors": mcmc.get_samples(),
+        "posterior_samples": mcmc.get_samples(),
         "response_norm": response_norm,
         "Z": Z,
         "a0": a0,
@@ -106,11 +114,11 @@ def predict_one_series(
     np.ndarray
         Point forecasts of shape (horizon,).
     """
-    posteriors = fit_result["posteriors"]
+    posterior_samples = fit_result["posterior_samples"]
     response_norm = fit_result["response_norm"]
 
-    at_samples = np.array(posteriors["at"])
-    sigma_h_samples = np.array(posteriors["sigma_h"])
+    at_samples = np.array(posterior_samples["at"])
+    sigma_h_samples = np.array(posterior_samples["sigma_h"])
 
     n_steps = at_samples.shape[1]
 
@@ -118,8 +126,8 @@ def predict_one_series(
         weekly_dummies_full = make_peridoic_dummies(n_steps + horizon, period=7, drop_first=True)
         Z_future = np.concatenate([np.ones((horizon, 1)), weekly_dummies_full[n_steps:]], axis=1)
 
-    a_last = at_samples[:, -1, :]       # (n_samples, n_states)
-    mu_future = a_last @ Z_future.T     # (n_samples, horizon)
+    a_last = at_samples[:, -1, :]  # (n_samples, n_states)
+    mu_future = a_last @ Z_future.T  # (n_samples, horizon)
 
     eps = np.random.default_rng(42).normal(0, sigma_h_samples[:, None], size=mu_future.shape)
     yhat_samples = np.exp(mu_future + eps) * response_norm
