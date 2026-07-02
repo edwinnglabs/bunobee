@@ -17,7 +17,7 @@ def kalman_filter_1d_ekf(
     y: jnp.ndarray,
     logp: bool = False,
     exponent: float = 0.5,
-    positivity_idx: jnp.ndarray | None = None,
+    positivity: jnp.ndarray | None = None,
     # (n_steps, n_states) — observed latent state means in a-space; ignored where P_obs is inf
     a_obs: jnp.ndarray | None = None,
     # (n_steps, n_states) — observed latent state variances in a-space; inf = no information
@@ -49,12 +49,12 @@ def kalman_filter_1d_ekf(
 
     3. **Linearise** — compute per-state effective values and Jacobians:
 
-       - Nonlinear states (``positivity_idx=True``):
+       - Nonlinear states (``positivity=True``):
          h(a_i) = exp(exponent · a_i),  H_i = exponent · Z_i · exp(exponent · a_i)
-       - Linear states (``positivity_idx=False``):
+       - Linear states (``positivity=False``):
          h(a_i) = a_i,  H_i = Z_i
 
-       ``positivity_idx=None`` treats all states as nonlinear (default).
+       ``positivity=None`` treats all states as nonlinear (default).
        Pass ``jnp.zeros(n_states, dtype=bool)`` to recover a fully linear KF.
 
     4. **Update** — standard Kalman correction::
@@ -91,7 +91,7 @@ def kalman_filter_1d_ekf(
         Accumulate the approximate Gaussian log-likelihood. Default False.
     exponent : float, optional
         Exponent in the nonlinear mapping ``exp(exponent · a_t)``. Default 0.5.
-    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+    positivity : jnp.ndarray | None, optional, shape (n_states,)
         Boolean mask — True selects states that use the nonlinear exp mapping.
         ``None`` (default) applies the nonlinear mapping to all states.
         Pass ``jnp.zeros(n_states, dtype=bool)`` for a fully linear filter.
@@ -137,7 +137,7 @@ def kalman_filter_1d_ekf(
     n_states = a0.shape[0]
 
     # None → all states use the nonlinear exp mapping
-    _positivity = positivity_idx if positivity_idx is not None else jnp.ones(n_states, dtype=bool)
+    _positivity = positivity if positivity is not None else jnp.ones(n_states, dtype=bool)
 
     # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
     _has_obs_fusion = a_obs is not None or P_obs is not None
@@ -224,7 +224,7 @@ def kalman_dk_smoother_1d_ekf(
     P0: jnp.ndarray,
     sigma_q: jnp.ndarray | float,
     exponent: float = 0.5,
-    positivity_idx: jnp.ndarray | None = None,
+    positivity: jnp.ndarray | None = None,
     a_obs: jnp.ndarray | None = None,
     P_obs: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
@@ -235,7 +235,7 @@ def kalman_dk_smoother_1d_ekf(
     (recover intensities for nonlinear states via ``jnp.exp(exponent *
     at_smooth)``).  ``at``, ``Pt``, ``vt``, ``Ft``, ``Kt`` come directly from
     :func:`kalman_filter_1d_ekf`; ``Z``, ``a0``, ``P0``, ``sigma_q``,
-    ``exponent``, ``positivity_idx``, ``a_obs``, ``P_obs`` must match
+    ``exponent``, ``positivity``, ``a_obs``, ``P_obs`` must match
     the values originally passed to the filter.
 
     Backward recursion mirrors the linear D&K smoother but substitutes the
@@ -293,7 +293,7 @@ def kalman_dk_smoother_1d_ekf(
     exponent : float, optional
         Exponent in the nonlinear mapping ``exp(exponent · a_t)``; must match
         the value used by the filter. Default 0.5.
-    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+    positivity : jnp.ndarray | None, optional, shape (n_states,)
         Boolean mask — True selects states using the nonlinear exp mapping
         (must match the filter). ``None`` (default) treats all states as
         nonlinear. Pass ``jnp.zeros(n_states, dtype=bool)`` to recover a
@@ -315,7 +315,7 @@ def kalman_dk_smoother_1d_ekf(
     sigma_q_sq = jnp.square(sigma_q)
 
     # None → all states nonlinear (matches filter default).
-    _positivity = positivity_idx if positivity_idx is not None else jnp.ones(n_states, dtype=bool)
+    _positivity = positivity if positivity is not None else jnp.ones(n_states, dtype=bool)
 
     # Pre-fusion predicted state.  EKF stores Pt[t] = P_{t|t} (without σ_q²),
     # so shifting requires adding σ_q² at every t — including t=0, since the

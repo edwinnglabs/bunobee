@@ -134,18 +134,18 @@ def test_st_filter_reduces_to_1d_for_single_series() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — EKF collapses to linear filter when positivity_idx is all-False
+# Test 3 — EKF collapses to linear filter when positivity is all-False
 # ---------------------------------------------------------------------------
 
 
 def test_ekf_reduces_to_linear_filter() -> None:
-    """kalman_filter_1d_ekf with positivity_idx=all-False matches kalman_filter_1d.
+    """kalman_filter_1d_ekf with positivity=all-False matches kalman_filter_1d.
 
     Because the EKF carries P_{t|t} (pure posterior) while the linear filter
     carries P_{t+1|t} = P_{t|t} + sigma_q^2, exact agreement requires the
     linear filter's P0 to equal P0_ekf + sigma_q^2.
     """
-    positivity_idx = jnp.zeros(N_STATES, dtype=bool)
+    positivity = jnp.zeros(N_STATES, dtype=bool)
     sigma_q_sq = jnp.square(_SIGMA_Q)
     P0_ekf = _P0
     P0_lin = _P0 + sigma_q_sq  # align initial predicted covariance
@@ -158,7 +158,7 @@ def test_ekf_reduces_to_linear_filter() -> None:
         sigma_q=_SIGMA_Q,
         y=_Y,
         logp=True,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
     log_p_ekf, at_ekf, Pt_ekf, vt_ekf, Ft_ekf, Kt_ekf = kalman_filter_1d_ekf(
         a0=_A0,
@@ -168,7 +168,7 @@ def test_ekf_reduces_to_linear_filter() -> None:
         sigma_q=_SIGMA_Q,
         y=_Y,
         logp=True,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
 
     assert jnp.allclose(at_ekf, at_lin, atol=1e-10), "filtered means differ"
@@ -184,13 +184,13 @@ def test_ekf_reduces_to_linear_filter() -> None:
 
 
 def test_st_ekf_reduces_to_st_filter() -> None:
-    """kalman_filter_1d_ekf_st with positivity_idx=all-False matches kalman_filter_1d_st.
+    """kalman_filter_1d_ekf_st with positivity=all-False matches kalman_filter_1d_st.
 
     Cross-validates the multi-series EKF against the multi-series linear filter
     using the same P0-alignment trick as in test_ekf_reduces_to_linear_filter.
     """
     n_series = 2
-    positivity_idx = jnp.zeros(N_STATES, dtype=bool)
+    positivity = jnp.zeros(N_STATES, dtype=bool)
     sigma_q_sq = jnp.square(_SIGMA_Q)
 
     # Build a 2-series problem by stacking two copies of _Z and _Y
@@ -218,7 +218,7 @@ def test_st_ekf_reduces_to_st_filter() -> None:
         sigma_q=_SIGMA_Q,
         y=y_st,
         logp=True,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
 
     assert jnp.allclose(at_ekf_st, at_st, atol=1e-10), "filtered means differ"
@@ -240,7 +240,7 @@ def test_positivity_keeps_states_nonnegative() -> None:
     """
     # Large negative observations drive the first state negative without positivity
     y_neg = jnp.full(T, -5.0)
-    positivity_idx = jnp.array([True, False])
+    positivity = jnp.array([True, False])
 
     _, at_1d, *_ = kalman_filter_1d(
         a0=_A0,
@@ -249,7 +249,7 @@ def test_positivity_keeps_states_nonnegative() -> None:
         sigma_h=_SIGMA_H,
         sigma_q=_SIGMA_Q,
         y=y_neg,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
 
     assert jnp.all(at_1d[:, 0] >= 1e-6), "1d filter violated positivity floor"
@@ -277,7 +277,7 @@ def test_positivity_keeps_states_nonnegative() -> None:
         sigma_h=jnp.array([_SIGMA_H]),
         sigma_q=_SIGMA_Q,
         y=y_st,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
 
     assert jnp.all(at_st[:, 0] >= 1e-6), "st filter violated positivity floor"

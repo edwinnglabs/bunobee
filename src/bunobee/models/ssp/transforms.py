@@ -63,15 +63,62 @@ def _validate_match(match: str) -> None:
         raise ValueError(f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}")
 
 
-def _validate_common(ssp_priors: xr.Dataset) -> None:
-    """Validate inputs shared by both EKF transforms."""
-    if "positivity_idx" not in ssp_priors:
-        raise ValueError("ssp_priors must contain a `positivity_idx` variable")
+def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True) -> None:
+    """Validate a time-point prior ``xr.Dataset`` against the SSP contract.
+
+    Single source of truth for the prior's required variables, dims, and the
+    optional ``sigma_q`` family attr, so a malformed prior fails here — at
+    construction / transform time — rather than deep inside a filter scan.
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset
+        Candidate prior dataset. Always required: ``positivity`` — a boolean
+        mask over dims ``(state,)`` marking positivity-constrained states.
+        When ``require_init`` is ``True`` (the transform contract), ``a0`` and
+        ``P0`` over ``state`` are also required (``P0`` diagonal ``(state,)``
+        or full ``(state, state_dual)``). Optional: ``a_obs`` / ``P_obs`` over
+        ``(time, state)`` — both present or both absent — and a ``sigma_q``
+        block whose family is set by ``attrs['sigma_q_family']``.
+    require_init : bool, optional
+        Whether ``a0`` / ``P0`` must be present, by default ``True``. Pass
+        ``False`` to validate a disclosure-only prior (as produced by
+        :func:`~bunobee.models.ssp.utils.construct_states_prior`, which carries
+        the observation block but not the initial-state moments).
+
+    Raises
+    ------
+    ValueError
+        If a required variable is missing, ``positivity`` is not a boolean
+        ``(state,)`` mask, exactly one of ``a_obs`` / ``P_obs`` is present, the
+        ``state`` dim length is inconsistent across variables, or
+        ``attrs['sigma_q_family']`` names an unknown family.
+    """
+    required = ("a0", "P0", "positivity") if require_init else ("positivity",)
+    for name in required:
+        if name not in ssp_priors:
+            raise ValueError(f"ssp_priors must contain a `{name}` variable")
+
+    positivity = ssp_priors["positivity"]
+    if positivity.dims != ("state",):
+        raise ValueError(f"`positivity` must have dims ('state',); got {positivity.dims}")
+    if positivity.dtype != np.dtype(bool):
+        raise ValueError(f"`positivity` must be a boolean mask; got dtype {positivity.dtype}")
 
     has_a_obs = "a_obs" in ssp_priors
     has_P_obs = "P_obs" in ssp_priors
     if has_a_obs != has_P_obs:
         raise ValueError("a_obs and P_obs must both be present or both be absent")
+
+    n_states = ssp_priors.sizes["state"]
+    for name in ("a0", "a_obs", "P_obs"):
+        got = ssp_priors[name].sizes.get("state") if name in ssp_priors else None
+        if got is not None and got != n_states:
+            raise ValueError(f"`{name}` has state dim {got}, expected {n_states}")
+
+    family = ssp_priors.attrs.get("sigma_q_family", "truncated_normal")
+    if family not in ("truncated_normal", "beta"):
+        raise ValueError(f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'")
 
 
 def _compute_a0_a_space(
@@ -173,11 +220,10 @@ def transform_to_ekf(
     ----------
     ssp_priors : xr.Dataset
         Required: ``a0`` ``(state,)``, ``P0`` ``(state,)`` diagonal,
-        ``positivity_idx`` ``(state,)`` boolean, and the ``sigma_q`` block
+        ``positivity`` ``(state,)`` boolean, and the ``sigma_q`` block
         for the chosen family (see :func:`transform_to_ekf_st` for the
         per-family schema, which is identical here).
-        Optional: ``a_obs`` / ``P_obs`` ``(time, state)`` (both or neither);
-        ``obs_idx`` (passed through).
+        Optional: ``a_obs`` / ``P_obs`` ``(time, state)`` (both or neither).
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k * a)``. Default 0.5.
     match : {"mean", "median", "linearize"}, optional
@@ -196,11 +242,11 @@ def transform_to_ekf(
     Raises
     ------
     ValueError
-        If ``P0`` is not 1-D, if ``positivity_idx`` is missing, if exactly one
+        If ``P0`` is not 1-D, if ``positivity`` is missing, if exactly one
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
-    _validate_common(ssp_priors)
+    validate_prior(ssp_priors)
     _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
@@ -212,7 +258,7 @@ def transform_to_ekf(
         )
 
     family = ssp_priors.attrs.get("sigma_q_family", "truncated_normal")
-    positivity = jnp.asarray(ssp_priors["positivity_idx"].values, dtype=bool)
+    positivity = jnp.asarray(ssp_priors["positivity"].values, dtype=bool)
     a0_nat = jnp.asarray(ssp_priors["a0"].values)
     k = exponent
     n_states = a0_nat.shape[0]
@@ -226,12 +272,8 @@ def transform_to_ekf(
     data_vars.update(_transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k, match))
     data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
-    if "obs_idx" in ssp_priors:
-        obs_idx_var = ssp_priors["obs_idx"]
-        data_vars["obs_idx"] = (obs_idx_var.dims, np.asarray(obs_idx_var.values))
-
-    pos_var = ssp_priors["positivity_idx"]
-    data_vars["positivity_idx"] = (pos_var.dims, np.asarray(pos_var.values))
+    pos_var = ssp_priors["positivity"]
+    data_vars["positivity"] = (pos_var.dims, np.asarray(pos_var.values))
 
     return xr.Dataset(
         data_vars=data_vars,
@@ -272,7 +314,7 @@ def transform_to_ekf_st(
     ----------
     ssp_priors : xr.Dataset
         Required: ``a0`` ``(state,)``, ``P0`` ``(state, state_dual)`` full
-        covariance, ``positivity_idx`` ``(state,)`` boolean, and the
+        covariance, ``positivity`` ``(state,)`` boolean, and the
         ``sigma_q`` block for the chosen family.
 
         ``sigma_q`` block, family ``"truncated_normal"`` (default):
@@ -294,8 +336,7 @@ def transform_to_ekf_st(
           ``scale_a * Beta(alpha, beta)`` in a-space equals the pushforward
           of the natural-scale mode ``scale * (alpha - 1) / (alpha + beta - 2)``.
 
-        Optional: ``a_obs`` / ``P_obs`` ``(time, state)`` (both or neither);
-        ``obs_idx`` (passed through).
+        Optional: ``a_obs`` / ``P_obs`` ``(time, state)`` (both or neither).
     exponent : float, optional
         Exponent ``k`` in the forward map ``x = exp(k * a)``. Default 0.5.
     match : {"mean", "median", "linearize"}, optional
@@ -314,11 +355,11 @@ def transform_to_ekf_st(
     Raises
     ------
     ValueError
-        If ``P0`` is not 2-D, if ``positivity_idx`` is missing, if exactly one
+        If ``P0`` is not 2-D, if ``positivity`` is missing, if exactly one
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
-    _validate_common(ssp_priors)
+    validate_prior(ssp_priors)
     _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
@@ -330,7 +371,7 @@ def transform_to_ekf_st(
         )
 
     family = ssp_priors.attrs.get("sigma_q_family", "truncated_normal")
-    positivity = jnp.asarray(ssp_priors["positivity_idx"].values, dtype=bool)
+    positivity = jnp.asarray(ssp_priors["positivity"].values, dtype=bool)
     a0_nat = jnp.asarray(ssp_priors["a0"].values)
     k = exponent
     n_states = a0_nat.shape[0]
@@ -364,12 +405,8 @@ def transform_to_ekf_st(
     data_vars.update(_transform_sigma_q_block(ssp_priors, family, n_states, safe_init, positivity, k, match))
     data_vars.update(_transform_obs_block(ssp_priors, positivity, k, match))
 
-    if "obs_idx" in ssp_priors:
-        obs_idx_var = ssp_priors["obs_idx"]
-        data_vars["obs_idx"] = (obs_idx_var.dims, np.asarray(obs_idx_var.values))
-
-    pos_var = ssp_priors["positivity_idx"]
-    data_vars["positivity_idx"] = (pos_var.dims, np.asarray(pos_var.values))
+    pos_var = ssp_priors["positivity"]
+    data_vars["positivity"] = (pos_var.dims, np.asarray(pos_var.values))
 
     return xr.Dataset(
         data_vars=data_vars,

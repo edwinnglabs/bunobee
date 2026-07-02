@@ -18,7 +18,7 @@ def kalman_filter_1d_st(
     logp: bool = False,
     a_obs: jnp.ndarray | None = None,
     P_obs: jnp.ndarray | None = None,
-    positivity_idx: jnp.ndarray | None = None,
+    positivity: jnp.ndarray | None = None,
 ) -> tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Multi-series Kalman filter with shared latent state and full state covariance.
 
@@ -79,7 +79,7 @@ def kalman_filter_1d_st(
         timesteps / states with no external information. When both
         ``a_obs`` and ``P_obs`` are None the filter runs without
         any state fusion.
-    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+    positivity : jnp.ndarray | None, optional, shape (n_states,)
         Boolean mask — True selects states that must remain non-negative.
         ``None`` (default) disables positivity correction for all states.
 
@@ -118,8 +118,8 @@ def kalman_filter_1d_st(
     _at_obs = a_obs if a_obs is not None else jnp.zeros((y.shape[0], n_states))
     _Pt_obs = P_obs if P_obs is not None else jnp.full((y.shape[0], n_states), jnp.inf)
 
-    _has_positivity = positivity_idx is not None
-    _positivity_idx = positivity_idx if positivity_idx is not None else jnp.zeros(n_states, dtype=bool)
+    _has_positivity = positivity is not None
+    _positivity = positivity if positivity is not None else jnp.zeros(n_states, dtype=bool)
 
     def _transition_fn(
         carry: tuple[jnp.ndarray, jnp.ndarray, float],
@@ -169,7 +169,7 @@ def kalman_filter_1d_st(
 
         # ------ Positivity correction ------
         if _has_positivity:
-            enforce = _positivity_idx & (at < 0)
+            enforce = _positivity & (at < 0)
             # Treat as pseudo-observation: observe a_i=1e-3 with var=1e-3 for violated states
             pos_loc = jnp.where(enforce, 1e-3, 0.0)
             pos_var = jnp.where(enforce, 1e-3, jnp.inf)
@@ -181,7 +181,7 @@ def kalman_filter_1d_st(
             Pt = 0.5 * (Pt + Pt.T)
             at = Pt @ (Pt_inv @ at + prec_obs_diag * pos_loc)
             # Hard floor for numerical stability
-            at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
+            at = jnp.where(_positivity, jnp.maximum(at, 1e-6), at)
 
         return (at, Pt, log_p), (at, Pt, vt, Ft, Kt)
 

@@ -9,6 +9,7 @@ import xarray as xr
 jax.config.update("jax_enable_x64", True)
 
 from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st
+from bunobee.models.ssp.utils import disclosed_idx
 
 K = 0.5
 
@@ -22,12 +23,11 @@ def _closed_form(mu_x: float, var_x: float, k: float = K) -> tuple[float, float]
 def _make_priors(
     a0_nat: jnp.ndarray,
     P0_nat: jnp.ndarray,
-    positivity_idx: jnp.ndarray,
+    positivity: jnp.ndarray,
     sigma_loc: jnp.ndarray | float = 0.0,
     sigma_scale: jnp.ndarray | float | None = None,
     a_obs_nat: jnp.ndarray | None = None,
     P_obs_nat: jnp.ndarray | None = None,
-    obs_idx: jnp.ndarray | None = None,
     sigma_low: jnp.ndarray | None = None,
     sigma_high: jnp.ndarray | None = None,
     family: str = "truncated_normal",
@@ -41,7 +41,7 @@ def _make_priors(
     data_vars: dict = {
         "a0": (("state",), np.asarray(a0_nat)),
         "P0": (p0_dims, p0_arr),
-        "positivity_idx": (("state",), np.asarray(positivity_idx, dtype=bool)),
+        "positivity": (("state",), np.asarray(positivity, dtype=bool)),
     }
 
     if family == "truncated_normal":
@@ -68,8 +68,6 @@ def _make_priors(
         data_vars["a_obs"] = (("time", "state"), np.asarray(a_obs_nat))
     if P_obs_nat is not None:
         data_vars["P_obs"] = (("time", "state"), np.asarray(P_obs_nat))
-    if obs_idx is not None:
-        data_vars["obs_idx"] = (("obs_point",), np.asarray(obs_idx))
 
     return xr.Dataset(data_vars, attrs={"sigma_q_family": family})
 
@@ -172,7 +170,7 @@ class TestTransformToEkf:
             }
         )
 
-        with pytest.raises(ValueError, match="positivity_idx"):
+        with pytest.raises(ValueError, match="positivity"):
             transform_to_ekf(ds)
 
     def test_omits_obs_when_absent(self):
@@ -185,16 +183,24 @@ class TestTransformToEkf:
         assert "a_obs" not in out
         assert "P_obs" not in out
 
-    def test_obs_idx_passthrough(self):
+    def test_obs_idx_not_emitted(self):
+        # obs_idx is no longer a stored variable — disclosure indices are derived.
         a0_nat = jnp.array([1.0])
         P0_diag = jnp.ones(1)
         positivity = jnp.array([True])
-        idx = jnp.array([3, 7, 11])
 
-        priors = _make_priors(a0_nat, P0_diag, positivity, obs_idx=idx)
-        out = transform_to_ekf(priors)
+        out = transform_to_ekf(_make_priors(a0_nat, P0_diag, positivity))
 
-        assert jnp.array_equal(out["obs_idx"].values, np.asarray(idx))
+        assert "obs_idx" not in out
+
+    def test_disclosed_idx_from_p_obs(self):
+        # disclosed_idx recovers the finite-variance rows without a stored obs_idx.
+        a_obs = np.zeros((5, 1))
+        p_obs = np.full((5, 1), np.inf)
+        p_obs[[1, 3], 0] = 0.1
+        priors = _make_priors(jnp.array([1.0]), jnp.ones(1), jnp.array([True]), a_obs_nat=a_obs, P_obs_nat=p_obs)
+
+        assert np.array_equal(disclosed_idx(priors), np.array([1, 3]))
 
     def test_default_family_attr_propagates(self):
         a0_nat = jnp.array([1.0, 2.0])

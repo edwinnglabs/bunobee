@@ -9,6 +9,8 @@ import pandas as pd
 import xarray as xr
 from jax import numpy as jnp
 
+from bunobee.models.ssp.transforms import validate_prior
+
 
 def construct_states_prior(
     n_steps: int,
@@ -19,7 +21,7 @@ def construct_states_prior(
     n_points: int = 7,
     seed: int = 42,
     obs_scale: float = 0.1,
-    positivity_idx: np.ndarray | None = None,
+    positivity: np.ndarray | None = None,
 ) -> xr.Dataset:
     """Construct a_obs and P_obs by disclosing the ground-truth latent
     state over n_periods randomly drawn windows of n_points consecutive steps.
@@ -43,18 +45,18 @@ def construct_states_prior(
     obs_scale : float
         Standard deviation expressing confidence in the disclosed state.
         Smaller → tighter prior; larger → more diffuse.
-    positivity_idx : np.ndarray or None, optional
-        Boolean mask of length ``n_states`` indicating which states use the
-        positivity (log-space) transform.  Defaults to ``[False, True, …]``
-        — intercept is linear, all regressors are positivity states.
+    positivity : np.ndarray or None, optional
+        Boolean mask of length ``n_states`` indicating which states are
+        positivity-constrained.  Defaults to ``[False, True, …]`` — intercept
+        is linear, all regressors are positivity states.
 
     Returns
     -------
     xr.Dataset
-        Variables ``a_obs`` and ``P_obs`` with dims ``(time, state)``,
-        ``obs_idx`` with dim ``obs_point``, and ``positivity_idx`` with dim
-        ``state``.  Coords: ``time`` (0…n_steps-1),
-        ``state`` (["intercept", *regressors]), ``obs_point`` (integer range).
+        Variables ``a_obs`` and ``P_obs`` with dims ``(time, state)`` and
+        ``positivity`` with dim ``state``.  Coords: ``time`` (0…n_steps-1) and
+        ``state`` (["intercept", *regressors]).  Disclosure time indices are
+        not stored; derive them with :func:`disclosed_idx`.
     """
     rng = np.random.default_rng(seed)
     # sample n_periods window starts; ensure each window fits within n_steps
@@ -70,31 +72,63 @@ def construct_states_prior(
     var_row = jnp.array([jnp.inf] + [obs_scale**2] * len(regressors))
     P_obs = P_obs.at[obs_idx].set(var_row)
 
-    if positivity_idx is None:
-        positivity_idx = np.array([False] + [True] * len(regressors))
+    if positivity is None:
+        positivity = np.array([False] + [True] * len(regressors))
     else:
-        positivity_idx = np.asarray(positivity_idx, dtype=bool)
+        positivity = np.asarray(positivity, dtype=bool)
 
     state_labels = ["intercept", *regressors]
-    return xr.Dataset(
+    ds = xr.Dataset(
         {
             "a_obs": (("time", "state"), np.asarray(a_obs)),
             "P_obs": (("time", "state"), np.asarray(P_obs)),
-            "obs_idx": (("obs_point",), obs_idx),
-            "positivity_idx": (("state",), positivity_idx),
+            "positivity": (("state",), positivity),
         },
         coords={
             "time": np.arange(n_steps),
             "state": state_labels,
-            "obs_point": np.arange(len(obs_idx)),
         },
     )
+    # Fail fast on a malformed disclosure block; a0/P0 are supplied downstream.
+    validate_prior(ds, require_init=False)
+    return ds
+
+
+def disclosed_idx(ssp_priors: xr.Dataset) -> np.ndarray:
+    """Return the time indices where the prior discloses state information.
+
+    Replaces the previously stored ``obs_idx`` variable, which was redundant
+    with ``P_obs``: a disclosure exists at any timestep with at least one
+    finite-variance state, since undisclosed timesteps carry ``inf`` variance
+    (zero precision, a pure filter carry-through).
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset
+        Prior dataset containing a ``P_obs`` variable with dims
+        ``(time, state)``.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted integer indices into the ``time`` axis with at least one
+        disclosed (finite-variance) state.
+
+    Raises
+    ------
+    KeyError
+        If ``ssp_priors`` has no ``P_obs`` variable.
+    """
+    if "P_obs" not in ssp_priors:
+        raise KeyError("ssp_priors has no `P_obs`; cannot derive disclosure indices")
+    p_obs = np.asarray(ssp_priors["P_obs"].values)
+    return np.where(np.isfinite(p_obs).any(axis=1))[0]
 
 
 def a_to_lam(
     arr: np.ndarray,
     exponent: float,
-    positivity_idx: np.ndarray | None = None,
+    positivity: np.ndarray | None = None,
 ) -> np.ndarray:
     """Convert a-space values to λ-space for positivity states.
 
@@ -104,7 +138,7 @@ def a_to_lam(
         Array in a-space, shape ``(..., n_states)`` — e.g. ``a_obs``.
     exponent : float
         EKF nonlinearity exponent: ``λ = exp(exponent · a)``.
-    positivity_idx : np.ndarray or None, optional
+    positivity : np.ndarray or None, optional
         Boolean mask of length ``n_states``.  ``True`` = positivity state.
         ``None`` treats every state as positivity.
 
@@ -116,7 +150,7 @@ def a_to_lam(
     """
     out = np.array(arr, dtype=float)
     n_states = out.shape[-1]
-    mask = np.ones(n_states, dtype=bool) if positivity_idx is None else np.asarray(positivity_idx, dtype=bool)
+    mask = np.ones(n_states, dtype=bool) if positivity is None else np.asarray(positivity, dtype=bool)
     out[..., mask] = np.exp(exponent * out[..., mask])
     return out
 
@@ -124,7 +158,7 @@ def a_to_lam(
 def lam_to_a(
     arr: np.ndarray,
     exponent: float,
-    positivity_idx: np.ndarray | None = None,
+    positivity: np.ndarray | None = None,
 ) -> np.ndarray:
     """Convert λ-space values to a-space for positivity states.
 
@@ -135,7 +169,7 @@ def lam_to_a(
         be strictly positive; ``log`` is applied element-wise.
     exponent : float
         EKF nonlinearity exponent: ``a = log(λ) / exponent``.
-    positivity_idx : np.ndarray or None, optional
+    positivity : np.ndarray or None, optional
         Boolean mask of length ``n_states``.  ``None`` treats all as positivity.
 
     Returns
@@ -146,7 +180,7 @@ def lam_to_a(
     """
     out = np.array(arr, dtype=float)
     n_states = out.shape[-1]
-    mask = np.ones(n_states, dtype=bool) if positivity_idx is None else np.asarray(positivity_idx, dtype=bool)
+    mask = np.ones(n_states, dtype=bool) if positivity is None else np.asarray(positivity, dtype=bool)
     out[..., mask] = np.log(out[..., mask]) / exponent
     return out
 
@@ -377,6 +411,100 @@ def plot_states(
 
     if title is None:
         title = keys[0] if single else " vs ".join(keys)
+    fig.suptitle(title, y=1.01)
+    plt.tight_layout()
+
+    return fig, axes
+
+
+def plot_prior_heatmap(
+    ssp_priors: xr.Dataset,
+    *,
+    quantity: str = "mean",
+    dates: np.ndarray | None = None,
+    cmap: str = "viridis",
+    undisclosed_color: str = "0.9",
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """Visualise a time-point prior as a state-by-time heatmap.
+
+    Draws the disclosed prior with states on the y-axis and time on the x-axis.
+    Cells with no disclosure (``P_obs`` is ``inf``) are masked and rendered in
+    ``undisclosed_color`` so the sparse disclosure windows stand out.
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset
+        Prior dataset as produced by :func:`construct_states_prior`, i.e. with
+        variables ``a_obs`` and ``P_obs`` over dims ``(time, state)`` and a
+        ``state`` coordinate giving the state labels.
+    quantity : {"mean", "var", "both"}, optional
+        Which field(s) to draw, by default ``"mean"``.  ``"mean"`` shows the
+        disclosed state means ``a_obs``; ``"var"`` shows the disclosed variances
+        ``P_obs``; ``"both"`` stacks the two panels vertically.
+    dates : np.ndarray or None, optional
+        Length-T array of x-axis tick values.  Falls back to the dataset's
+        ``time`` coordinate (or an integer range) when ``None``.
+    cmap : str, optional
+        Matplotlib colormap name for the disclosed values, by default
+        ``"viridis"``.
+    undisclosed_color : str, optional
+        Matplotlib color for masked (undisclosed) cells, by default ``"0.9"``.
+    title : str or None, optional
+        Figure suptitle.  Auto-generated from ``quantity`` when ``None``.
+
+    Returns
+    -------
+    fig : plt.Figure
+    axes : np.ndarray
+        Flattened array of the panel ``Axes`` (one per drawn quantity).
+
+    Raises
+    ------
+    ValueError
+        If ``quantity`` is not one of ``"mean"``, ``"var"``, or ``"both"``, or
+        if ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block.
+    """
+    valid = {"mean", "var", "both"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)}, got {quantity!r}")
+    if "a_obs" not in ssp_priors or "P_obs" not in ssp_priors:
+        raise ValueError("ssp_priors must contain `a_obs` and `P_obs` to plot the prior")
+
+    a_obs = np.asarray(ssp_priors["a_obs"].values, dtype=float)
+    p_obs = np.asarray(ssp_priors["P_obs"].values, dtype=float)
+    state_labels = [str(s) for s in np.asarray(ssp_priors["state"].values)]
+
+    if dates is None:
+        dates = np.asarray(ssp_priors["time"].values) if "time" in ssp_priors.coords else np.arange(a_obs.shape[0])
+    dates = np.asarray(dates)
+
+    # disclosed wherever the variance is finite; everything else is masked
+    disclosed = np.isfinite(p_obs)
+    fields = {"mean": (a_obs, "a_obs (mean)"), "var": (p_obs, "P_obs (variance)")}
+    panels = ["mean", "var"] if quantity == "both" else [quantity]
+
+    n_states = len(state_labels)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(14, 1.6 + 0.5 * n_states * len(panels)), squeeze=False)
+    axes = axes.flatten()
+
+    colormap = plt.get_cmap(cmap).copy()
+    colormap.set_bad(undisclosed_color)
+    for ax, key in zip(axes, panels):
+        values, label = fields[key]
+        # transpose to (state, time); mask undisclosed and any residual non-finite cells
+        grid = np.ma.masked_where(~disclosed.T | ~np.isfinite(values.T), values.T)
+        mesh = ax.pcolormesh(dates, np.arange(n_states), grid, cmap=colormap, shading="nearest")
+        fig.colorbar(mesh, ax=ax, label=label, pad=0.01)
+        ax.set_yticks(np.arange(n_states))
+        ax.set_yticklabels(state_labels, fontsize=8)
+        ax.set_ylabel("state")
+        ax.invert_yaxis()
+        ax.tick_params(axis="x", labelsize=7, rotation=30)
+    axes[-1].set_xlabel("time")
+
+    if title is None:
+        title = "time-point prior (mean & variance)" if quantity == "both" else "time-point prior"
     fig.suptitle(title, y=1.01)
     plt.tight_layout()
 

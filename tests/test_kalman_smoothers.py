@@ -35,7 +35,7 @@ def _run_filter_case() -> tuple[
     P0 = jnp.array([0.8, 0.3, 0.25])
     sigma_h = jnp.array(0.05)
     sigma_q = jnp.array([0.02, 0.01, 0.015])
-    positivity_idx = jnp.array([False, True, True])
+    positivity = jnp.array([False, True, True])
 
     Z = jnp.array(
         [
@@ -66,7 +66,7 @@ def _run_filter_case() -> tuple[
         logp=True,
         a_obs=a_obs,
         P_obs=P_obs,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
     return at, Pt, vt, Ft, Kt, Z, a0, P0, a_obs, P_obs, sigma_q
 
@@ -117,7 +117,7 @@ def test_ekf_rts_matches_dk_in_fully_linear_limit() -> None:
     P0 = jnp.array([0.8, 0.3, 0.25])
     sigma_h = jnp.array(0.05)
     sigma_q = jnp.array([0.02, 0.01, 0.015])
-    positivity_idx = jnp.zeros(3, dtype=bool)
+    positivity = jnp.zeros(3, dtype=bool)
 
     Z = jnp.array(
         [
@@ -147,7 +147,7 @@ def test_ekf_rts_matches_dk_in_fully_linear_limit() -> None:
         y=y,
         logp=True,
         exponent=0.5,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
         a_obs=a_obs,
         P_obs=P_obs,
     )
@@ -162,7 +162,7 @@ def test_ekf_rts_matches_dk_in_fully_linear_limit() -> None:
         P0=P0,
         sigma_q=sigma_q,
         exponent=0.5,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
         a_obs=a_obs,
         P_obs=P_obs,
     )
@@ -183,7 +183,7 @@ def test_ekf_rts_matches_linear_rts_in_fully_linear_limit() -> None:
     P0 = jnp.array([0.8, 0.3, 0.25])
     sigma_h = jnp.array(0.05)
     sigma_q = jnp.array([0.02, 0.01, 0.015])
-    positivity_idx = jnp.zeros(3, dtype=bool)
+    positivity = jnp.zeros(3, dtype=bool)
 
     Z = jnp.array(
         [
@@ -214,7 +214,7 @@ def test_ekf_rts_matches_linear_rts_in_fully_linear_limit() -> None:
         logp=True,
         a_obs=a_obs,
         P_obs=P_obs,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
     )
     _, at_ekf, Pt_ekf, _, _, _ = kalman_filter_1d_ekf(
         a0=a0,
@@ -225,7 +225,7 @@ def test_ekf_rts_matches_linear_rts_in_fully_linear_limit() -> None:
         y=y,
         logp=True,
         exponent=0.5,
-        positivity_idx=positivity_idx,
+        positivity=positivity,
         a_obs=a_obs,
         P_obs=P_obs,
     )

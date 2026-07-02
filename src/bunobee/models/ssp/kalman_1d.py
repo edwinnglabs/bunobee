@@ -27,7 +27,7 @@ def kalman_filter_1d(
     # (n_steps, n_states) — observed latent state variances; inf = no information (pure filter)
     P_obs: jnp.ndarray | None = None,
     # (n_states, )
-    positivity_idx: jnp.ndarray | None = None,
+    positivity: jnp.ndarray | None = None,
 ) -> tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Linear 1D Kalman filter with optional state fusion and positivity constraint.
 
@@ -61,7 +61,7 @@ def kalman_filter_1d(
            P_t ← P_t · (1 − K_t · Z_t) + σ_q²
 
     4. **Positivity correction** (optional) — for states flagged by
-       ``positivity_idx``, any updated value below zero is soft-clipped back
+       ``positivity``, any updated value below zero is soft-clipped back
        toward 1e-3 via a second precision-weighted fusion, then hard-floored
        at 1e-6 to maintain a numerically stable gap from zero.
 
@@ -89,7 +89,7 @@ def kalman_filter_1d(
         timesteps / states with no external information. When both
         ``a_obs`` and ``P_obs`` are None the filter runs without
         any state fusion.
-    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+    positivity : jnp.ndarray | None, optional, shape (n_states,)
         Boolean mask — True selects states that must remain non-negative.
         ``None`` (default) disables positivity correction for all states.
 
@@ -128,8 +128,8 @@ def kalman_filter_1d(
     _at_obs = a_obs if a_obs is not None else jnp.zeros((y.shape[0], n_states))
     _Pt_obs = P_obs if P_obs is not None else jnp.full((y.shape[0], n_states), jnp.inf)
 
-    _has_positivity = positivity_idx is not None
-    _positivity_idx = positivity_idx if positivity_idx is not None else jnp.zeros(n_states, dtype=bool)
+    _has_positivity = positivity is not None
+    _positivity = positivity if positivity is not None else jnp.zeros(n_states, dtype=bool)
 
     def _transition_fn(carry, xs):
         """transition function for Kalman filter"""
@@ -182,7 +182,7 @@ def kalman_filter_1d(
         Pt = Pt * (1 - Kt * Zt) + sigma_q_sq
 
         if _has_positivity:
-            enforce = _positivity_idx & (at < 0)
+            enforce = _positivity & (at < 0)
             # Soft adjustment jitter with 1e-3 to create numerically stable gap from zero.
             # Apply fusion only where enforce=True; otherwise leave (at, Pt) untouched —
             # the previous unconditional fusion silently halved Pt every step for non-enforced
@@ -194,7 +194,7 @@ def kalman_filter_1d(
             Pt = jnp.where(enforce, Pt_fused, Pt)
             at = jnp.where(enforce, at_fused, at)
             # avoid exact boundary issues
-            at = jnp.where(_positivity_idx, jnp.maximum(at, 1e-6), at)
+            at = jnp.where(_positivity, jnp.maximum(at, 1e-6), at)
 
         return ((at, Pt, log_p), (at, Pt, vt, Ft, Kt))
 

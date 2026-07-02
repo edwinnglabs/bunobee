@@ -17,7 +17,7 @@ def kalman_filter_1d_ekf_st(
     y: jnp.ndarray,
     logp: bool = False,
     exponent: float = 0.5,
-    positivity_idx: jnp.ndarray | None = None,
+    positivity: jnp.ndarray | None = None,
     a_obs: jnp.ndarray | None = None,
     P_obs: jnp.ndarray | None = None,
 ) -> tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -83,7 +83,7 @@ def kalman_filter_1d_ekf_st(
         Accumulate the approximate multivariate Gaussian log-likelihood. Default False.
     exponent : float, optional
         Exponent in the nonlinear mapping ``exp(exponent · a_t)``. Default 0.5.
-    positivity_idx : jnp.ndarray | None, optional, shape (n_states,)
+    positivity : jnp.ndarray | None, optional, shape (n_states,)
         Boolean mask — True selects states that use the nonlinear exp mapping.
         ``None`` (default) applies the nonlinear mapping to all states.
         Pass ``jnp.zeros(n_states, dtype=bool)`` to recover the linear ``kalman_filter_1d_st``.
@@ -125,7 +125,7 @@ def kalman_filter_1d_ekf_st(
     sigma_q_sq = jnp.broadcast_to(jnp.square(sigma_q), (n_states,))
 
     # None → all states use the nonlinear exp mapping
-    _positivity = positivity_idx if positivity_idx is not None else jnp.ones(n_states, dtype=bool)
+    _positivity = positivity if positivity is not None else jnp.ones(n_states, dtype=bool)
 
     # default: loc=0, var=inf → zero precision → fusion is a no-op at undisclosed steps
     _has_obs_fusion = a_obs is not None or P_obs is not None
