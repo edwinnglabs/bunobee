@@ -125,6 +125,102 @@ def disclosed_idx(ssp_priors: xr.Dataset) -> np.ndarray:
     return np.where(np.isfinite(p_obs).any(axis=1))[0]
 
 
+def extend_states_prior(
+    ssp_priors: xr.Dataset,
+    Q: float | np.ndarray,
+) -> xr.Dataset:
+    r"""Extend disclosed anchors along the driftless random-walk marginal.
+
+    :func:`construct_states_prior` discloses anchors at a handful of timesteps
+    and leaves every other step at ``P_obs = inf`` (undisclosed / uninformed).
+    For a single isolated channel touched by no other data those null steps are
+    not truly uninformed: the driftless random-walk transition already implies
+    an exact marginal that propagates each anchor both forward and backward —
+    the mean is carried constant and the variance grows linearly with the time
+    lag.  This function fills each formerly-``inf`` entry with that two-sided
+    marginal,
+
+    .. math::
+
+        a_{\mathrm{obs}}[t] = a^*, \qquad
+        P_{\mathrm{obs}}[t] = P^* + |t - t^*|\,Q,
+
+    where ``(a*, P*)`` is the disclosed anchor at the nearest disclosure time
+    ``t*`` in that state (minimum variogram distance ``|t - t*|``) and ``Q`` is
+    the per-state process variance ``σ_q²``.  States with no disclosed anchor
+    are left fully undisclosed (``P_obs`` stays ``inf``).
+
+    This is the exact marginal only for an isolated channel; treat the result as
+    a prior fed into the augmented-measurement step, not a final posterior.
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset
+        Disclosed prior as produced by :func:`construct_states_prior`, carrying
+        ``a_obs`` and ``P_obs`` over dims ``(time, state)``.  All other
+        variables (``positivity``, any ``a0`` / ``P0`` or ``sigma_q`` block, and
+        attrs) are passed through unchanged.
+    Q : float or np.ndarray
+        Per-state process variance ``σ_q²``.  A scalar is broadcast to every
+        state; an array must have length ``n_states``.  Must be finite-or-``inf``
+        and non-negative.  ``Q → inf`` recovers the un-extended prior (only the
+        original anchors stay informed), while ``Q → 0`` holds each anchor's
+        variance flat across its region.
+
+    Returns
+    -------
+    xr.Dataset
+        Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored
+        state's undisclosed steps filled by the nearest-anchor random-walk
+        marginal.  Passes :func:`validate_prior` with ``require_init=False``.
+
+    Raises
+    ------
+    ValueError
+        If ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block, or
+        ``Q`` is negative, ``NaN``, or has the wrong length.
+    """
+    if "a_obs" not in ssp_priors or "P_obs" not in ssp_priors:
+        raise ValueError("ssp_priors must contain `a_obs` and `P_obs` to extend the prior")
+
+    a_obs = np.array(ssp_priors["a_obs"].values, dtype=float)
+    p_obs = np.array(ssp_priors["P_obs"].values, dtype=float)
+    n_steps, n_states = p_obs.shape
+
+    q_vec = np.broadcast_to(np.asarray(Q, dtype=float), (n_states,)).astype(float, copy=True)
+    if np.any(np.isnan(q_vec)) or np.any(q_vec < 0):
+        raise ValueError("Q must be non-negative (finite or inf) for every state")
+
+    tgrid = np.arange(n_steps)
+    for s in range(n_states):
+        anchor_t = np.where(np.isfinite(p_obs[:, s]))[0]
+        if anchor_t.size == 0:
+            continue  # no anchor -> state stays fully undisclosed (inf)
+
+        anchor_a = a_obs[anchor_t, s]
+        anchor_p = p_obs[anchor_t, s]
+        dist = np.abs(tgrid[:, None] - anchor_t[None, :])  # (n_steps, n_anchors)
+
+        # Multiply only at nonzero lags so 0 * inf never arises: anchors stay
+        # exact (lag 0 -> variance P*) even when Q is inf.
+        lag_var = np.zeros_like(dist, dtype=float)
+        np.multiply(dist, q_vec[s], out=lag_var, where=dist != 0)
+        cand_p = anchor_p[None, :] + lag_var  # (n_steps, n_anchors)
+
+        # Nearest anchor by variogram distance; ties broken toward smaller variance.
+        min_dist = dist.min(axis=1, keepdims=True)
+        chosen = np.argmin(np.where(dist == min_dist, cand_p, np.inf), axis=1)
+
+        a_obs[:, s] = anchor_a[chosen]
+        p_obs[:, s] = cand_p[tgrid, chosen]
+
+    out = ssp_priors.copy()
+    out["a_obs"] = (("time", "state"), a_obs)
+    out["P_obs"] = (("time", "state"), p_obs)
+    validate_prior(out, require_init=False)
+    return out
+
+
 def a_to_lam(
     arr: np.ndarray,
     exponent: float,

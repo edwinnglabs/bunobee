@@ -29,6 +29,11 @@ All live in `bunobee.models.ssp` (re-exported from `bunobee.models.ssp.utils` / 
   steps. Undisclosed steps carry `inf` variance (zero precision → the pure filter passes through untouched).
 - **`disclosed_idx(ssp_priors)`** — derives the disclosure timesteps directly from `P_obs` (any step with at least one
   finite-variance state). Replaces the previously stored `obs_idx` variable, which was redundant with `P_obs`.
+- **`extend_states_prior(ssp_priors, Q)`** — fills the `inf` (undisclosed) steps of each anchored state with the
+  driftless random-walk marginal `a_obs[t] = a*`, `P_obs[t] = P* + |t−t*|·Q`, spread forward and backward from the
+  nearest anchor. Grows each anchor into a symmetric variance cone; states with no anchor stay `inf`, and `Q → inf`
+  recovers the anchors-only prior. Exact only for an isolated channel — feed the result into the augmented-measurement
+  step, not as a posterior.
 - **`plot_prior_heatmap(ssp_priors, quantity="both")`** — renders the prior as a **states × time** heatmap. Rows are
   latent states, columns are timesteps; coloured cells are disclosed anchors (finite variance) and grey cells are
   undisclosed (`inf` variance). `quantity` selects `"mean"` (`a_obs`), `"var"` (`P_obs`), or `"both"`.
@@ -41,6 +46,13 @@ All live in `bunobee.models.ssp` (re-exported from `bunobee.models.ssp.utils` / 
 Each notebook now includes a short *"Time-point prior at a glance"* block that prints `disclosed_idx(...)` and draws
 `plot_prior_heatmap(..., quantity="both")` right after the prior is assembled. In `v4`/`v5` the default config sets
 `use_time_point_prior=False`, so the heatmap is fully grey — flip that flag to populate the anchor windows.
+
+## Standalone demo — `ssp_extend_prior`
+
+`ssp_extend_prior.ipynb` is a self-contained demo of `extend_states_prior`. It (1) builds a disclosed prior with
+`construct_states_prior`, (2) extends the sparse anchors along the two-sided random walk, and (3) overlays the
+**anchors-only** vs. **random-walk-extended** prior in a single `plot_states` figure — the extension shows up as a
+continuous variance cone that pinches to each anchor and widens with lag, while the anchorless intercept stays `inf`.
 
 ## Running the notebooks
 
