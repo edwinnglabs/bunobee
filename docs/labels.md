@@ -9,7 +9,7 @@ the single source of truth for their names, meanings, and colors.
 | Label | Color | Use when |
 |-------|-------|----------|
 | `bug` | `#d73a4a` | Something is broken or behaves incorrectly. |
-| `epic` | `#006b75` | A large multi-issue initiative or overarching theme. |
+| `epic` | `#7057ff` | Umbrella / tracking issue that owns sub-issues (e.g. a split plan). Not worked 
 | `feature` | `#0e8a16` | A new capability the package does not have yet. |
 | `housekeeping` | `#bfd4f2` | Chore: deps, CI, packaging, config, cleanup — no behavior change for users. |
 | `idea` | `#fbca04` | An open proposal or exploration, not yet committed to. |
@@ -38,7 +38,7 @@ Run once to create the full set on the repo (idempotent — safe to re-run):
 
 ```sh
 gh label create bug          --color d73a4a --description "Broken or incorrect behavior"        --force
-gh label create epic         --color 006b75 --description "Large multi-issue initiative / overarching theme" --force
+gh label create epic         --color 7057ff --description "Umbrella issue that owns sub-issues"  --force
 gh label create feature      --color 0e8a16 --description "New capability"                       --force
 gh label create housekeeping --color bfd4f2 --description "Documentation, workflow, misc."  --force
 gh label create idea         --color fbca04 --description "Open proposal / exploration"          --force
