@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from bunobee.models.ssp.prior import disclosed_idx, extend_states_prior
 from bunobee.models.ssp.transforms import validate_prior
-from bunobee.models.ssp.utils import disclosed_idx, extend_states_prior
 
 
 def _prior(a_obs: np.ndarray, p_obs: np.ndarray, positivity: np.ndarray | None = None) -> xr.Dataset:

@@ -22,11 +22,18 @@ states every four weeks.
 
 ## Prior construction & visualisation tools
 
-All live in `bunobee.models.ssp` (re-exported from `bunobee.models.ssp.utils` / `.transforms`):
+All live in `bunobee.models.ssp` (re-exported from `.prior` / `.posterior` / `.plotting` / `.transforms` /
+`.simulation`):
 
-- **`construct_states_prior(...)`** — assembles an `xarray.Dataset` prior with `a_obs` / `P_obs` over `(time, state)`
-  and a `positivity` mask, disclosing the ground truth over `n_periods` random windows of `n_points` consecutive
-  steps. Undisclosed steps carry `inf` variance (zero precision → the pure filter passes through untouched).
+- **`construct_states_prior(...)`** (in `.simulation`, simulation-only — requires a ground-truth `true_states` that
+  isn't available outside a synthetic/prototype setting) — assembles an `xarray.Dataset` prior with `a_obs` / `P_obs`
+  over `(time, state)` and a `positivity` mask, disclosing the ground truth over `n_periods` random windows of
+  `n_points` consecutive steps. Undisclosed steps carry `inf` variance (zero precision → the pure filter passes
+  through untouched).
+- **`SspPrior`** (in `.prior`) — frozen wrapper around a *complete*, filter-ready prior `xr.Dataset`. Validates
+  `a0` / `P0` / `a_obs` / `P_obs` / `positivity` plus `time` / `state` coordinates at construction time, regardless
+  of how the dataset was built; exposes each as a property alongside `.dataset` for interop with `xr.merge`,
+  `az.InferenceData`, and the Kalman filter functions.
 - **`disclosed_idx(ssp_priors)`** — derives the disclosure timesteps directly from `P_obs` (any step with at least one
   finite-variance state). Replaces the previously stored `obs_idx` variable, which was redundant with `P_obs`.
 - **`extend_states_prior(ssp_priors, Q)`** — fills the `inf` (undisclosed) steps of each anchored state with the

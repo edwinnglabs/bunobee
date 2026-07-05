@@ -8,8 +8,8 @@ import xarray as xr
 
 jax.config.update("jax_enable_x64", True)
 
+from bunobee.models.ssp.prior import disclosed_idx
 from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st
-from bunobee.models.ssp.utils import disclosed_idx
 
 K = 0.5
 

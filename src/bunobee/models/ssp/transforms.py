@@ -83,7 +83,7 @@ def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True) -> None
     require_init : bool, optional
         Whether ``a0`` / ``P0`` must be present, by default ``True``. Pass
         ``False`` to validate a disclosure-only prior (as produced by
-        :func:`~bunobee.models.ssp.utils.construct_states_prior`, which carries
+        :func:`~bunobee.simulation.ssp.construct_states_prior`, which carries
         the observation block but not the initial-state moments).
 
     Raises

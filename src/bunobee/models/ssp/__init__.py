@@ -1,19 +1,13 @@
 from __future__ import annotations
 
+from bunobee.models.ssp.plotting import plot_prior_heatmap, plot_states
+from bunobee.models.ssp.posterior import a_to_lam, lam_to_a
+from bunobee.models.ssp.prior import SspPrior, disclosed_idx, extend_states_prior
 from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st, validate_prior
-from bunobee.models.ssp.utils import (
-    a_to_lam,
-    construct_states_prior,
-    disclosed_idx,
-    extend_states_prior,
-    lam_to_a,
-    plot_prior_heatmap,
-    plot_states,
-)
 
 __all__ = [
+    "SspPrior",
     "a_to_lam",
-    "construct_states_prior",
     "disclosed_idx",
     "extend_states_prior",
     "lam_to_a",
