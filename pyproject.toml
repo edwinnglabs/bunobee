@@ -12,13 +12,15 @@ dependencies = [
     "pandas>=2.0",
     "arviz",
     "xarray",
-    "ipywidgets",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8",
     "black==26.1.0",
+]
+notebook = [
+    "ipywidgets",
 ]
 
 [build-system]
