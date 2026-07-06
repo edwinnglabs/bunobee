@@ -16,16 +16,15 @@ Status: DRAFT — checklist for moving `bunobee` from Test PyPI to real PyPI.
   `repository-url` (defaults to real PyPI).
 - Register the publisher on pypi.org under the `pypi` environment before first run.
 
-## 2. Version strategy (decided: manual, 0.0.x lane)
+## 2. Version strategy (decided: manual, 0.0.x for now)
 
 - **Model:** manual `version` in `pyproject.toml`; `setuptools-scm` removed from build requires.
   `src/bunobee/__init__.py` reads installed metadata via `importlib.metadata`.
-- **Lane:** releases stay in the `0.0.x` patch line for now. Graduating to `0.x` / `1.0` is a
-  deliberate, separate lift (stability/API commitment) — deferred, not automated.
-- **Bumping:** `python scripts/bump_version.py` (or `make bump`) advances the patch and refuses to
-  leave the `0.0.x` lane; `--dev` / `make bump-dev` cuts a `.devN` pre-release for Test PyPI iteration.
-- **Guard:** `publish-test-pypi.yaml` fails the publish if a bumped version is not `0.0.x`, so a stray
-  `0.1.0` can't auto-publish.
+- **Convention:** keep releases in the `0.0.x` patch line for now, bumping the version by hand.
+  Graduating to `0.x` / `1.0` is a deliberate, separate lift (stability/API commitment) — deferred.
+- **Publishing:** any push to `main` that changes `version` auto-publishes to Test PyPI via
+  `publish-test-pypi.yaml`. Use a `.devN` suffix (installs need `pip --pre`) to iterate without
+  spending a clean patch number.
 - Tag-driven `setuptools-scm` remains an option to revisit if manual bumping gets noisy.
 
 ## 3. Packaging metadata (thin in pyproject.toml)

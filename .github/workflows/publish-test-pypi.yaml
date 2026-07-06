@@ -15,29 +15,18 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Check version changed and enforce the 0.0.x lane
+      - name: Check if version changed
         id: check
         run: |
           OLD=$(git show HEAD~1:pyproject.toml 2>/dev/null | grep '^version = ' | head -1 | cut -d'"' -f2)
           NEW=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
           echo "Old: $OLD  →  New: $NEW"
-          if [ "$OLD" = "$NEW" ]; then
-            echo "Version unchanged; nothing to publish."
+          if [ "$OLD" != "$NEW" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "version=$NEW" >> $GITHUB_OUTPUT
+          else
             echo "changed=false" >> $GITHUB_OUTPUT
-            exit 0
           fi
-          # A version bump is happening — releases are pinned to the 0.0.x lane.
-          # Graduating to 0.x/1.0 is a deliberate lift, not an auto-publish.
-          case "$NEW" in
-            0.0.*) ;;
-            *)
-              echo "::error::Refusing to publish $NEW: releases are pinned to the 0.0.x lane."
-              echo "::error::A 0.x/1.0 bump is a deliberate lift — do it intentionally, not via auto-publish."
-              exit 1
-              ;;
-          esac
-          echo "changed=true" >> $GITHUB_OUTPUT
-          echo "version=$NEW" >> $GITHUB_OUTPUT
 
   publish:
     needs: check-version
