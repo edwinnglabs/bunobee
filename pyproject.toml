@@ -1,6 +1,6 @@
 [project]
 name = "bunobee"
-version = "0.0.3dev5"
+version = "0.0.4"
 description = "The time-series engine for forecasting with JAX and NumPyro"
 authors = [{name = "Edwin Ng", email = "edwinnglabs@gmail.com"}]
 readme = "README.md"
@@ -40,7 +40,7 @@ Issues = "https://github.com/edwinnglabs/bunobee/issues"
 Documentation = "https://github.com/edwinnglabs/bunobee#readme"
 
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

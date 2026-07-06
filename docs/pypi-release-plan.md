@@ -16,15 +16,16 @@ Status: DRAFT — checklist for moving `bunobee` from Test PyPI to real PyPI.
   `repository-url` (defaults to real PyPI).
 - Register the publisher on pypi.org under the `pypi` environment before first run.
 
-## 2. Version strategy (currently inconsistent)
+## 2. Version strategy (decided: manual, 0.0.x for now)
 
-- `pyproject.toml` hardcodes `version = "0.0.3dev4"` but build-requires lists `setuptools-scm`
-  (unused, no `[tool.setuptools_scm]` section).
-- Pick ONE:
-  - **Tag-driven (recommended):** add `dynamic = ["version"]` + `[tool.setuptools_scm]`, drop hardcoded
-    `version`, release by tagging `v0.1.0`. `src/bunobee/__init__.py` already reads installed metadata.
-  - **Manual:** remove `setuptools-scm` from build requires.
-- `0.0.3dev4` is a dev pre-release (pip needs `--pre`). Cut a clean `0.1.0` for first formal release.
+- **Model:** manual `version` in `pyproject.toml`; `setuptools-scm` removed from build requires.
+  `src/bunobee/__init__.py` reads installed metadata via `importlib.metadata`.
+- **Convention:** keep releases in the `0.0.x` patch line for now, bumping the version by hand.
+  Graduating to `0.x` / `1.0` is a deliberate, separate lift (stability/API commitment) — deferred.
+- **Publishing:** any push to `main` that changes `version` auto-publishes to Test PyPI via
+  `publish-test-pypi.yaml`. Use a `.devN` suffix (installs need `pip --pre`) to iterate without
+  spending a clean patch number.
+- Tag-driven `setuptools-scm` remains an option to revisit if manual bumping gets noisy.
 
 ## 3. Packaging metadata (thin in pyproject.toml)
 
