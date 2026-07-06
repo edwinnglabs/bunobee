@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./bunobee.png" alt="Bunobee Logo" width="320" />
+  <img src="https://raw.githubusercontent.com/edwinnglabs/bunobee/main/bunobee.png" alt="Bunobee Logo" width="320" />
 </div>
 
 # Bunobee
