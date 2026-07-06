@@ -33,4 +33,4 @@ consolidates the state-space (SSP) engine work that landed across them.
 - Unused `setuptools-scm` from build requirements.
 
 [Unreleased]: https://github.com/edwinnglabs/bunobee/compare/v0.0.4...HEAD
-[0.0.4]: https://github.com/edwinnglabs/bunobee/releases/tag/v0.0.4
+[v0.0.4]: https://github.com/edwinnglabs/bunobee/releases/tag/v0.0.4
