@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PEP 561 `py.typed` marker so downstream type checkers honor the package's type hints.
+
 ## [v0.0.4]
 
 First public release on PyPI. `bunobee` is a time-series forecasting engine built on JAX
