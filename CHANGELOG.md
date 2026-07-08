@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - PEP 561 `py.typed` marker so downstream type checkers honor the package's type hints.
+- `extend_states_prior_smoothed` — exact KF-forward + RTS-backward anchor extension that
+  fuses every anchor per state, for multi-anchor channels the nearest-anchor heuristic only
+  approximates.
+
+### Changed
+
+- Renamed `extend_states_prior` to `extend_states_prior_nearest` so the nearest-anchor
+  heuristic and the new `extend_states_prior_smoothed` are self-describing.
 
 ## [v0.0.4]
 
