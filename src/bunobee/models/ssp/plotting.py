@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from bunobee.models.ssp.prior import SspPrior
+from bunobee.models.ssp.prior import SspPrior, disclosed_idx
 
 
 def plot_states(
@@ -244,6 +244,201 @@ def plot_prior_heatmap(
     if title is None:
         title = "time-point prior (mean & variance)" if quantity == "both" else "time-point prior"
     fig.suptitle(title, y=1.01)
+    plt.tight_layout()
+
+    return fig, axes
+
+
+def _gaussian_pdf(y: np.ndarray, mean: np.ndarray, var: np.ndarray) -> np.ndarray:
+    """Evaluate the 1-D Gaussian density ``N(y; mean, var)`` elementwise.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        State value(s) at which to evaluate the density; broadcast against
+        ``mean`` / ``var``.
+    mean : np.ndarray
+        Marginal mean(s).
+    var : np.ndarray
+        Marginal variance(s); must be finite and positive to yield a proper
+        density (``inf`` variance yields ``0``, ``0`` variance yields ``inf``).
+
+    Returns
+    -------
+    np.ndarray
+        Density values, broadcast shape of the inputs.
+    """
+    return np.exp(-0.5 * (y - mean) ** 2 / var) / np.sqrt(2 * np.pi * var)
+
+
+def _read_states_prior(prior: xr.Dataset | SspPrior) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Extract ``a_obs`` / ``P_obs`` and state labels from a states prior.
+
+    Parameters
+    ----------
+    prior : xr.Dataset or SspPrior
+        Prior carrying ``a_obs`` / ``P_obs`` over dims ``(time, state)``.
+
+    Returns
+    -------
+    a_obs : np.ndarray, shape (n_steps, n_states)
+    p_obs : np.ndarray, shape (n_steps, n_states)
+    state_labels : list[str]
+
+    Raises
+    ------
+    ValueError
+        If ``prior`` lacks the ``a_obs`` / ``P_obs`` disclosure block.
+    """
+    if isinstance(prior, SspPrior):
+        prior = prior.dataset
+    if "a_obs" not in prior or "P_obs" not in prior:
+        raise ValueError("prior must contain `a_obs` and `P_obs` to plot the prior density")
+    a_obs = np.asarray(prior["a_obs"].values, dtype=float)
+    p_obs = np.asarray(prior["P_obs"].values, dtype=float)
+    if "state" in prior.coords:
+        state_labels = [str(s) for s in np.asarray(prior["state"].values)]
+    else:
+        state_labels = [f"s{i}" for i in range(a_obs.shape[1])]
+    return a_obs, p_obs, state_labels
+
+
+def plot_prior_density(
+    prior: xr.Dataset | SspPrior,
+    *,
+    anchors: xr.Dataset | SspPrior | None = None,
+    n_grid: int = 400,
+    pad: float = 3.5,
+    cmap: str = "magma",
+    mean_color: str = "white",
+    anchor_color: str = "cyan",
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    r"""Draw the per-step Gaussian marginal of a states prior as density panels.
+
+    Companion to :func:`plot_prior_heatmap`.  For each state, the prior's
+    per-step marginal ``N(a_obs[t], P_obs[t])`` is evaluated on a shared value
+    grid and rendered as a single ``time x value`` heatmap panel (one subplot
+    per state, brighter = higher density), with the smoothed mean threaded
+    across the top.  This promotes the ad-hoc ``density_field`` view from the
+    ``ssp_extend_prior_multi_anchor`` prototype notebook into the package.
+
+    Undisclosed steps (``P_obs`` is ``inf``) are masked, so a raw, un-extended
+    prior -- which carries ``inf`` variance at most steps -- still renders
+    gracefully: only the finite-variance steps contribute to the value grid and
+    the density block, and undisclosed columns are left blank.
+
+    Parameters
+    ----------
+    prior : xr.Dataset or SspPrior
+        States prior carrying ``a_obs`` and ``P_obs`` over dims
+        ``(time, state)``.  Typically the extended / smoothed prior (every step
+        finite) whose full marginal is the quantity being visualised, but a raw
+        disclosed prior renders too.
+    anchors : xr.Dataset or SspPrior or None, optional
+        Separate prior whose disclosures supply the raw anchor markers.  Needed
+        when ``prior`` is the already-extended prior (every step finite), so its
+        own disclosures no longer isolate the raw anchors.  When ``None`` the
+        anchors are read from ``prior`` itself via
+        :func:`~bunobee.models.ssp.prior.disclosed_idx`.
+    n_grid : int, optional
+        Number of points on the shared value grid, by default 400.
+    pad : float, optional
+        Grid half-width in standard deviations beyond the mean envelope, by
+        default 3.5 (captures ~99.95% of every bell's mass).
+    cmap : str, optional
+        Matplotlib colormap for the density field, by default ``"magma"``.
+    mean_color : str, optional
+        Colour of the overlaid mean line, by default ``"white"``.
+    anchor_color : str, optional
+        Colour of the raw-anchor markers, by default ``"cyan"``.
+    title : str or None, optional
+        Figure suptitle.  Auto-generated when ``None``.
+
+    Returns
+    -------
+    fig : plt.Figure
+    axes : np.ndarray
+        Flattened array of the panel ``Axes`` (one per state).
+
+    Raises
+    ------
+    ValueError
+        If ``prior`` lacks the ``a_obs`` / ``P_obs`` disclosure block.
+    """
+    a_obs, p_obs, state_labels = _read_states_prior(prior)
+    n_steps, n_states = a_obs.shape
+    x = np.arange(n_steps)
+
+    # Anchor source: an explicit `anchors` prior, else the prior's own disclosures.
+    anchor_a, anchor_p, _ = _read_states_prior(anchors) if anchors is not None else (a_obs, p_obs, state_labels)
+    anchor_t = disclosed_idx(anchors if anchors is not None else prior)
+
+    fig, axes = plt.subplots(1, n_states, figsize=(7.0 * n_states, 4.0), squeeze=False)
+    axes = axes.flatten()
+
+    colormap = plt.get_cmap(cmap).copy()
+    colormap.set_bad(alpha=0.0)
+
+    for i, (ax, label) in enumerate(zip(axes, state_labels)):
+        a_i = a_obs[:, i]
+        p_i = p_obs[:, i]
+        finite = np.isfinite(p_i) & np.isfinite(a_i) & (p_i > 0)
+
+        # Build the shared value grid from disclosed steps only (both this prior
+        # and, if given, the anchor source) so `inf`-variance steps never blow up.
+        grid_a = [a_i[finite]]
+        grid_sd = [np.sqrt(p_i[finite])]
+        if anchors is not None:
+            a_src, p_src = anchor_a[:, i], anchor_p[:, i]
+            src_finite = np.isfinite(p_src) & np.isfinite(a_src) & (p_src > 0)
+            grid_a.append(a_src[src_finite])
+            grid_sd.append(np.sqrt(p_src[src_finite]))
+        centres = np.concatenate(grid_a)
+        spreads = np.concatenate(grid_sd)
+        if centres.size == 0:
+            # Nothing disclosed for this state: draw an empty panel gracefully.
+            y = np.linspace(-1.0, 1.0, n_grid)
+        else:
+            y = np.linspace((centres - pad * spreads).min(), (centres + pad * spreads).max(), n_grid)
+
+        # Density block (n_grid, n_steps); mask undisclosed columns so they stay blank.
+        safe_var = np.where(finite, p_i, 1.0)  # avoid 1/inf and 1/0 in the evaluation
+        dens = _gaussian_pdf(y[:, None], a_i[None, :], safe_var[None, :])
+        dens = np.ma.masked_where(np.broadcast_to(~finite[None, :], dens.shape), dens)
+
+        im = ax.imshow(
+            dens,
+            origin="lower",
+            aspect="auto",
+            extent=[0, max(n_steps - 1, 1), y[0], y[-1]],
+            cmap=colormap,
+        )
+        # Mean line, broken across undisclosed steps.
+        ax.plot(x, np.where(finite, a_i, np.nan), color=mean_color, lw=1.0, label="mean")
+
+        m = np.isin(x, anchor_t) & np.isfinite(anchor_p[:, i]) & np.isfinite(anchor_a[:, i])
+        if m.any():
+            ax.scatter(
+                x[m],
+                anchor_a[m, i],
+                s=30,
+                marker="x",
+                color=anchor_color,
+                zorder=3,
+                label="raw anchor",
+            )
+
+        ax.set_title(f"{label}: prior density", fontsize=9)
+        ax.set_xlabel("time step")
+        ax.legend(fontsize=7, loc="upper right")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="density")
+
+    axes[0].set_ylabel("state value")
+
+    if title is None:
+        title = "per-state prior density"
+    fig.suptitle(title, y=1.02)
     plt.tight_layout()
 
     return fig, axes
