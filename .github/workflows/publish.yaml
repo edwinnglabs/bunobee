@@ -1,0 +1,92 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve version and classify (PEP 440)
+        id: v
+        run: |
+          pip install packaging
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          IS_PRE=$(VERSION="$VERSION" python -c "import os; from packaging.version import Version; print(str(Version(os.environ['VERSION']).is_prerelease).lower())")
+          {
+            echo "version=$VERSION"
+            echo "is_prerelease=$IS_PRE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION  is_prerelease=$IS_PRE"
+
+  build:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # Every push to main publishes to Test PyPI. skip-existing makes a re-push of the
+  # same version a no-op instead of a 400 File-already-exists error.
+  testpypi:
+    needs: [resolve-version, build]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  # Final (non-prerelease) versions also publish to PyPI, but only after Test PyPI
+  # succeeds and the required reviewer approves the `pypi` environment deployment.
+  pypi:
+    needs: [resolve-version, testpypi]
+    if: needs.resolve-version.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
