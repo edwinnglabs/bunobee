@@ -1,3 +1,11 @@
+"""M5 SSP models fitted by MAP (Adam) instead of NUTS.
+
+The ``predict_*_opt`` helpers here are deprecated in favor of
+:func:`bunobee.models.ssp.forecast.forecast_ssp`; they are retained because their
+closed-form lognormal-mean correction has no posterior-replay equivalent. See each
+function's deprecation note for the migration path.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -9,9 +17,13 @@ import jax.numpy as jnp
 from numpyro import distributions as dist
 from tqdm.auto import tqdm
 
-from ..ssp.univariate import kalman_filter_1d, kalman_filter_1d_batch
+from ..ssp.kalman_1d import kalman_filter_1d
+from ..ssp.vfactory import make_kalman_batch
 
 logger = logging.getLogger(__name__)
+
+#: Batched Kalman filter over independent series, built from the single-series filter.
+kalman_filter_1d_batch = make_kalman_batch(kalman_filter_1d)
 
 
 def _softplus(x: jnp.ndarray) -> jnp.ndarray:
@@ -182,6 +194,17 @@ def predict_one_series_opt(
 
     Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
     transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
+
+    .. deprecated::
+        Prefer :func:`bunobee.models.ssp.forecast.forecast_ssp` for new code. This
+        function is kept for the m5 MAP pipeline only: it has no posterior draws to
+        replay, and its closed-form variance ``Z_future**2 @ P_last + sigma_h**2``
+        comes from the terminal filtered covariance rather than from the forward
+        process-noise accumulation ``forecast_ssp`` samples, so the two are not
+        interchangeable. To migrate, fit with ``fit_one_series`` (NUTS) and call
+        ``forecast_ssp``, then take the mean of ``forecast_samples`` for the same
+        E[Y] target. See :func:`bunobee.models.m5.m5_ssp_mcmc.predict_one_series`
+        for the wrapper pattern.
 
     Parameters
     ----------
@@ -388,6 +411,15 @@ def predict_batch_series_opt(
 
     Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
     transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
+
+    .. deprecated::
+        Prefer :func:`bunobee.models.ssp.forecast.forecast_ssp` for new code. Same
+        caveat as :func:`predict_one_series_opt`: these are MAP point estimates with
+        an analytic Jensen correction built on the terminal filtered covariance
+        ``Pt[:, -1, :]``, not posterior draws, so ``forecast_ssp`` cannot reproduce
+        them numerically. It is the sampling replacement — build the ``(horizon,
+        n_series, n_states)`` design with ``build_forecast_design`` and take the mean
+        over ``sample`` for the same E[Y] target.
 
     Parameters
     ----------
