@@ -4,7 +4,7 @@ A staged series of prototypes for the state-space engine in `bunobee.models.ssp`
 previous one, moving from a single-series linear Kalman filter to a multi-series extended Kalman filter (EKF), and
 demonstrates how to assemble, disclose, and visualise **time-point priors** on the latent states.
 
-## The `ssp_v1` … `ssp_v5` progression
+## The `ssp_v1` … `ssp_v6` progression
 
 - **`ssp_v1` — First Prototype** (`kalman_1d`): bare single-series linear Kalman filter, the starting point.
 - **`ssp_v2` — Kalman Filter with Time-Point Priors and Positive Coefficients** (`kalman_1d`): time-point priors via
@@ -15,6 +15,11 @@ demonstrates how to assemble, disclose, and visualise **time-point priors** on t
   filter; time-point priors derived from a beta-prior table.
 - **`ssp_v5` — Extended Kalman Filter, Fit with Multiple Time-Series** (`kalman_1d_ekf_st`): multi-series EKF via
   `transform_to_ekf_st`; positivity on the natural scale.
+- **`ssp_v6_forecast` — Extended Kalman Filter, Multi-Series Forecast** (`forecast_ssp`): the `v5` fit with the last
+  28 days held out, its design continued by `build_forecast_design`, and the predictive path drawn by `forecast_ssp`
+  — fan chart with 50% / 90% bands, `plot_states` on the in-sample path, and the fan faceted over all series. This is
+  the only notebook here **committed with its rendered outputs** (`"keep_output": true` in the notebook metadata, which
+  `nbstripout` honours), because the plots are the point.
 
 `v2`/`v3` are single-series and disclose the ground-truth latent state over a few random windows. `v4`/`v5` are
 multi-series and build their priors from a time-point beta table (`use_time_point_prior=True`), anchoring the media
@@ -76,5 +81,5 @@ pip install -e .          # install bunobee into your environment
 jupyter lab               # then open playground/statespace_prototype/ssp_v*.ipynb
 ```
 
-`v2`/`v3` are self-contained (they synthesise their own data). `v4`/`v5` expect a multi-series dataset and a
-time-point beta table loaded in their data cells.
+`v2`/`v3` are self-contained (they synthesise their own data). `v4`/`v5`/`v6` expect a multi-series dataset (and, for
+`v4`/`v5`, a time-point beta table) loaded in their data cells.
