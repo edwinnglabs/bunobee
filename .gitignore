@@ -160,6 +160,8 @@ cython_debug/
 #.idea/
 *.DS_Store
 *.csv
+# committed test fixtures are the exception — CI needs them checked in
+!tests/fixtures/*.csv
 *.pkl
 
 push_package.sh
