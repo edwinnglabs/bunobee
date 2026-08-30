@@ -1,3 +1,6 @@
+from bunobee.models.ssp.forecast import build_forecast_design
+
+
 def fit_one_series(
     sales: np.ndarray,
     num_warmup: int = 100,
@@ -123,8 +126,12 @@ def predict_one_series(
     n_steps = at_samples.shape[1]
 
     if Z_future is None:
-        weekly_dummies_full = make_peridoic_dummies(n_steps + horizon, period=7, drop_first=True)
-        Z_future = np.concatenate([np.ones((horizon, 1)), weekly_dummies_full[n_steps:]], axis=1)
+        Z_train = np.asarray(fit_result["Z"], dtype=float)[:n_steps]
+        Z_future = build_forecast_design(
+            Z_train,
+            horizon,
+            periodic={"columns": slice(1, None), "period": 7, "drop_first": True},
+        )[:, 0, :]
 
     a_last = at_samples[:, -1, :]  # (n_samples, n_states)
     mu_future = a_last @ Z_future.T  # (n_samples, horizon)

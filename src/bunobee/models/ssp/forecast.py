@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 import xarray as xr
 
 from bunobee.models.ssp.posterior import a_to_lam
+from bunobee.regression import make_peridoic_dummies
 from bunobee.utils import flatten_front_dim
 
 logger = logging.getLogger("bunobee")
@@ -150,3 +151,187 @@ def forecast_ssp(
     }
 
     return xr.Dataset(data_vars=data_vars, coords=coords)
+
+
+def _normalize_columns(columns, n_states: int) -> np.ndarray:
+    """Resolve a slice / index sequence into a 1-D array of column positions."""
+    if isinstance(columns, slice):
+        return np.arange(n_states)[columns]
+    idx = np.atleast_1d(np.asarray(columns))
+    if idx.dtype == bool:
+        if idx.shape != (n_states,):
+            raise ValueError(f"boolean column mask must have shape ({n_states},); got {idx.shape}")
+        return np.flatnonzero(idx)
+    return idx.astype(int)
+
+
+def _periodic_specs(periodic) -> list[Mapping]:
+    """Normalize the ``periodic`` argument into a list of block specs."""
+    if periodic is None:
+        return []
+    if isinstance(periodic, Mapping):
+        return [periodic]
+    if isinstance(periodic, Sequence):
+        return list(periodic)
+    raise TypeError(f"periodic must be a mapping or a sequence of mappings; got {type(periodic).__name__}")
+
+
+def _covariate_items(covariates_future, n_states: int) -> dict[int, np.ndarray]:
+    """Normalize ``covariates_future`` into a ``{column: future values}`` mapping."""
+    if covariates_future is None:
+        return {}
+    if isinstance(covariates_future, Mapping):
+        return {int(col): np.asarray(values, dtype=float) for col, values in covariates_future.items()}
+
+    arr = np.asarray(covariates_future, dtype=float)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim not in (2, 3):
+        raise ValueError(
+            "covariates_future array must be (horizon, k) or (horizon, n_series, k); " f"got shape {arr.shape}"
+        )
+    n_cov = arr.shape[-1]
+    if n_cov > n_states:
+        raise ValueError(f"covariates_future supplies {n_cov} columns but Z_train has only {n_states}")
+    cols = range(n_states - n_cov, n_states)
+    return {col: arr[..., i] for i, col in enumerate(cols)}
+
+
+def build_forecast_design(
+    Z_train: np.ndarray,
+    horizon: int,
+    *,
+    periodic: Mapping | Sequence[Mapping] | None = None,
+    covariates_future: Mapping[int, np.ndarray] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Continue a training design matrix ``horizon`` steps past the end of the sample.
+
+    Builds the ``Z_future`` argument that :func:`forecast_ssp` consumes. Every state
+    column of ``Z_train`` is resolved by exactly one of three rules:
+
+    1. **Periodic** — columns named by a ``periodic`` block are regenerated with
+       ``make_peridoic_dummies(n_steps + horizon, period)[n_steps:]``, so the cycle
+       phase continues unbroken from the training window.
+    2. **Covariate** — columns supplied through ``covariates_future`` take the given
+       future values.
+    3. **Constant** — any remaining column must be constant over training time (an
+       intercept, a per-series indicator, a static control); its value is carried
+       forward. A remaining column that varies over time raises ``ValueError``,
+       since its future path cannot be known.
+
+    ``forecast_ssp`` also accepts a hand-built ``Z_future``; this helper is a
+    convenience for the common intercept + seasonal-dummy + covariate layout.
+
+    Parameters
+    ----------
+    Z_train : np.ndarray, shape (n_steps, n_series, n_states) or (n_steps, n_states)
+        In-sample design matrix. A 2-D array is treated as a single series and the
+        returned array still carries an explicit series axis of length 1.
+    horizon : int
+        Number of future steps to build. Must be positive.
+    periodic : mapping or sequence of mappings or None, optional
+        One spec per periodic dummy block. Keys:
+
+        ``"columns"``
+            Slice, integer sequence, or boolean mask selecting the block's columns.
+        ``"period"``
+            Cycle length (e.g. 7 for weekly dummies).
+        ``"drop_first"``
+            Whether the block dropped its first dummy column. Default ``True``.
+
+        The block width must equal ``period - int(drop_first)`` and the training rows
+        of the block must match the dummies implied by the spec, otherwise
+        ``ValueError`` is raised.
+    covariates_future : mapping or np.ndarray or None, optional
+        Future values for time-varying non-periodic columns. As a mapping, keys are
+        column positions and values broadcast to ``(horizon, n_series)``. As a plain
+        array of shape ``(horizon, k)`` or ``(horizon, n_series, k)``, the ``k``
+        columns fill the last ``k`` columns of the design matrix. Any leading axis of
+        the wrong length raises ``ValueError``.
+
+    Returns
+    -------
+    np.ndarray, shape (horizon, n_series, n_states)
+        Future design matrix, shape-compatible with ``forecast_ssp``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from bunobee.regression import make_peridoic_dummies
+    >>> n_steps = 28
+    >>> Z_train = np.concatenate([np.ones((n_steps, 1)), make_peridoic_dummies(n_steps, 7)], axis=1)
+    >>> Z_future = build_forecast_design(Z_train, 14, periodic={"columns": slice(1, None), "period": 7})
+    >>> Z_future.shape
+    (14, 1, 7)
+    """
+    horizon = int(horizon)
+    if horizon <= 0:
+        raise ValueError(f"horizon must be a positive integer; got {horizon}")
+
+    Z_train = np.asarray(Z_train, dtype=float)
+    if Z_train.ndim == 2:
+        Z_train = Z_train[:, None, :]
+    elif Z_train.ndim != 3:
+        raise ValueError(
+            f"Z_train must be 2-D (n_steps, n_states) or 3-D (n_steps, n_series, n_states); got {Z_train.shape}"
+        )
+    n_steps, n_series, n_states = Z_train.shape
+    if n_steps == 0:
+        raise ValueError("Z_train must have at least one training step")
+
+    Z_future = np.zeros((horizon, n_series, n_states), dtype=float)
+    resolved = np.zeros(n_states, dtype=bool)
+
+    for spec in _periodic_specs(periodic):
+        period = int(spec["period"])
+        drop_first = bool(spec.get("drop_first", True))
+        cols = _normalize_columns(spec["columns"], n_states)
+        width = period - int(drop_first)
+        if cols.size != width:
+            raise ValueError(
+                f"periodic block with period {period} and drop_first={drop_first} needs {width} columns; "
+                f"got {cols.size}"
+            )
+        dummies = np.asarray(
+            make_peridoic_dummies(n_steps + horizon, period=period, drop_first=drop_first), dtype=float
+        )
+        if not np.allclose(Z_train[:, :, cols], dummies[:n_steps][:, None, :]):
+            raise ValueError(
+                f"columns {cols.tolist()} of Z_train do not match periodic dummies with period {period} and "
+                f"drop_first={drop_first}; check the column selection and the cycle phase"
+            )
+        Z_future[:, :, cols] = dummies[n_steps:][:, None, :]
+        resolved[cols] = True
+
+    for col, values in _covariate_items(covariates_future, n_states).items():
+        values = np.asarray(values, dtype=float)
+        if values.ndim == 0 or values.shape[0] != horizon:
+            raise ValueError(
+                f"covariates_future for column {col} must have leading dimension {horizon}; got {values.shape}"
+            )
+        try:
+            Z_future[:, :, col] = np.broadcast_to(values.reshape(horizon, -1), (horizon, n_series))
+        except ValueError as exc:
+            raise ValueError(
+                f"covariates_future for column {col} must broadcast to ({horizon}, {n_series}); got {values.shape}"
+            ) from exc
+        resolved[col] = True
+
+    for col in np.flatnonzero(~resolved):
+        block = Z_train[:, :, col]
+        if not np.allclose(block, block[0]):
+            raise ValueError(
+                f"column {col} of Z_train varies over time but is neither periodic nor supplied through "
+                "covariates_future; its future path is unknown"
+            )
+        Z_future[:, :, col] = block[0]
+
+    logger.debug(
+        "build_forecast_design — n_steps: %d, horizon: %d, n_series: %d, n_states: %d",
+        n_steps,
+        horizon,
+        n_series,
+        n_states,
+    )
+
+    return Z_future
