@@ -3,20 +3,121 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 
+from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.models.ssp.posterior import a_to_lam
 from bunobee.regression import make_peridoic_dummies
 from bunobee.utils import flatten_front_dim
 
 logger = logging.getLogger("bunobee")
 
+FORECAST_METHODS = ("replay", "filter")
+
+
+def _filter_increments(
+    z: np.ndarray,
+    *,
+    a_T: np.ndarray,
+    sigma_q: np.ndarray,
+    sigma_h: np.ndarray,
+    Z_future: np.ndarray,
+    exponent: float,
+    positivity: np.ndarray,
+) -> np.ndarray:
+    """Turn standard normals into state increments propagated by the filter itself.
+
+    Runs :func:`kalman_filter_1d_ekf_st` once per posterior sample over ``Z_future``
+    with an all-missing observation mask, so every forecast step is a pure predict
+    step and the returned ``Pt`` is the exact predicted state covariance. The
+    per-step increment covariance is ``dP[h] = Pt[h] - Pt[h - 1]`` (with ``Pt[-1]``
+    the zero matrix the propagation starts from, since each posterior draw already
+    carries the filtered uncertainty at ``T``), and the increments are ``chol(dP) @ z``.
+
+    Parameters
+    ----------
+    z : np.ndarray, shape (n_sample, horizon, n_states)
+        Standard normal draws, one per state per forecast step.
+    a_T : np.ndarray, shape (n_sample, n_states)
+        Last filtered state per posterior sample; the propagation starts here.
+    sigma_q : np.ndarray, shape (n_sample, n_states)
+        Process noise standard deviation per posterior sample.
+    sigma_h : np.ndarray, shape (n_sample, n_series)
+        Observation noise standard deviation per posterior sample. Unused by the
+        predict-only step itself, but required by the filter signature.
+    Z_future : np.ndarray, shape (horizon, n_series, n_states)
+        Future design matrix.
+    exponent : float
+        Exponent in the nonlinear state map ``exp(exponent * a)``.
+    positivity : np.ndarray, shape (n_states,)
+        Boolean mask selecting states that use the nonlinear map.
+
+    Returns
+    -------
+    np.ndarray, shape (n_sample, horizon, n_states)
+        State increments; ``a_T + cumsum(increments, axis=1)`` is the state path.
+
+    Notes
+    -----
+    The filter runs in JAX's configured precision, float32 unless ``jax_enable_x64``
+    is set, so the increments agree with the closed-form random walk to about
+    single precision rather than bitwise.
+    """
+    n_sample, horizon, n_states = z.shape
+    n_series = Z_future.shape[1]
+
+    Z_jnp = jnp.asarray(Z_future)
+    positivity_jnp = jnp.asarray(positivity, dtype=bool)
+    P0 = jnp.zeros((n_states, n_states))
+    # Fully missing observations: NaN values are never read, the mask makes each step predict-only.
+    y_missing = jnp.full((horizon, n_series), jnp.nan)
+    mask = jnp.zeros((horizon, n_series), dtype=bool)
+
+    def _propagate(a0: jnp.ndarray, sig_h: jnp.ndarray, sig_q: jnp.ndarray) -> jnp.ndarray:
+        _, _, Pt, _, _, _ = kalman_filter_1d_ekf_st(
+            a0=a0,
+            P0=P0,
+            Z=Z_jnp,
+            sigma_h=sig_h,
+            sigma_q=sig_q,
+            y=y_missing,
+            logp=False,
+            exponent=exponent,
+            positivity=positivity_jnp,
+            mask=mask,
+        )
+        return Pt
+
+    Pt = jax.jit(jax.vmap(_propagate))(
+        jnp.asarray(a_T),
+        jnp.asarray(sigma_h),
+        jnp.asarray(sigma_q),
+    )
+    # (n_sample, horizon, n_states, n_states)
+    Pt = np.asarray(Pt, dtype=float)
+
+    P_prev = np.concatenate([np.zeros((n_sample, 1, n_states, n_states)), Pt[:, :-1]], axis=1)
+    dP = Pt - P_prev
+    dP = 0.5 * (dP + np.swapaxes(dP, -1, -2))
+
+    # Jitter keeps the factorization defined for a singular dP (sigma_q = 0 gives dP = 0);
+    # the absolute floor is far below any state scale and the relative term absorbs the
+    # cancellation error of the differencing above.
+    scale = np.max(np.abs(dP), axis=(-2, -1), keepdims=True)
+    jitter = 1e-24 + 1e-12 * scale
+    L = np.linalg.cholesky(dP + jitter * np.eye(n_states))
+
+    return np.einsum("shij,shj->shi", L, z)
+
 
 def forecast_ssp(
     idata: xr.Dataset,
     Z_future: np.ndarray,
     *,
+    method: str = "replay",
     exponent: float = 0.5,
     positivity: np.ndarray | None = None,
     noise_embed: bool = False,
@@ -25,8 +126,8 @@ def forecast_ssp(
 ) -> xr.Dataset:
     """Draw out-of-sample predictive samples from a fitted multi-series SSP posterior.
 
-    This is a posterior-replay forecast: it needs no change to the filter. The
-    filtered state path already lives in ``idata`` as the ``at`` site, so the
+    The default is a posterior-replay forecast: it needs no change to the filter.
+    The filtered state path already lives in ``idata`` as the ``at`` site, so the
     forecast launches from the last filtered state ``a_T = at[:, -1, :]`` and
     propagates a driftless random walk forward ``horizon`` steps, injecting
     per-step process noise ``N(0, diag(sigma_q**2))`` independently per posterior
@@ -40,6 +141,22 @@ def forecast_ssp(
     The ``eps`` term is added only when ``noise_embed=True``. The API mirrors
     ``bunobee.models.dlt.make_inference``.
 
+    ``method="filter"`` derives the same state path from the filter itself rather
+    than hard-coding the random walk: it runs ``kalman_filter_1d_ekf_st`` over
+    ``Z_future`` with an all-missing observation mask, which makes every forecast
+    step a pure predict step, then samples increments from the covariance the
+    filter actually propagated::
+
+        a_pred[h], P_pred[h] = filter(a0=a_T, P0=0, Z=Z_future, y=NaN, mask=False)
+        dP[h]                = P_pred[h] - P_pred[h - 1]
+        a_{T+h}              = a_pred[h] + sum_{k<=h} chol(dP[k]) @ z_k
+
+    For the driftless random walk both paths coincide (``dP[h] = diag(sigma_q**2)``
+    at every step), so ``"filter"`` reproduces the replay mean and variance up to
+    floating point. It exists because the propagation is read off the filter, so a
+    model whose predict step is not a plain random walk stays correct without
+    touching this function.
+
     Parameters
     ----------
     idata : xr.Dataset
@@ -52,6 +169,12 @@ def forecast_ssp(
         Future per-series design matrix. ``Z_future[h, j]`` is the loading vector
         for series ``j`` at forecast step ``h``. See ``build_forecast_design`` for
         a helper that continues periodic dummies and future covariates.
+    method : {"replay", "filter"}, optional
+        How the future state path is propagated. ``"replay"`` (default) walks the
+        saved posterior state forward analytically; ``"filter"`` runs the EKF over
+        ``Z_future`` with an all-missing mask and samples from the covariance it
+        propagates. Both give the same answer for the random-walk state equation;
+        ``"filter"`` costs one extra filter pass per posterior sample.
     exponent : float, optional
         Exponent in the nonlinear state map ``exp(exponent * a)``. Default 0.5.
         Ignored when ``idata.attrs`` carries an ``"exponent"`` entry.
@@ -79,6 +202,9 @@ def forecast_ssp(
         ``noise_embed=True``. ``time`` has length ``horizon``. ``sample`` flattens
         the posterior ``(chain, draw)`` axes.
     """
+    if method not in FORECAST_METHODS:
+        raise ValueError(f"method must be one of {FORECAST_METHODS}; got {method!r}")
+
     at = flatten_front_dim(np.asarray(idata["at"].to_numpy(), dtype=float), n=2)
     sigma_q = flatten_front_dim(np.asarray(idata["sigma_q"].to_numpy(), dtype=float), n=2)
     sigma_h = flatten_front_dim(np.asarray(idata["sigma_h"].to_numpy(), dtype=float), n=2)
@@ -106,20 +232,36 @@ def forecast_ssp(
         raise ValueError(f"positivity must have shape ({n_states},); got {resolved_positivity.shape}")
 
     logger.debug(
-        "forecast_ssp — n_sample: %d, horizon: %d, n_series: %d, n_states: %d, exponent: %s, noise_embed: %s",
+        "forecast_ssp — n_sample: %d, horizon: %d, n_series: %d, n_states: %d, exponent: %s, "
+        "method: %s, noise_embed: %s",
         n_sample,
         horizon,
         n_series,
         n_states,
         resolved_exponent,
+        method,
         noise_embed,
     )
 
     rng = np.random.default_rng(seed)
 
-    # Driftless random walk forward from the last filtered state, one increment per step.
+    # Standard normals are drawn identically by both methods so a fixed seed keeps the
+    # two paths comparable draw for draw.
     a_T = at[:, -1, :]
-    eta = rng.standard_normal((n_sample, horizon, n_states)) * sigma_q[:, None, :]
+    z = rng.standard_normal((n_sample, horizon, n_states))
+    if method == "replay":
+        # Driftless random walk forward from the last filtered state, one increment per step.
+        eta = z * sigma_q[:, None, :]
+    else:
+        eta = _filter_increments(
+            z,
+            a_T=a_T,
+            sigma_q=sigma_q,
+            sigma_h=sigma_h,
+            Z_future=Z_future,
+            exponent=resolved_exponent,
+            positivity=resolved_positivity,
+        )
     a_path = a_T[:, None, :] + np.cumsum(eta, axis=1)
 
     # Natural scale: exp(exponent * a) on positivity states, identity elsewhere.
