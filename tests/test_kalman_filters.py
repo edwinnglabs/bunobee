@@ -416,3 +416,148 @@ def test_filter_output_shapes_and_finiteness() -> None:
     assert jnp.all(jnp.isfinite(vt))
     assert jnp.all(jnp.isfinite(Ft))
     assert jnp.all(jnp.isfinite(Kt))
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — NaN-y predict-only step (issue #30)
+# ---------------------------------------------------------------------------
+
+
+def _masking_case():
+    """Two-series inputs with one fully missing interior row and one partially missing row."""
+    Z_st = jnp.stack([_Z, 0.8 * _Z], axis=1)  # (T, 2, N_STATES)
+    y_st = jnp.stack([_Y, 0.9 * _Y], axis=1)  # (T, 2)
+    y_st = y_st.at[3, :].set(jnp.nan)  # fully missing interior row
+    y_st = y_st.at[5, 1].set(jnp.nan)  # one missing series only
+    sigma_h_st = jnp.array([_SIGMA_H, 0.12])
+    P0_full = jnp.diag(_P0)
+    mask = ~jnp.isnan(y_st)
+    return Z_st, y_st, sigma_h_st, P0_full, mask
+
+
+def test_masked_row_equals_pure_predict_step() -> None:
+    """A fully masked row leaves at / Pt at the pure predict step for both st filters.
+
+    Acceptance criterion 1 of issue #30: with no observation to correct against,
+    ``at`` must carry through unchanged and ``Pt`` must grow by exactly the process
+    noise, so a NaN-padded ``y`` propagates the state instead of poisoning it.
+    """
+    Z_st, y_st, sigma_h_st, P0_full, mask = _masking_case()
+    gap = 3
+
+    for filter_fn in (kalman_filter_1d_st, kalman_filter_1d_ekf_st):
+        _, at, Pt, vt, _, Kt = filter_fn(
+            a0=_A0,
+            P0=P0_full,
+            Z=Z_st,
+            sigma_h=sigma_h_st,
+            sigma_q=_SIGMA_Q,
+            y=y_st,
+            logp=True,
+            mask=mask,
+        )
+        assert jnp.all(jnp.isfinite(at)), f"{filter_fn.__name__} leaked NaN into at"
+        assert jnp.all(jnp.isfinite(Pt)), f"{filter_fn.__name__} leaked NaN into Pt"
+
+        # at is unchanged and Pt grew by exactly diag(sigma_q**2) across the masked row
+        assert jnp.allclose(at[gap], at[gap - 1], atol=1e-12), f"{filter_fn.__name__} moved at on a masked row"
+        expected_P = Pt[gap - 1] + jnp.diag(jnp.square(_SIGMA_Q))
+        assert jnp.allclose(Pt[gap], expected_P, atol=1e-12), f"{filter_fn.__name__} Pt is not the predict step"
+
+        # The masked entries produce no innovation and no gain
+        assert jnp.allclose(vt[gap], 0.0, atol=1e-12)
+        assert jnp.allclose(Kt[gap], 0.0, atol=1e-12)
+        assert jnp.allclose(vt[5, 1], 0.0, atol=1e-12)
+        assert jnp.allclose(Kt[:, :, 1][5], 0.0, atol=1e-12)
+
+
+def test_partially_masked_row_still_updates_observed_series() -> None:
+    """Masking one series of a row leaves the other series updating normally.
+
+    The step is only predict-only for the missing entries: the observed series must
+    still move the shared state, so at must differ from the pure predict step.
+    """
+    Z_st, y_st, sigma_h_st, P0_full, mask = _masking_case()
+    partial = 5
+
+    for filter_fn in (kalman_filter_1d_st, kalman_filter_1d_ekf_st):
+        _, at, _, _, _, Kt = filter_fn(
+            a0=_A0, P0=P0_full, Z=Z_st, sigma_h=sigma_h_st, sigma_q=_SIGMA_Q, y=y_st, mask=mask
+        )
+        assert not jnp.allclose(at[partial], at[partial - 1]), f"{filter_fn.__name__} ignored the observed series"
+        # gain is zero only in the masked column
+        assert jnp.allclose(Kt[partial, :, 1], 0.0, atol=1e-12)
+        assert not jnp.allclose(Kt[partial, :, 0], 0.0)
+
+
+def test_masked_values_never_read() -> None:
+    """Changing a masked entry of y changes nothing — the mask, not the value, drives the step."""
+    Z_st, y_st, sigma_h_st, P0_full, mask = _masking_case()
+    y_poisoned = jnp.where(mask, y_st, 1e6)
+
+    for filter_fn in (kalman_filter_1d_st, kalman_filter_1d_ekf_st):
+        base = filter_fn(a0=_A0, P0=P0_full, Z=Z_st, sigma_h=sigma_h_st, sigma_q=_SIGMA_Q, y=y_st, logp=True, mask=mask)
+        poisoned = filter_fn(
+            a0=_A0, P0=P0_full, Z=Z_st, sigma_h=sigma_h_st, sigma_q=_SIGMA_Q, y=y_poisoned, logp=True, mask=mask
+        )
+        for name, lhs, rhs in zip(("log_p", "at", "Pt", "vt", "Ft", "Kt"), base, poisoned):
+            assert jnp.array_equal(lhs, rhs), f"{filter_fn.__name__} {name} depends on a masked value"
+
+
+def test_none_and_all_true_mask_leave_outputs_bitwise_unchanged() -> None:
+    """Acceptance criterion 2 of issue #30: no mask and an all-observed mask agree bitwise.
+
+    Guards the regression surface of the existing notebooks — ``lp`` and ``at`` must not
+    move by a single ULP now that the masking branch exists.
+    """
+    Z_st = jnp.stack([_Z, 0.8 * _Z], axis=1)
+    y_st = jnp.stack([_Y, 0.9 * _Y], axis=1)
+    sigma_h_st = jnp.array([_SIGMA_H, 0.12])
+    P0_full = jnp.diag(_P0)
+    all_obs = jnp.ones(y_st.shape, dtype=bool)
+    a_obs = jnp.zeros((T, N_STATES))
+    P_obs = jnp.full((T, N_STATES), jnp.inf).at[2].set(0.5)
+
+    for filter_fn in (kalman_filter_1d_st, kalman_filter_1d_ekf_st):
+        kwargs = dict(
+            a0=_A0,
+            P0=P0_full,
+            Z=Z_st,
+            sigma_h=sigma_h_st,
+            sigma_q=_SIGMA_Q,
+            y=y_st,
+            logp=True,
+            a_obs=a_obs,
+            P_obs=P_obs,
+        )
+        unmasked = filter_fn(**kwargs)
+        masked = filter_fn(**kwargs, mask=all_obs)
+        for name, lhs, rhs in zip(("log_p", "at", "Pt", "vt", "Ft", "Kt"), unmasked, masked):
+            assert jnp.array_equal(lhs, rhs), f"{filter_fn.__name__} {name} is not bitwise-unchanged"
+
+
+def test_unmasked_nan_still_poisons_the_state() -> None:
+    """Without a mask a NaN row still flows into the state — masking must stay opt-in."""
+    Z_st, y_st, sigma_h_st, P0_full, _ = _masking_case()
+    _, at, *_ = kalman_filter_1d_ekf_st(a0=_A0, P0=P0_full, Z=Z_st, sigma_h=sigma_h_st, sigma_q=_SIGMA_Q, y=y_st)
+    assert jnp.any(jnp.isnan(at)), "NaN y unexpectedly handled without a mask"
+
+
+def test_masked_loglik_scores_observed_entries_only() -> None:
+    """log_p equals a manual per-step Gaussian sum taken over the observed entries only."""
+    Z_st, y_st, sigma_h_st, P0_full, mask = _masking_case()
+    log_p, _, Pt, vt, Ft, _ = kalman_filter_1d_st(
+        a0=_A0, P0=P0_full, Z=Z_st, sigma_h=sigma_h_st, sigma_q=_SIGMA_Q, y=y_st, logp=True, mask=mask
+    )
+
+    expected = 0.0
+    for t in range(T):
+        obs = np.flatnonzero(np.asarray(mask[t]))
+        if obs.size == 0:
+            continue
+        F_obs = np.asarray(Ft[t])[np.ix_(obs, obs)]
+        v_obs = np.asarray(vt[t])[obs]
+        expected += -0.5 * (
+            obs.size * np.log(2.0 * np.pi) + np.linalg.slogdet(F_obs)[1] + v_obs @ np.linalg.solve(F_obs, v_obs)
+        )
+    assert np.allclose(float(log_p), expected, rtol=1e-8, atol=1e-8)

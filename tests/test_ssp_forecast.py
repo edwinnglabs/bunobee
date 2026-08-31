@@ -304,3 +304,70 @@ class TestIdataOverrides:
         expected0 = a_nat @ Z_future[0].T
 
         np.testing.assert_allclose(out["mu_samples"].values[:, 0, :], expected0, rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Issue #30 — filter-native forecast path (method="filter")
+# ---------------------------------------------------------------------------
+
+
+class TestFilterMethod:
+    def test_rejects_unknown_method(self):
+        ds = _make_idata()
+        rng = np.random.default_rng(20)
+        Z_future = rng.normal(size=(3, 2, 3))
+        with pytest.raises(ValueError, match="method must be one of"):
+            forecast_ssp(ds, Z_future, method="posterior-replay")
+
+    def test_matches_replay_in_mean_and_is_not_wider(self):
+        """The filter path reproduces the replay mean and does not inflate the spread.
+
+        With a random-walk state equation the predict-only covariance the filter
+        propagates is exactly ``h * diag(sigma_q**2)``, so both paths must agree to
+        the single precision the filter runs in.
+        """
+        n_states, n_series, horizon = 3, 2, 8
+        ds = _make_idata(n_states=n_states, n_series=n_series, n_steps=10, n_draws=60, sigma_q=0.3)
+        rng = np.random.default_rng(21)
+        Z_future = rng.normal(size=(horizon, n_series, n_states))
+
+        replay = forecast_ssp(ds, Z_future, method="replay", noise_embed=True, seed=7)
+        filtered = forecast_ssp(ds, Z_future, method="filter", noise_embed=True, seed=7)
+
+        for name in ("mu_samples", "forecast_samples"):
+            lhs = replay[name].values
+            rhs = filtered[name].values
+            np.testing.assert_allclose(rhs.mean(axis=0), lhs.mean(axis=0), rtol=2e-4, atol=1e-6)
+            replay_sd = lhs.std(axis=0)
+            filter_sd = rhs.std(axis=0)
+            assert np.all(filter_sd <= replay_sd * (1.0 + 1e-3) + 1e-8), f"{name} spread widened"
+
+    def test_zero_process_noise_matches_replay_closed_form(self):
+        """sigma_q = 0 makes the propagated covariance zero, so both paths are the state itself."""
+        n_states, n_series, horizon = 3, 2, 4
+        ds = _make_idata(sigma_q=0.0, n_states=n_states, n_series=n_series, n_steps=7)
+        rng = np.random.default_rng(22)
+        Z_future = rng.normal(size=(horizon, n_series, n_states))
+
+        out = forecast_ssp(ds, Z_future, method="filter", seed=3)
+
+        a_T = _flat_at(ds)[:, -1, :]
+        a_nat = a_to_lam(np.broadcast_to(a_T[:, None, :], (a_T.shape[0], horizon, n_states)), 0.5, None)
+        expected = np.einsum("hij,shj->shi", Z_future, a_nat)
+        np.testing.assert_allclose(out["mu_samples"].values, expected, rtol=1e-8, atol=1e-8)
+
+    def test_dims_and_variance_growth_match_the_replay_contract(self):
+        n_states, n_series, horizon = 2, 3, 10
+        ds = _make_idata(sigma_q=0.5, n_states=n_states, n_series=n_series, n_steps=6, n_chains=4, n_draws=500)
+        rng = np.random.default_rng(23)
+        # Constant design across the horizon so the random-walk variance growth is clean.
+        z_block = rng.normal(size=(n_series, n_states))
+        Z_future = np.broadcast_to(z_block, (horizon, n_series, n_states)).copy()
+
+        out = forecast_ssp(ds, Z_future, method="filter", positivity=np.zeros(n_states, dtype=bool), seed=5)
+
+        assert out["forecast_samples"].dims == ("sample", "time", "series")
+        assert out.sizes["time"] == horizon
+        var = out["forecast_samples"].values.var(axis=0)
+        assert np.all(np.diff(var, axis=0) >= -1e-9), "filter-path variance is not nondecreasing in time"
+        assert np.all(var[-1] > var[0])

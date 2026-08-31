@@ -20,6 +20,7 @@ def kalman_filter_1d_ekf_st(
     positivity: jnp.ndarray | None = None,
     a_obs: jnp.ndarray | None = None,
     P_obs: jnp.ndarray | None = None,
+    mask: jnp.ndarray | None = None,
 ) -> tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Multi-series EKF with shared latent state, full covariance, and log-state reparameterization.
 
@@ -64,6 +65,18 @@ def kalman_filter_1d_ekf_st(
            a_t = a_pred + K_t v_t
            P_t = P_pred − K_t H_t P_pred    (symmetrized)
 
+    Missing observations
+    --------------------
+    Passing ``mask`` turns stage 4 into a **predict-only** step wherever an entry is
+    missing. Row j of Z_t is zeroed for a missing series, so ``v_{t,j} = 0``,
+    column j of K_t is zero, and the missing series contributes nothing to either
+    ``a_t`` or ``P_t``. When a whole row is missing the step reduces exactly to the
+    pure prediction ``a_t = a_pred``, ``P_t = P_pred``, which is what lets a NaN
+    padded ``y`` carry the state through interior gaps or past the end of the
+    sample. The log-likelihood counts only the observed entries. Latent-state fusion
+    (stage 2) is a state-space constraint rather than an observation, so it still
+    applies on a fully masked step.
+
     Parameters
     ----------
     a0 : jnp.ndarray, shape (n_states,)
@@ -93,21 +106,32 @@ def kalman_filter_1d_ekf_st(
     P_obs : jnp.ndarray | None, optional, shape (n_steps, n_states)
         Externally disclosed latent state variances in a-space. Use ``jnp.inf`` for
         timesteps / states with no external information.
+    mask : jnp.ndarray | None, optional, shape (n_steps, n_series)
+        Boolean observation mask — ``True`` marks an observed entry of ``y``, ``False``
+        a missing one. ``None`` (default) disables masking entirely and leaves every
+        computation, ``log_p`` included, bitwise identical to the unmasked filter; a
+        NaN in ``y`` then propagates into the state as before. Pass
+        ``~jnp.isnan(y)`` to make NaN entries predict-only. Masked entries of ``y``
+        are never read, so they may hold NaN, and rows that are entirely masked out
+        need no meaningful ``Z`` either.
 
     Returns
     -------
     log_p : float
-        Accumulated approximate Gaussian log-likelihood. Returns 0.0 when ``logp=False``.
+        Accumulated approximate Gaussian log-likelihood over the observed entries
+        only. Returns 0.0 when ``logp=False``.
     at : jnp.ndarray, shape (n_steps, n_states)
         Filtered state estimates in a-space.
     Pt : jnp.ndarray, shape (n_steps, n_states, n_states)
         Filtered state covariance matrices.
     vt : jnp.ndarray, shape (n_steps, n_series)
-        Innovation (observation residual) per series at each timestep.
+        Innovation (observation residual) per series at each timestep. Zero where
+        ``mask`` marks an entry missing.
     Ft : jnp.ndarray, shape (n_steps, n_series, n_series)
-        Full innovation covariance matrix at each timestep.
+        Full innovation covariance matrix at each timestep. A masked-out series
+        keeps only its own ``sigma_h**2`` on the diagonal.
     Kt : jnp.ndarray, shape (n_steps, n_states, n_series)
-        Kalman gain matrix at each timestep.
+        Kalman gain matrix at each timestep. Zero in the columns of masked-out series.
     """
     logger.debug(
         "kalman_filter_1d_ekf_st inputs — a0: %s, P0: %s, Z: %s, y: %s, sigma_h: %s, sigma_q: %s",
@@ -132,13 +156,24 @@ def kalman_filter_1d_ekf_st(
     _at_obs = a_obs if a_obs is not None else jnp.zeros((y.shape[0], n_states))
     _Pt_obs = P_obs if P_obs is not None else jnp.full((y.shape[0], n_states), jnp.inf)
 
+    # None → no masking at all; the traced computation stays bitwise identical.
+    _has_mask = mask is not None
+    _mask = jnp.asarray(mask, dtype=bool) if mask is not None else jnp.ones(y.shape, dtype=bool)
+
     def _ekf_st_step(
         carry: tuple[jnp.ndarray, jnp.ndarray, float],
-        xs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        xs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[tuple, tuple]:
         """Single EKF step: predict, fuse latent obs, linearise, update."""
         at, Pt, log_p = carry
-        yt, Zt, at_obs, Pt_obs = xs
+        yt, Zt, at_obs, Pt_obs, obs_mask = xs
+
+        # ------ Missing observations: zero out Z rows so masked series never update ------
+        # A zeroed row j gives yhat_j = 0 and (with yt_j → 0) vt_j = 0, Ht[j] = 0, so
+        # Kt[:, j] = 0 and series j contributes nothing to at_new / Pt_new.
+        if _has_mask:
+            yt = jnp.where(obs_mask, yt, 0.0)
+            Zt = jnp.where(obs_mask[:, None], Zt, 0.0)
 
         # ------ Predict: absorb process noise before fusion and linearisation ------
         a_pred = at
@@ -192,7 +227,15 @@ def kalman_filter_1d_ekf_st(
         if logp:
             _, log_det_F = jnp.linalg.slogdet(Ft)
             mahal = vt @ jnp.linalg.solve(Ft, vt)
-            log_p = log_p - 0.5 * (n_series * jnp.log(2.0 * jnp.pi) + log_det_F + mahal)
+            if _has_mask:
+                # Masked series sit alone on the diagonal of Ft with variance sigma_h**2
+                # and contribute vt = 0; drop their log-determinant and dimension count
+                # so log_p scores the observed entries only.
+                n_obs = jnp.sum(obs_mask)
+                log_det_F = log_det_F - jnp.sum(jnp.where(obs_mask, 0.0, jnp.log(sigma_h_sq)))
+                log_p = log_p - 0.5 * (n_obs * jnp.log(2.0 * jnp.pi) + log_det_F + mahal)
+            else:
+                log_p = log_p - 0.5 * (n_series * jnp.log(2.0 * jnp.pi) + log_det_F + mahal)
 
         at_new = a_pred + Kt @ vt
         Pt_new = P_pred - Kt @ Ht @ P_pred
@@ -203,7 +246,7 @@ def kalman_filter_1d_ekf_st(
     (_, _, log_p), (at, Pt, vt, Ft, Kt) = lax.scan(
         _ekf_st_step,
         (a0, P0, 0.0),
-        (y, Z, _at_obs, _Pt_obs),
+        (y, Z, _at_obs, _Pt_obs, _mask),
         length=y.shape[0],
     )
     return log_p, at, Pt, vt, Ft, Kt
