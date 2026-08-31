@@ -10,6 +10,7 @@ def a_to_lam(
     arr: np.ndarray,
     exponent: float,
     positivity: np.ndarray | None = None,
+    clip: float | None = None,
 ) -> np.ndarray:
     """Convert a-space values to λ-space for positivity states.
 
@@ -22,6 +23,11 @@ def a_to_lam(
     positivity : np.ndarray or None, optional
         Boolean mask of length ``n_states``.  ``True`` = positivity state.
         ``None`` treats every state as positivity.
+    clip : float or None, optional
+        Symmetric bound on the exponent argument: ``exp(clip(exponent · a, -clip, clip))``.
+        ``None`` (default) applies no clip.  Pass ``10.0`` to reproduce the guard
+        ``kalman_filter_1d_ekf_st`` applies internally, which keeps a long-horizon
+        forecast with a large ``sigma_q`` finite instead of overflowing to ``inf``.
 
     Returns
     -------
@@ -32,7 +38,10 @@ def a_to_lam(
     out = np.array(arr, dtype=float)
     n_states = out.shape[-1]
     mask = np.ones(n_states, dtype=bool) if positivity is None else np.asarray(positivity, dtype=bool)
-    out[..., mask] = np.exp(exponent * out[..., mask])
+    scaled = exponent * out[..., mask]
+    if clip is not None:
+        scaled = np.clip(scaled, -abs(clip), abs(clip))
+    out[..., mask] = np.exp(scaled)
     return out
 
 

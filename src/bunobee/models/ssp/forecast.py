@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 
+from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.models.ssp.posterior import a_to_lam
 from bunobee.regression import make_peridoic_dummies
@@ -16,6 +17,49 @@ from bunobee.utils import flatten_front_dim
 logger = logging.getLogger("bunobee")
 
 FORECAST_METHODS = ("replay", "filter")
+FORECAST_LINKS = ("exp", "identity")
+
+#: Hard floor the linear filters apply to positivity states every step (``kalman_1d_st.py``).
+POSITIVITY_FLOOR = 1e-6
+#: Bound the EKF puts on ``exponent * a`` before exponentiating (``kalman_1d_st_ekf.py``).
+EXP_CLIP = 10.0
+
+
+def _floored_walk(a_T: np.ndarray, eta: np.ndarray, positivity: np.ndarray) -> np.ndarray:
+    """Walk the state forward one step at a time, flooring positivity states as we go.
+
+    Reproduces the ``identity`` link's positivity mechanism: the linear filters
+    (:func:`kalman_filter_1d_st`) clip a violating state back up **inside** the
+    transition, so every clip resets the origin of the remaining walk. Applying
+    ``np.maximum`` to a finished ``cumsum`` path is a different — and wrong —
+    operation, because it lets the path accumulate arbitrarily far below zero and
+    then lifts only the visible part back up.
+
+    The resulting path is deliberately biased upward: a clipped random walk is not
+    a martingale. That is the point — it is what the fitted model does.
+
+    Parameters
+    ----------
+    a_T : np.ndarray, shape (n_sample, n_states)
+        Last filtered state per posterior sample.
+    eta : np.ndarray, shape (n_sample, horizon, n_states)
+        Per-step state increments.
+    positivity : np.ndarray, shape (n_states,)
+        Boolean mask selecting the states held at or above :data:`POSITIVITY_FLOOR`.
+
+    Returns
+    -------
+    np.ndarray, shape (n_sample, horizon, n_states)
+        State path with the floor enforced at every step.
+    """
+    horizon = eta.shape[1]
+    out = np.empty_like(eta)
+    a = np.array(a_T, dtype=float)
+    for h in range(horizon):
+        a = a + eta[:, h, :]
+        a[:, positivity] = np.maximum(a[:, positivity], POSITIVITY_FLOOR)
+        out[:, h, :] = a
+    return out
 
 
 def _filter_increments(
@@ -27,15 +71,17 @@ def _filter_increments(
     Z_future: np.ndarray,
     exponent: float,
     positivity: np.ndarray,
+    link: str = "exp",
 ) -> np.ndarray:
     """Turn standard normals into state increments propagated by the filter itself.
 
-    Runs :func:`kalman_filter_1d_ekf_st` once per posterior sample over ``Z_future``
-    with an all-missing observation mask, so every forecast step is a pure predict
-    step and the returned ``Pt`` is the exact predicted state covariance. The
-    per-step increment covariance is ``dP[h] = Pt[h] - Pt[h - 1]`` (with ``Pt[-1]``
-    the zero matrix the propagation starts from, since each posterior draw already
-    carries the filtered uncertainty at ``T``), and the increments are ``chol(dP) @ z``.
+    Runs the filter family named by ``link`` once per posterior sample over
+    ``Z_future`` with an all-missing observation mask, so every forecast step is a
+    pure predict step and the returned ``Pt`` is the exact predicted state
+    covariance. The per-step increment covariance is ``dP[h] = Pt[h] - Pt[h - 1]``
+    (with ``Pt[-1]`` the zero matrix the propagation starts from, since each
+    posterior draw already carries the filtered uncertainty at ``T``), and the
+    increments are ``chol(dP) @ z``.
 
     Parameters
     ----------
@@ -51,14 +97,21 @@ def _filter_increments(
     Z_future : np.ndarray, shape (horizon, n_series, n_states)
         Future design matrix.
     exponent : float
-        Exponent in the nonlinear state map ``exp(exponent * a)``.
+        Exponent in the nonlinear state map ``exp(exponent * a)``. Used by the
+        ``"exp"`` link only.
     positivity : np.ndarray, shape (n_states,)
-        Boolean mask selecting states that use the nonlinear map.
+        Boolean mask selecting the positivity states.
+    link : {"exp", "identity"}, optional
+        Which filter family propagates the covariance: ``"exp"`` (default) uses
+        :func:`kalman_filter_1d_ekf_st`, ``"identity"`` uses
+        :func:`kalman_filter_1d_st`.
 
     Returns
     -------
     np.ndarray, shape (n_sample, horizon, n_states)
-        State increments; ``a_T + cumsum(increments, axis=1)`` is the state path.
+        State increments; the state path is ``a_T + cumsum(increments, axis=1)``
+        for the ``"exp"`` link, or that walk with the per-step positivity floor
+        applied for the ``"identity"`` link.
 
     Notes
     -----
@@ -77,7 +130,7 @@ def _filter_increments(
     mask = jnp.zeros((horizon, n_series), dtype=bool)
 
     def _propagate(a0: jnp.ndarray, sig_h: jnp.ndarray, sig_q: jnp.ndarray) -> jnp.ndarray:
-        _, _, Pt, _, _, _ = kalman_filter_1d_ekf_st(
+        kwargs = dict(
             a0=a0,
             P0=P0,
             Z=Z_jnp,
@@ -85,10 +138,18 @@ def _filter_increments(
             sigma_q=sig_q,
             y=y_missing,
             logp=False,
-            exponent=exponent,
-            positivity=positivity_jnp,
             mask=mask,
         )
+        if link == "exp":
+            # In the EKF `positivity` only selects the exp map used to linearise, so it
+            # belongs in the propagation.
+            _, _, Pt, _, _, _ = kalman_filter_1d_ekf_st(exponent=exponent, positivity=positivity_jnp, **kwargs)
+        else:
+            # In the linear filter `positivity` is the pseudo-observation correction, a
+            # mean-space operation replayed per draw by `_floored_walk`. Passing it here
+            # would inject a Pt inversion into a propagation that starts from P0 = 0, so
+            # the covariance is propagated unconstrained and constrained afterwards.
+            _, _, Pt, _, _, _ = kalman_filter_1d_st(**kwargs)
         return Pt
 
     Pt = jax.jit(jax.vmap(_propagate))(
@@ -118,6 +179,7 @@ def forecast_ssp(
     Z_future: np.ndarray,
     *,
     method: str = "replay",
+    link: str = "exp",
     exponent: float = 0.5,
     positivity: np.ndarray | None = None,
     noise_embed: bool = False,
@@ -141,11 +203,41 @@ def forecast_ssp(
     The ``eps`` term is added only when ``noise_embed=True``. The API mirrors
     ``bunobee.models.dlt.make_inference``.
 
+    Positivity: which mechanism, and which filter
+    --------------------------------------------
+    The ``positivity`` mask means two different things depending on the filter
+    family that produced the posterior, so ``link`` names the mechanism explicitly
+    instead of leaving it to be inferred from the mask:
+
+    ``link="exp"`` (default) — the EKF families ``kalman_filter_1d_ekf`` and
+    ``kalman_filter_1d_ekf_st``. A masked state ``a`` is a **log-intensity**; its
+    natural value is ``exp(exponent * a)``, positive by construction, and the
+    filter enforces nothing. The forecast applies the same map, clipping
+    ``exponent * a`` to ``[-EXP_CLIP, EXP_CLIP]`` exactly as the EKF does, so a long
+    horizon with a large ``sigma_q`` cannot overflow to ``inf``.
+
+    ``link="identity"`` — the linear families ``kalman_filter_1d`` and
+    ``kalman_filter_1d_st``. A masked state **is already** the natural value, and
+    positivity is enforced inside the transition at every step: a violating state is
+    pulled back with a pseudo-observation and then floored at
+    :data:`POSITIVITY_FLOOR`. The forecast never exponentiates such a state; it
+    carries the enforcement forward by walking the state one step at a time and
+    flooring after each increment (:func:`_floored_walk`). The clip is sequential on
+    purpose — each clip resets the origin of the remaining walk, which is not the
+    same as ``np.maximum`` over a finished ``cumsum`` path — and the resulting path
+    is biased upward, because a clipped random walk is not a martingale and that is
+    what the fitted model does.
+
+    Passing an EKF posterior with ``link="identity"`` (or the reverse) is the failure
+    this parameter exists to prevent, so a mask whose states go negative under
+    ``link="identity"`` raises rather than forecasting a constraint the fit never
+    allowed.
+
     ``method="filter"`` derives the same state path from the filter itself rather
-    than hard-coding the random walk: it runs ``kalman_filter_1d_ekf_st`` over
-    ``Z_future`` with an all-missing observation mask, which makes every forecast
-    step a pure predict step, then samples increments from the covariance the
-    filter actually propagated::
+    than hard-coding the random walk: it runs the filter for the resolved ``link``
+    over ``Z_future`` with an all-missing observation mask, which makes every
+    forecast step a pure predict step, then samples increments from the covariance
+    the filter actually propagated::
 
         a_pred[h], P_pred[h] = filter(a0=a_T, P0=0, Z=Z_future, y=NaN, mask=False)
         dP[h]                = P_pred[h] - P_pred[h - 1]
@@ -163,26 +255,38 @@ def forecast_ssp(
         Posterior carrying ``at`` with dims ``(chain, draw, n_steps, n_states)``,
         ``sigma_q`` with dims ``(chain, draw, n_states)``, and ``sigma_h`` with
         dims ``(chain, draw, n_series)``. When present, ``idata.attrs["exponent"]``
-        overrides the ``exponent`` argument and a ``positivity`` data variable
-        overrides the ``positivity`` argument.
+        overrides the ``exponent`` argument, ``idata.attrs["link"]`` overrides the
+        ``link`` argument, and a ``positivity`` data variable overrides the
+        ``positivity`` argument.
     Z_future : np.ndarray, shape (horizon, n_series, n_states)
         Future per-series design matrix. ``Z_future[h, j]`` is the loading vector
         for series ``j`` at forecast step ``h``. See ``build_forecast_design`` for
         a helper that continues periodic dummies and future covariates.
     method : {"replay", "filter"}, optional
         How the future state path is propagated. ``"replay"`` (default) walks the
-        saved posterior state forward analytically; ``"filter"`` runs the EKF over
-        ``Z_future`` with an all-missing mask and samples from the covariance it
-        propagates. Both give the same answer for the random-walk state equation;
-        ``"filter"`` costs one extra filter pass per posterior sample.
+        saved posterior state forward analytically; ``"filter"`` runs the filter
+        for the resolved ``link`` over ``Z_future`` with an all-missing mask and
+        samples from the covariance it propagates. Both give the same answer for
+        the random-walk state equation; ``"filter"`` costs one extra filter pass
+        per posterior sample.
+    link : {"exp", "identity"}, optional
+        Which positivity mechanism the fitted model used, and therefore how the
+        ``positivity`` mask is honoured. ``"exp"`` (default) is the EKF
+        reparameterization ``exp(exponent * a)``; ``"identity"`` is the linear
+        filters' natural-scale state with a per-step floor at
+        :data:`POSITIVITY_FLOOR`. Ignored when ``idata.attrs`` carries a ``"link"``
+        entry. See the section above for which filter goes with which value.
     exponent : float, optional
         Exponent in the nonlinear state map ``exp(exponent * a)``. Default 0.5.
-        Ignored when ``idata.attrs`` carries an ``"exponent"`` entry.
+        Ignored when ``idata.attrs`` carries an ``"exponent"`` entry, and unused
+        entirely when ``link="identity"``.
     positivity : np.ndarray or None, optional, shape (n_states,)
-        Boolean mask; ``True`` selects states that use the nonlinear ``exp`` map.
-        ``None`` (default) applies the nonlinear map to every state, matching the
-        filter default. Pass ``np.zeros(n_states, dtype=bool)`` for a fully linear
-        forecast. Ignored when ``idata`` carries a ``positivity`` data variable.
+        Boolean mask; ``True`` selects the positivity states — those that use the
+        nonlinear ``exp`` map under ``link="exp"``, or that are floored every step
+        under ``link="identity"``. ``None`` (default) marks every state, matching
+        the filter default. Pass ``np.zeros(n_states, dtype=bool)`` for a fully
+        unconstrained linear forecast. Ignored when ``idata`` carries a
+        ``positivity`` data variable.
     noise_embed : bool, optional
         When ``True``, add a per-step observation-noise draw
         ``N(0, sigma_h[series]**2)`` to ``mu`` to form ``forecast_samples`` and
@@ -201,9 +305,21 @@ def forecast_ssp(
         ``forecast_samples`` and ``mu_samples`` always, plus ``eps_samples`` when
         ``noise_embed=True``. ``time`` has length ``horizon``. ``sample`` flattens
         the posterior ``(chain, draw)`` axes.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` or ``link`` is not one of the supported values, if
+        ``Z_future`` does not conform to ``idata``, or if ``link="identity"`` is
+        paired with a posterior whose masked states go negative — the signature of
+        a posterior that no linear positivity enforcement ever produced, most often
+        an EKF (log-scale) posterior forecast under the wrong mechanism.
     """
     if method not in FORECAST_METHODS:
         raise ValueError(f"method must be one of {FORECAST_METHODS}; got {method!r}")
+    resolved_link = str(idata.attrs.get("link", link))
+    if resolved_link not in FORECAST_LINKS:
+        raise ValueError(f"link must be one of {FORECAST_LINKS}; got {resolved_link!r}")
 
     at = flatten_front_dim(np.asarray(idata["at"].to_numpy(), dtype=float), n=2)
     sigma_q = flatten_front_dim(np.asarray(idata["sigma_q"].to_numpy(), dtype=float), n=2)
@@ -231,14 +347,30 @@ def forecast_ssp(
     if resolved_positivity.shape != (n_states,):
         raise ValueError(f"positivity must have shape ({n_states},); got {resolved_positivity.shape}")
 
+    if resolved_link == "identity" and resolved_positivity.any():
+        # A linear filter floors every masked state at POSITIVITY_FLOOR on every training
+        # step, so a negative masked state cannot come out of one. If we see one the
+        # mechanism is misdeclared -- typically an EKF (log-scale) posterior asked to
+        # forecast on the natural scale -- and honouring it silently would forecast a
+        # constraint the fit never allowed.
+        offenders = np.flatnonzero(resolved_positivity & (at < 0.0).any(axis=(0, 1)))
+        if offenders.size:
+            raise ValueError(
+                f"link='identity' marks states {offenders.tolist()} as positivity states, but idata['at'] "
+                "holds negative values for them; a linear filter floors positivity states every step, so "
+                "this posterior was not fitted with that mechanism. Use link='exp' for an EKF posterior "
+                "(states are log-intensities), or drop those states from the positivity mask."
+            )
+
     logger.debug(
         "forecast_ssp — n_sample: %d, horizon: %d, n_series: %d, n_states: %d, exponent: %s, "
-        "method: %s, noise_embed: %s",
+        "link: %s, method: %s, noise_embed: %s",
         n_sample,
         horizon,
         n_series,
         n_states,
         resolved_exponent,
+        resolved_link,
         method,
         noise_embed,
     )
@@ -261,11 +393,19 @@ def forecast_ssp(
             Z_future=Z_future,
             exponent=resolved_exponent,
             positivity=resolved_positivity,
+            link=resolved_link,
         )
-    a_path = a_T[:, None, :] + np.cumsum(eta, axis=1)
 
-    # Natural scale: exp(exponent * a) on positivity states, identity elsewhere.
-    a_nat = a_to_lam(a_path, resolved_exponent, resolved_positivity)
+    if resolved_link == "exp":
+        # EKF posterior: the state is a log-intensity, positivity holds by construction.
+        a_path = a_T[:, None, :] + np.cumsum(eta, axis=1)
+        # Natural scale: exp(exponent * a) on positivity states, identity elsewhere. The
+        # clip mirrors kalman_filter_1d_ekf_st so a long horizon cannot overflow to inf.
+        a_nat = a_to_lam(a_path, resolved_exponent, resolved_positivity, clip=EXP_CLIP)
+    else:
+        # Linear posterior: the state is already natural scale, so the walk itself carries
+        # the filter's per-step floor and nothing is exponentiated.
+        a_nat = _floored_walk(a_T, eta, resolved_positivity)
 
     # (sample, horizon, n_states) contracted with (horizon, n_series, n_states) -> (sample, horizon, n_series)
     mu_samples = np.einsum("hij,shj->shi", Z_future, a_nat)
