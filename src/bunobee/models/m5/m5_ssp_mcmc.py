@@ -1,4 +1,27 @@
-from bunobee.models.ssp.forecast import build_forecast_design
+"""M5 single-series SSP model fitted with NUTS.
+
+The forecast side is a thin wrapper over the shared SSP core: ``predict_one_series``
+delegates the state propagation and the ``Z_future`` contraction to
+:func:`bunobee.models.ssp.forecast.forecast_ssp` and only keeps the m5-specific
+back-transform (``exp`` on the log scale, rescaled by ``response_norm``).
+"""
+
+from __future__ import annotations
+
+import jax.numpy as jnp
+import numpy as np
+import numpyro
+import xarray as xr
+from jax import random
+from numpyro import distributions as dist
+from numpyro.infer import MCMC, NUTS
+
+from bunobee.models.ssp.forecast import build_forecast_design, forecast_ssp
+from bunobee.models.ssp.kalman_1d import kalman_filter_1d
+from bunobee.regression import make_peridoic_dummies
+
+#: Default forecast horizon for the M5 competition (28 days).
+HORIZON = 28
 
 
 def fit_one_series(
@@ -94,6 +117,43 @@ def fit_one_series(
     }
 
 
+def _to_forecast_idata(at_samples: np.ndarray, sigma_h_samples: np.ndarray) -> xr.Dataset:
+    """Wrap flat NUTS draws in the ``(chain, draw, ...)`` layout ``forecast_ssp`` reads.
+
+    ``numpyro.MCMC.get_samples()`` returns chain-flattened draws, so a singleton
+    ``chain`` axis is prepended. ``sigma_q`` is set to zero: the m5 point forecast
+    launches from the terminal filtered state and holds it flat over the horizon
+    rather than re-injecting process noise, so a zero process scale makes the
+    shared core reproduce that behavior exactly.
+
+    Parameters
+    ----------
+    at_samples : np.ndarray, shape (n_samples, n_steps, n_states)
+        Filtered state draws from the ``at`` deterministic site.
+    sigma_h_samples : np.ndarray, shape (n_samples,)
+        Observation-noise scale draws.
+
+    Returns
+    -------
+    xr.Dataset
+        Dataset carrying ``at``, ``sigma_q`` and ``sigma_h`` with a leading
+        ``(chain, draw)`` pair and a single series.
+    """
+    at = np.asarray(at_samples, dtype=float)[None]  # (1, n_samples, n_steps, n_states)
+    n_samples, n_states = at.shape[1], at.shape[3]
+    sigma_h = np.asarray(sigma_h_samples, dtype=float).reshape(1, n_samples, 1)
+    sigma_q = np.zeros((1, n_samples, n_states), dtype=float)
+
+    return xr.Dataset(
+        data_vars={
+            "at": (["chain", "draw", "step", "state"], at),
+            "sigma_q": (["chain", "draw", "state"], sigma_q),
+            "sigma_h": (["chain", "draw", "series"], sigma_h),
+        },
+        coords={"chain": np.arange(1), "draw": np.arange(n_samples)},
+    )
+
+
 def predict_one_series(
     fit_result: dict,
     horizon: int = HORIZON,
@@ -101,12 +161,24 @@ def predict_one_series(
 ) -> np.ndarray:
     """Generate point forecast (median) from a fitted single-series model.
 
+    A thin wrapper over :func:`bunobee.models.ssp.forecast.forecast_ssp`: the state
+    launch, the ``Z_future`` contraction and the observation-noise draw all come from
+    the shared core, and this function only supplies the m5 back-transform
+    (``exp`` on the log scale, rescaled by ``response_norm``) and the median reduction.
+
+    The model is linear-Gaussian on ``log(sales / response_norm)``, so ``positivity``
+    is all-``False`` and the ``exp(exponent * a)`` state map is bypassed; ``sigma_q``
+    is zeroed so the terminal filtered state is held flat over the horizon, matching
+    the historical m5 behavior. Draws are not bitwise identical to the pre-refactor
+    implementation because ``forecast_ssp`` owns the RNG stream, but the sampling
+    distribution — and hence the returned median — is unchanged.
+
     Parameters
     ----------
     fit_result : dict
         Output of ``fit_one_series()``.
     horizon : int
-        Number of future steps to forecast.
+        Number of future steps to forecast. Ignored when ``Z_future`` is given.
     Z_future : np.ndarray | None
         (horizon, n_states) pre-built future design matrix. When provided the
         internal dummy continuation is skipped. Pass ``Z_future_shared`` to
@@ -123,7 +195,7 @@ def predict_one_series(
     at_samples = np.array(posterior_dict["at"])
     sigma_h_samples = np.array(posterior_dict["sigma_h"])
 
-    n_steps = at_samples.shape[1]
+    n_steps, n_states = at_samples.shape[1], at_samples.shape[2]
 
     if Z_future is None:
         Z_train = np.asarray(fit_result["Z"], dtype=float)[:n_steps]
@@ -133,10 +205,16 @@ def predict_one_series(
             periodic={"columns": slice(1, None), "period": 7, "drop_first": True},
         )[:, 0, :]
 
-    a_last = at_samples[:, -1, :]  # (n_samples, n_states)
-    mu_future = a_last @ Z_future.T  # (n_samples, horizon)
+    idata = _to_forecast_idata(at_samples, sigma_h_samples)
+    forecast = forecast_ssp(
+        idata,
+        np.asarray(Z_future, dtype=float)[:, None, :],  # (horizon, n_series=1, n_states)
+        positivity=np.zeros(n_states, dtype=bool),
+        noise_embed=True,
+        transform_callback=lambda samples: np.exp(samples) * response_norm,
+        seed=42,
+    )
 
-    eps = np.random.default_rng(42).normal(0, sigma_h_samples[:, None], size=mu_future.shape)
-    yhat_samples = np.exp(mu_future + eps) * response_norm
+    yhat_samples = forecast["forecast_samples"].to_numpy()[:, :, 0]  # (n_samples, horizon)
 
     return np.median(yhat_samples, axis=0)

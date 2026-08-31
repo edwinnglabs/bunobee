@@ -71,3 +71,5 @@ def make_kalman_batch(
             outs.append(_kf(sigma_h[start:end], sigma_q[start:end], y[start:end]))
         n_out = len(outs[0])
         return tuple(jnp.concatenate([o[i] for o in outs], axis=0) for i in range(n_out))
+
+    return _batched
