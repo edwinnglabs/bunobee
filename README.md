@@ -107,7 +107,7 @@ idata = xr.Dataset(
         "sigma_h": (("chain", "draw", "series"), np.asarray(samples["sigma_h"])),
         "positivity": (("state",), positivity),
     }
-).assign_attrs(exponent=1.0)
+).assign_attrs(exponent=1.0, link="exp")  # link="exp": positivity states are EKF log-intensities
 
 # Continue the design past the sample: the intercept carries forward, future spend is supplied
 Z_future = build_forecast_design(Z, horizon, covariates_future=rng.uniform(0.5, 1.5, size=(horizon, n_series, 1)))

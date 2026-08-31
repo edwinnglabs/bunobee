@@ -371,3 +371,204 @@ class TestFilterMethod:
         var = out["forecast_samples"].values.var(axis=0)
         assert np.all(np.diff(var, axis=0) >= -1e-9), "filter-path variance is not nondecreasing in time"
         assert np.all(var[-1] > var[0])
+
+
+# ---------------------------------------------------------------------------
+# Issue #33 — the positivity mask means different things per filter family
+#
+# 1. `link` defaults to "exp", so the EKF behavior of #26 is unchanged.
+# 2. `link` resolves from `idata.attrs`, mirroring `exponent`.
+# 3. `link="identity"` never exponentiates and floors every step over a long horizon.
+# 4. The floor is sequential, not `np.maximum` over a finished `cumsum` path.
+# 5. An unsupported / ambiguous link raises `ValueError`.
+# 6. The EKF path stays finite over a long horizon with a large `sigma_q`.
+# ---------------------------------------------------------------------------
+
+
+def _positive_idata(*, n_states, n_series, n_steps=8, sigma_q=0.1, a_T_value=1.0, n_chains=2, n_draws=25):
+    """A posterior whose states are natural-scale and strictly positive, as a linear filter leaves them."""
+    ds = _make_idata(
+        n_chains=n_chains,
+        n_draws=n_draws,
+        n_steps=n_steps,
+        n_states=n_states,
+        n_series=n_series,
+        sigma_q=sigma_q,
+    )
+    ds["at"] = (ds["at"].dims, np.abs(ds["at"].to_numpy()) + a_T_value)
+    return ds
+
+
+class TestLinkResolution:
+    def test_default_is_exp_and_matches_the_explicit_argument(self):
+        n_states, n_series = 3, 2
+        ds = _make_idata(sigma_q=0.0, n_states=n_states, n_series=n_series, n_steps=6)
+        rng = np.random.default_rng(30)
+        Z_future = rng.normal(size=(3, n_series, n_states))
+
+        default = forecast_ssp(ds, Z_future, seed=0)
+        explicit = forecast_ssp(ds, Z_future, link="exp", seed=0)
+        xr.testing.assert_identical(default, explicit)
+
+    def test_rejects_unknown_link(self):
+        ds = _make_idata()
+        rng = np.random.default_rng(31)
+        Z_future = rng.normal(size=(3, 2, 3))
+        with pytest.raises(ValueError, match="link must be one of"):
+            forecast_ssp(ds, Z_future, link="log")
+
+    def test_link_attr_overrides_the_argument(self):
+        n_states, n_series = 3, 2
+        ds = _positive_idata(n_states=n_states, n_series=n_series, sigma_q=0.0)
+        ds.attrs["link"] = "identity"
+        rng = np.random.default_rng(32)
+        Z_future = rng.normal(size=(2, n_series, n_states))
+
+        # link="exp" is passed explicitly; the attr must win, so nothing is exponentiated.
+        out = forecast_ssp(ds, Z_future, link="exp", seed=0)
+
+        a_T = _flat_at(ds)[:, -1, :]
+        expected = np.einsum("hij,sj->shi", Z_future, a_T)
+        np.testing.assert_allclose(out["mu_samples"].values, expected, rtol=1e-12, atol=1e-12)
+
+    def test_attr_link_is_validated_too(self):
+        ds = _make_idata()
+        ds.attrs["link"] = "logit"
+        rng = np.random.default_rng(33)
+        Z_future = rng.normal(size=(3, 2, 3))
+        with pytest.raises(ValueError, match="link must be one of"):
+            forecast_ssp(ds, Z_future)
+
+
+class TestIdentityLink:
+    def test_never_exponentiates_the_positivity_states(self):
+        """sigma_q = 0 pins the path at a_T, which must pass through untouched."""
+        n_states, n_series = 3, 2
+        ds = _positive_idata(n_states=n_states, n_series=n_series, sigma_q=0.0)
+        rng = np.random.default_rng(34)
+        Z_future = rng.normal(size=(4, n_series, n_states))
+
+        out = forecast_ssp(ds, Z_future, link="identity", seed=0)
+
+        a_T = _flat_at(ds)[:, -1, :]
+        expected = np.einsum("hij,sj->shi", Z_future, a_T)
+        np.testing.assert_allclose(out["mu_samples"].values, expected, rtol=1e-12, atol=1e-12)
+
+        # The exp reading would be a strictly different answer for these states.
+        exp_reading = np.einsum("hij,sj->shi", Z_future, a_to_lam(a_T, 0.5, None))
+        assert not np.allclose(out["mu_samples"].values, exp_reading)
+
+    @pytest.mark.parametrize("method", ["replay", "filter"])
+    def test_paths_stay_above_the_floor_over_a_long_horizon(self, method):
+        """Large sigma_q, long horizon: every positivity state stays >= POSITIVITY_FLOOR."""
+        n_states = n_series = 3
+        horizon = 60
+        ds = _positive_idata(n_states=n_states, n_series=n_series, sigma_q=5.0, n_draws=40)
+        # Identity design reads the state path straight out of mu_samples.
+        Z_future = np.broadcast_to(np.eye(n_states), (horizon, n_series, n_states)).copy()
+
+        out = forecast_ssp(ds, Z_future, link="identity", method=method, seed=11)
+
+        mu = out["mu_samples"].values
+        assert np.all(np.isfinite(mu))
+        assert mu.min() >= forecast_mod.POSITIVITY_FLOOR - 1e-15
+        # The walk really is diffusing, so the floor is doing work rather than never binding.
+        assert np.isclose(mu.min(), forecast_mod.POSITIVITY_FLOOR)
+
+    def test_linear_states_are_left_unconstrained(self):
+        n_states = n_series = 2
+        horizon = 40
+        positivity = np.array([True, False])
+        ds = _positive_idata(n_states=n_states, n_series=n_series, sigma_q=3.0, n_draws=60)
+        Z_future = np.broadcast_to(np.eye(n_states), (horizon, n_series, n_states)).copy()
+
+        out = forecast_ssp(ds, Z_future, link="identity", positivity=positivity, seed=12)
+
+        mu = out["mu_samples"].values
+        assert mu[..., 0].min() >= forecast_mod.POSITIVITY_FLOOR - 1e-15
+        assert mu[..., 1].min() < 0.0, "the unmasked state should be free to go negative"
+
+
+class TestSequentialFloor:
+    def test_floored_walk_differs_from_post_hoc_maximum(self):
+        """Each clip resets the walk's origin; clipping a finished cumsum does not."""
+        a_T = np.array([[1.0]])
+        eta = np.array([[[-5.0], [3.0]]])
+        positivity = np.array([True])
+
+        sequential = forecast_mod._floored_walk(a_T, eta, positivity)
+        post_hoc = np.maximum(a_T[:, None, :] + np.cumsum(eta, axis=1), forecast_mod.POSITIVITY_FLOOR)
+
+        np.testing.assert_allclose(
+            sequential[0, :, 0], [forecast_mod.POSITIVITY_FLOOR, forecast_mod.POSITIVITY_FLOOR + 3.0]
+        )
+        np.testing.assert_allclose(post_hoc[0, :, 0], [forecast_mod.POSITIVITY_FLOOR] * 2)
+        assert not np.allclose(sequential, post_hoc)
+
+    def test_forecast_uses_the_sequential_clip(self):
+        """End to end: the forecast matches the sequential walk and not the post-hoc clip."""
+        n_states = n_series = 2
+        horizon = 30
+        sigma_q, seed = 2.0, 77
+        ds = _positive_idata(n_states=n_states, n_series=n_series, sigma_q=sigma_q, n_draws=50)
+        Z_future = np.broadcast_to(np.eye(n_states), (horizon, n_series, n_states)).copy()
+
+        out = forecast_ssp(ds, Z_future, link="identity", seed=seed)
+
+        a_T = _flat_at(ds)[:, -1, :]
+        n_sample = a_T.shape[0]
+        # forecast_ssp draws exactly this block first, so the increments are reproducible.
+        eta = np.random.default_rng(seed).standard_normal((n_sample, horizon, n_states)) * sigma_q
+        positivity = np.ones(n_states, dtype=bool)
+
+        sequential = forecast_mod._floored_walk(a_T, eta, positivity)
+        post_hoc = np.maximum(a_T[:, None, :] + np.cumsum(eta, axis=1), forecast_mod.POSITIVITY_FLOOR)
+
+        np.testing.assert_allclose(out["mu_samples"].values, sequential, rtol=1e-12, atol=1e-12)
+        assert not np.allclose(sequential, post_hoc)
+        # The sequential clip is biased upward -- that bias is the model's, not an artifact.
+        assert sequential.mean() > post_hoc.mean()
+
+
+class TestAmbiguousCombinationRaises:
+    def test_identity_link_on_a_negative_state_posterior_raises(self):
+        """An EKF (log-scale) posterior read as natural scale is the failure mode #33 is about."""
+        n_states, n_series = 3, 2
+        ds = _make_idata(n_states=n_states, n_series=n_series, n_steps=6)  # centered at 0 -> negatives
+        rng = np.random.default_rng(35)
+        Z_future = rng.normal(size=(3, n_series, n_states))
+
+        with pytest.raises(ValueError, match="link='identity'"):
+            forecast_ssp(ds, Z_future, link="identity")
+
+    def test_dropping_the_offending_states_from_the_mask_is_accepted(self):
+        n_states, n_series = 3, 2
+        ds = _make_idata(n_states=n_states, n_series=n_series, n_steps=6)
+        rng = np.random.default_rng(36)
+        Z_future = rng.normal(size=(3, n_series, n_states))
+
+        out = forecast_ssp(ds, Z_future, link="identity", positivity=np.zeros(n_states, dtype=bool), seed=0)
+        assert np.all(np.isfinite(out["mu_samples"].values))
+
+
+class TestExpLinkOverflowGuard:
+    def test_long_horizon_large_sigma_q_stays_finite(self):
+        """`a_to_lam` has no clip of its own; the forecast applies the EKF's [-10, 10] guard."""
+        n_states = n_series = 2
+        horizon = 250
+        ds = _make_idata(n_states=n_states, n_series=n_series, n_steps=6, sigma_q=50.0, n_draws=40)
+        Z_future = np.broadcast_to(np.eye(n_states), (horizon, n_series, n_states)).copy()
+
+        out = forecast_ssp(ds, Z_future, link="exp", exponent=0.5, noise_embed=True, seed=13)
+
+        for name in ("mu_samples", "forecast_samples"):
+            values = out[name].values
+            assert np.all(np.isfinite(values)), f"{name} overflowed"
+        assert out["mu_samples"].values.max() <= np.exp(forecast_mod.EXP_CLIP) * (1.0 + 1e-9)
+
+    def test_unclipped_a_to_lam_would_overflow(self):
+        """Guard the guard: without the clip the same path is not finite."""
+        a = np.array([[1e4, -1e4]])
+        with np.errstate(over="ignore"):
+            assert not np.all(np.isfinite(a_to_lam(a, 0.5, None)))
+        assert np.all(np.isfinite(a_to_lam(a, 0.5, None, clip=forecast_mod.EXP_CLIP)))
