@@ -29,6 +29,10 @@ test = [
     "pytest>=8",
     "black==26.1.0",
 ]
+m5 = [
+    "optax",
+    "tqdm",
+]
 notebook = [
     "ipywidgets",
 ]

@@ -4,18 +4,29 @@ The ``predict_*_opt`` helpers here are deprecated in favor of
 :func:`bunobee.models.ssp.forecast.forecast_ssp`; they are retained because their
 closed-form lognormal-mean correction has no posterior-replay equivalent. See each
 function's deprecation note for the migration path.
+
+This module drives the optimization-mode demo and is the only part of ``bunobee`` that
+needs ``optax`` and ``tqdm``. Those live behind the optional ``m5`` extra, so importing
+this module requires ``pip install 'bunobee[m5]'``.
 """
 
 from __future__ import annotations
 
 import logging
 
-import optax
 from jax import jit, value_and_grad
 import numpy as np
 import jax.numpy as jnp
 from numpyro import distributions as dist
-from tqdm.auto import tqdm
+
+try:
+    import optax
+    from tqdm.auto import tqdm
+except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the m5 extra
+    raise ModuleNotFoundError(
+        f"bunobee.models.m5.m5_ssp_optim requires the optional 'm5' extra (missing: {exc.name}). "
+        "Install it with: pip install 'bunobee[m5]'"
+    ) from exc
 
 from ..ssp.kalman_1d import kalman_filter_1d
 from ..ssp.vfactory import make_kalman_batch

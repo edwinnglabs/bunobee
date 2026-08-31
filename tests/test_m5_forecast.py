@@ -17,9 +17,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from bunobee.models.m5 import m5_ssp_mcmc, m5_ssp_optim
+from bunobee.models.m5 import m5_ssp_mcmc
 from bunobee.models.m5.m5_ssp_mcmc import predict_one_series
-from bunobee.models.m5.m5_ssp_optim import predict_batch_series_opt, predict_one_series_opt
+
+try:
+    from bunobee.models.m5 import m5_ssp_optim
+    from bunobee.models.m5.m5_ssp_optim import predict_batch_series_opt, predict_one_series_opt
+except ModuleNotFoundError:  # the optional 'm5' extra (optax, tqdm) is not installed
+    m5_ssp_optim = None
+    predict_one_series_opt = None
+    predict_batch_series_opt = None
+
+requires_m5_extra = pytest.mark.skipif(
+    m5_ssp_optim is None,
+    reason="needs the optional 'm5' extra: pip install 'bunobee[m5]'",
+)
 
 HORIZON = 14
 N_SAMPLES = 4000
@@ -158,6 +170,7 @@ class TestNumericalRegression:
         assert np.array_equal(first, second)
 
 
+@requires_m5_extra
 class TestDeprecatedMapPredictors:
     """Criterion 3: the MAP predictors are untouched numerically and clearly deprecated."""
 
@@ -210,7 +223,10 @@ class TestDeprecatedMapPredictors:
 class TestStyle:
     """Line-length budget for the touched modules."""
 
-    @pytest.mark.parametrize("module", [m5_ssp_mcmc, m5_ssp_optim])
+    @pytest.mark.parametrize(
+        "module",
+        [m5_ssp_mcmc, pytest.param(m5_ssp_optim, marks=requires_m5_extra)],
+    )
     def test_lines_within_120_chars(self, module):
         """Project style caps source lines at 120 characters."""
         for i, line in enumerate(Path(module.__file__).read_text().splitlines(), start=1):
