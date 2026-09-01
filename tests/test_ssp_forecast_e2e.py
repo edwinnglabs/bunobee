@@ -5,13 +5,13 @@ forecast -> inspect draws* on real data, rather than the synthetic-posterior ide
 ``tests/test_ssp_forecast.py`` (issue #26) and ``tests/test_build_forecast_design.py`` (issue #27).
 
 The data is ``tests/fixtures/sparse_panel.csv``: an exact slice of the sparse dataset used by the
-``ssp_v5`` prototype, ``playground/resource/sparse/sparse_df.csv``, which is untracked (``*.csv`` is
-gitignored) and so unavailable in CI. The slice keeps the first ``N_STEPS + HORIZON`` dates, the four
+``ssp_05_extended_filter_multi_series`` prototype, ``playground/resource/sparse/sparse_df.csv``, which is
+untracked (``*.csv`` is gitignored) and so unavailable in CI. The slice keeps the first ``N_STEPS + HORIZON`` dates, the four
 series in ``SERIES``, and the columns ``outcome`` plus the ``MEDIA`` channels --
 :class:`TestFixtureProvenance` re-derives it from the full file whenever that file is on hand, so the
 committed copy cannot silently drift.
 
-The fixture fits that panel with a deliberately tiny ``ssp_v5``-style NUTS run: a 4-series / 120-step
+The fixture fits that panel with a deliberately tiny ``ssp_05``-style NUTS run: a 4-series / 120-step
 training window, an ``intercept + weekly-dummy + media`` design, and a shared-state EKF likelihood whose
 only sampled parameters are ``sigma_h`` and ``sigma_q``. That keeps the posterior geometry two-block and
 low-dimensional, so 2 chains x (40 warmup + 100 draws) converge in roughly ten seconds -- no multi-minute
@@ -105,7 +105,7 @@ def _build_design(media: np.ndarray) -> np.ndarray:
 
 
 def _ekf_prior(sigma_q_scale: np.ndarray, positivity: np.ndarray) -> xr.Dataset:
-    """Natural-scale ``ssp_v5``-style prior, transformed to EKF a-space."""
+    """Natural-scale ``ssp_05``-style prior, transformed to EKF a-space."""
     a0 = np.concatenate([[1.0], np.zeros(N_DUMMIES), np.full(N_MEDIA, 0.1)])
     P0_diag = np.concatenate([[0.25], np.full(N_DUMMIES, 0.05), np.full(N_MEDIA, 0.001)])
     prior = xr.Dataset(

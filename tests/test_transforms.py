@@ -665,8 +665,8 @@ class TestTransformToEkfStBeta:
         assert jnp.allclose(out["sigma_q_alpha_prior"].values, jnp.array([3.0, 4.0]))
         assert jnp.allclose(out["sigma_q_beta_prior"].values, jnp.array([8.0, 6.0]))
 
-    def test_ssp_v2_style_scaled_beta(self):
-        # Mirrors the v2 notebook: scale_nat = sdy * 0.1 for intercept,
+    def test_ssp_02_style_scaled_beta(self):
+        # Mirrors the ssp_02 notebook: scale_nat = sdy * 0.1 for intercept,
         # sdy_over_sdx * 0.1 for regressors; Beta(2, 10).
         sdy = 0.078
         sdy_over_sdx = jnp.array([0.58, 0.29, 0.45])

@@ -321,7 +321,7 @@ def plot_prior_density(
     grid and rendered as a single ``time x value`` heatmap panel (one subplot
     per state, brighter = higher density), with the smoothed mean threaded
     across the top.  This promotes the ad-hoc ``density_field`` view from the
-    ``ssp_extend_prior_multi_anchor`` prototype notebook into the package.
+    ``ssp_08_multi_anchor_prior_extension`` prototype notebook into the package.
 
     Undisclosed steps (``P_obs`` is ``inf``) are masked, so a raw, un-extended
     prior -- which carries ``inf`` variance at most steps -- still renders

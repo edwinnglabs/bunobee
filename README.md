@@ -115,7 +115,7 @@ forecast = forecast_ssp(idata, Z_future, noise_embed=True, seed=0)
 print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, n_series)
 ```
 
-A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_v6_forecast.ipynb`](playground/statespace_prototype/ssp_v6_forecast.ipynb).
+A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb`](playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb).
 
 ## License
 
