@@ -117,6 +117,22 @@ print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, 
 
 A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb`](playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb).
 
+## Development
+
+Notebooks under `playground/` are committed **without outputs**, so the repo stays small and diffs stay
+readable. Two layers keep that true:
+
+```bash
+pip install nbstripout pre-commit
+nbstripout --install     # git clean filter, strips outputs on commit (per clone, run once)
+pre-commit install       # same hook, as a pre-commit safety net
+```
+
+CI enforces it regardless of local setup: the `notebooks` job runs `nbstripout --verify` on every
+tracked `.ipynb` and caps each notebook at 1.5 MiB. A notebook whose rendered plots *are* the point
+opts out with `"keep_output": true` in its notebook metadata — `ssp_06_multi_series_forecast.ipynb` is
+the only one that does, and the size cap is what keeps that opt-out honest.
+
 ## License
 
 Bunobee is released under the [MIT License](LICENSE).
