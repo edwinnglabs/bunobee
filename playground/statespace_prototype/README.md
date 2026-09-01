@@ -4,26 +4,27 @@ A staged series of prototypes for the state-space engine in `bunobee.models.ssp`
 previous one, moving from a single-series linear Kalman filter to a multi-series extended Kalman filter (EKF), and
 demonstrates how to assemble, disclose, and visualise **time-point priors** on the latent states.
 
-## The `ssp_v1` … `ssp_v6` progression
+## The chapters — `ssp_01` … `ssp_08`
 
-- **`ssp_v1` — First Prototype** (`kalman_1d`): bare single-series linear Kalman filter, the starting point.
-- **`ssp_v2` — Kalman Filter with Time-Point Priors and Positive Coefficients** (`kalman_1d`): time-point priors via
-  `construct_states_prior`; positivity-constrained coefficients.
-- **`ssp_v3` — Extended Kalman Filter, a Revisit on the Non-Linear State-Space Model** (`kalman_1d_ekf`): log-space
-  (multiplicative) states through `transform_to_ekf`; `λ_t = exp(k·a_t)`.
-- **`ssp_v4` — Linear Kalman Filter, Fit with Multiple Time-Series** (`kalman_1d_st`): multi-series (`_st`) linear
-  filter; time-point priors derived from a beta-prior table.
-- **`ssp_v5` — Extended Kalman Filter, Fit with Multiple Time-Series** (`kalman_1d_ekf_st`): multi-series EKF via
-  `transform_to_ekf_st`; positivity on the natural scale.
-- **`ssp_v6_forecast` — Extended Kalman Filter, Multi-Series Forecast** (`forecast_ssp`): the `v5` fit with the last
-  28 days held out, its design continued by `build_forecast_design`, and the predictive path drawn by `forecast_ssp`
-  — fan chart with 50% / 90% bands, `plot_states` on the in-sample path, and the fan faceted over all series. This is
-  the only notebook here **committed with its rendered outputs** (`"keep_output": true` in the notebook metadata, which
-  `nbstripout` honours), because the plots are the point.
+- **`ssp_01_first_prototype` — First Prototype** (`kalman_1d`): bare single-series linear Kalman filter, the starting
+  point.
+- **`ssp_02_time_point_priors` — Kalman Filter with Time-Point Priors and Positive Coefficients** (`kalman_1d`):
+  time-point priors via `construct_states_prior`; positivity-constrained coefficients.
+- **`ssp_03_extended_kalman_filter` — Extended Kalman Filter, a Revisit on the Non-Linear State-Space Model**
+  (`kalman_1d_ekf`): log-space (multiplicative) states through `transform_to_ekf`; `λ_t = exp(k·a_t)`.
+- **`ssp_04_linear_filter_multi_series` — Linear Kalman Filter, Fit with Multiple Time-Series** (`kalman_1d_st`):
+  multi-series (`_st`) linear filter; time-point priors derived from a beta-prior table.
+- **`ssp_05_extended_filter_multi_series` — Extended Kalman Filter, Fit with Multiple Time-Series**
+  (`kalman_1d_ekf_st`): multi-series EKF via `transform_to_ekf_st`; positivity on the natural scale.
+- **`ssp_06_multi_series_forecast` — Extended Kalman Filter, Multi-Series Forecast** (`forecast_ssp`): the `ssp_05`
+  fit with the last 28 days held out, its design continued by `build_forecast_design`, and the predictive path drawn
+  by `forecast_ssp` — fan chart with 50% / 90% bands, `plot_states` on the in-sample path, and the fan faceted over
+  all series. This is the only notebook here **committed with its rendered outputs** (`"keep_output": true` in the
+  notebook metadata, which `nbstripout` honours), because the plots are the point.
 
-`v2`/`v3` are single-series and disclose the ground-truth latent state over a few random windows. `v4`/`v5` are
-multi-series and build their priors from a time-point beta table (`use_time_point_prior=True`), anchoring the media
-states every four weeks.
+`ssp_02`/`ssp_03` are single-series and disclose the ground-truth latent state over a few random windows.
+`ssp_04`/`ssp_05` are multi-series and build their priors from a time-point beta table (`use_time_point_prior=True`),
+anchoring the media states every four weeks.
 
 ## Prior construction & visualisation tools
 
@@ -50,26 +51,33 @@ All live in `bunobee.models.ssp` (re-exported from `.prior` / `.posterior` / `.p
   extension mode (`Z = 0`) then `kalman_rts_smoother_1d`, fusing *every* anchor per state by inverse-variance weighting.
   For a single-anchor channel it matches `extend_states_prior_nearest` to numerical noise; for multiple anchors it blends
   means and tightens the variance (never wider). States with no anchor stay `inf`. See
-  [`ssp_extend_prior_multi_anchor.ipynb`](./ssp_extend_prior_multi_anchor.ipynb).
+  [`ssp_08_multi_anchor_prior_extension.ipynb`](./ssp_08_multi_anchor_prior_extension.ipynb).
 - **`plot_prior_heatmap(ssp_priors, quantity="both")`** — renders the prior as a **states × time** heatmap. Rows are
   latent states, columns are timesteps; coloured cells are disclosed anchors (finite variance) and grey cells are
   undisclosed (`inf` variance). `quantity` selects `"mean"` (`a_obs`), `"var"` (`P_obs`), or `"both"`.
 - **`plot_states(posterior, dates, state_labels, ...)`** — posterior quantile ribbons for the filtered / smoothed
   states (or EKF intensities), optionally overlaying disclosure anchors via `obs_idx=disclosed_idx(ssp_priors)`.
 - **`transform_to_ekf` / `transform_to_ekf_st`** — reparameterise a natural-scale prior into EKF (`a`-space) form for
-  the `_ekf` filters (`v3` / `v5`).
+  the `_ekf` filters (`ssp_03` / `ssp_05`).
 - **`validate_prior(ssp_priors)`** — contract check on the prior dataset (called inside `construct_states_prior`).
 
 Each notebook now includes a short *"Time-point prior at a glance"* block that prints `disclosed_idx(...)` and draws
-`plot_prior_heatmap(..., quantity="both")` right after the prior is assembled. In `v4`/`v5` the default config sets
-`use_time_point_prior=False`, so the heatmap is fully grey — flip that flag to populate the anchor windows.
+`plot_prior_heatmap(..., quantity="both")` right after the prior is assembled. In `ssp_04`/`ssp_05` the default config
+sets `use_time_point_prior=False`, so the heatmap is fully grey — flip that flag to populate the anchor windows.
 
-## Standalone demo — `ssp_extend_prior`
+## Prior deep dives — `ssp_07` / `ssp_08`
 
-`ssp_extend_prior.ipynb` is a self-contained demo of `extend_states_prior_nearest`. It (1) builds a disclosed prior with
-`construct_states_prior`, (2) extends the sparse anchors along the two-sided random walk, and (3) overlays the
-**anchors-only** vs. **random-walk-extended** prior in a single `plot_states` figure — the extension shows up as a
-continuous variance cone that pinches to each anchor and widens with lag, while the anchorless intercept stays `inf`.
+Two self-contained chapters on the prior-extension utilities; they synthesise their own data and can be read on their
+own once `ssp_02`/`ssp_03` have introduced time-point priors.
+
+- **`ssp_07_extend_states_prior` — Extending State Anchors via a Two-Sided Random Walk**
+  (`extend_states_prior_nearest`): (1) builds a disclosed prior with `construct_states_prior`, (2) extends the sparse
+  anchors along the two-sided random walk, and (3) overlays the **anchors-only** vs. **random-walk-extended** prior in
+  a single `plot_states` figure — the extension shows up as a continuous variance cone that pinches to each anchor and
+  widens with lag, while the anchorless intercept stays `inf`.
+- **`ssp_08_multi_anchor_prior_extension` — Multi-Anchor Extension: Nearest-Anchor Heuristic vs. a KF + RTS Smoother**
+  (`extend_states_prior_smoothed`): checks where the nearest-anchor heuristic of `ssp_07` stops being exact, and builds
+  out the principled multi-anchor alternative.
 
 ## Running the notebooks
 
@@ -78,8 +86,8 @@ root:
 
 ```bash
 pip install -e .          # install bunobee into your environment
-jupyter lab               # then open playground/statespace_prototype/ssp_v*.ipynb
+jupyter lab               # then open playground/statespace_prototype/ssp_*.ipynb
 ```
 
-`v2`/`v3` are self-contained (they synthesise their own data). `v4`/`v5`/`v6` expect a multi-series dataset (and, for
-`v4`/`v5`, a time-point beta table) loaded in their data cells.
+`ssp_02`/`ssp_03` are self-contained (they synthesise their own data). `ssp_04`/`ssp_05`/`ssp_06` expect a multi-series
+dataset (and, for `ssp_04`/`ssp_05`, a time-point beta table) loaded in their data cells.

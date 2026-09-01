@@ -28,6 +28,42 @@ jobs:
       - name: Run tests
         run: pytest tests/
 
+  notebooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nbstripout
+        run: pip install "nbstripout==0.8.2"
+
+      # Fails if any committed notebook still carries outputs or execution counts.
+      # Notebooks that deliberately keep their outputs opt out with "keep_output": true
+      # in the notebook metadata, which nbstripout honours.
+      - name: Verify notebooks are stripped
+        run: nbstripout --verify $(git ls-files '*.ipynb')
+
+      # Guards the opt-out: a "keep_output" notebook full of base64 PNGs is the one
+      # thing --verify cannot catch, so cap every notebook's on-disk size.
+      - name: Check notebook sizes
+        env:
+          MAX_KIB: 1536
+        run: |
+          rc=0
+          for f in $(git ls-files '*.ipynb'); do
+            kib=$(( $(stat -c%s "$f") / 1024 ))
+            if [ "$kib" -gt "$MAX_KIB" ]; then
+              echo "::error file=$f::${kib} KiB exceeds the ${MAX_KIB} KiB budget"
+              rc=1
+            else
+              printf '%6s KiB  %s\n' "$kib" "$f"
+            fi
+          done
+          exit $rc
+
   package:
     runs-on: ubuntu-latest
     steps:
