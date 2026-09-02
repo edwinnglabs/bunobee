@@ -289,6 +289,81 @@ def test_smoothed_state_without_anchor_stays_inf():
     assert np.all(np.isinf(out["P_obs"].values[:, 1]))
 
 
+def _multi_state_multi_anchor() -> xr.Dataset:
+    """Build a four-column prior spanning every anchoring regime.
+
+    Returns
+    -------
+    xr.Dataset
+        30-step prior whose columns are, in order: unanchored (a ``level``-like
+        state), two tight anchors, three anchors with a loose middle outlier,
+        and a single anchor.
+    """
+    a_obs = np.zeros((30, 4))
+    p_obs = np.full((30, 4), np.inf)
+    # s0: no anchor at all
+    a_obs[4, 1], p_obs[4, 1] = 0.20, 0.02  # s1: two tight anchors
+    a_obs[25, 1], p_obs[25, 1] = 0.45, 0.02
+    a_obs[3, 2], p_obs[3, 2] = 0.30, 0.02  # s2: loose middle outlier
+    a_obs[15, 2], p_obs[15, 2] = 0.65, 0.15
+    a_obs[27, 2], p_obs[27, 2] = 0.35, 0.02
+    a_obs[10, 3], p_obs[10, 3] = 0.60, 0.03  # s3: single anchor
+    return _prior(a_obs, p_obs)
+
+
+def test_smoothed_per_state_vector_Q():
+    # A length-n_states Q gives each column its own random-walk slope: two columns
+    # carrying an identical single anchor open up at their own Q away from it.
+    a_obs = np.zeros((11, 2))
+    p_obs = np.full((11, 2), np.inf)
+    a_obs[5, :], p_obs[5, :] = 0.5, 0.01
+    ds = _prior(a_obs, p_obs)
+    q = np.array([0.02, 0.2])
+    out = extend_states_prior_smoothed(ds, q)
+
+    # Single anchor per column, so the smoother marginal is the exact
+    # P* + |t - t*|.Q cone, with a different slope on each column.
+    lag = np.abs(np.arange(11) - 5)
+    assert np.allclose(out["P_obs"].values[:, 0], 0.01 + lag * q[0], atol=1e-7)
+    assert np.allclose(out["P_obs"].values[:, 1], 0.01 + lag * q[1], atol=1e-7)
+    assert np.allclose(out["a_obs"].values, 0.5, atol=1e-7)
+
+
+def test_smoothed_multi_state_columns_are_decoupled():
+    # The filter runs with Z = 0, so the state columns never couple: extending
+    # each column alone as a one-state prior reproduces the joint run exactly.
+    ds = _multi_state_multi_anchor()
+    q = np.array([0.02, 0.01, 0.02, 0.05])
+    joint = extend_states_prior_smoothed(ds, q)
+
+    for i in range(ds.sizes["state"]):
+        solo = extend_states_prior_smoothed(ds.isel(state=[i]), q[i])
+        assert np.array_equal(solo["a_obs"].values[:, 0], joint["a_obs"].values[:, i])
+        assert np.array_equal(solo["P_obs"].values[:, 0], joint["P_obs"].values[:, i])
+
+    # The unanchored column stays fully undisclosed; every other one is filled.
+    assert np.all(np.isinf(joint["P_obs"].values[:, 0]))
+    assert np.all(np.isfinite(joint["P_obs"].values[:, 1:]))
+
+
+def test_smoothed_multi_state_tighter_than_nearest_per_column():
+    # Each anchored column is smoothed on its own terms: never wider than the
+    # nearest-anchor heuristic, and strictly tighter wherever it has two anchors.
+    ds = _multi_state_multi_anchor()
+    q = np.array([0.02, 0.01, 0.02, 0.05])
+    nearest = extend_states_prior_nearest(ds, q)
+    smoothed = extend_states_prior_smoothed(ds, q)
+
+    p_near = nearest["P_obs"].values
+    p_smooth = smoothed["P_obs"].values
+    for i in (1, 2, 3):
+        assert np.all(p_smooth[:, i] <= p_near[:, i] + 1e-9)
+    for i in (1, 2):  # multi-anchor columns fuse both directions
+        assert np.any(p_smooth[:, i] < p_near[:, i] - 1e-6)
+    # single-anchor column: the two agree to the diffuse-prior noise floor
+    assert np.allclose(p_smooth[:, 3], p_near[:, 3], atol=1e-7)
+
+
 def test_smoothed_output_passes_validate_prior():
     out = extend_states_prior_smoothed(_multi_anchor(), 0.02)
     validate_prior(out, require_init=False)  # must not raise
