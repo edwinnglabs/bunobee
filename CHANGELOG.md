@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both prior extensions now extend one step backward to `t = -1` and emit the initial-state
   moments `a0` / `P0` over dims `(state,)`, so their output satisfies the complete-prior
   contract and can be promoted to an `SspPrior`. The `(time, state)` rectangle keeps its
-  shape. Unanchored states get `a0 = 0`, `P0 = inf`; an `a0` / `P0` already present on the
-  input is overwritten rather than passed through.
+  shape. Unanchored states get `a0 = 0`, `P0 = inf`. The derived moments are a placeholder,
+  so an `a0` / `P0` already present on the input is preserved rather than overwritten — pass
+  `overwrite_init=True` to let the placeholder win instead.
 
 ## [v0.0.4]
 

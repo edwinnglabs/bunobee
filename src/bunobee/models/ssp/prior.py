@@ -144,9 +144,41 @@ def disclosed_idx(ssp_prior: xr.Dataset | SspPrior) -> np.ndarray:
     return np.where(np.isfinite(p_obs).any(axis=1))[0]
 
 
+def _write_init_moments(
+    out: xr.Dataset,
+    a_init: np.ndarray,
+    P_init: np.ndarray,
+    overwrite_init: bool,
+) -> None:
+    """Write the derived ``a0`` / ``P0`` onto ``out`` without outranking a real prior.
+
+    The moments an extension derives — the driftless random-walk marginal evaluated one step
+    before the series — are only a *placeholder*: the authoritative initial-state prior is the
+    one the caller supplies downstream. So each of ``a0`` / ``P0`` is written only when it is
+    absent from ``out``, independently of the other, unless ``overwrite_init`` says otherwise.
+
+    Parameters
+    ----------
+    out : xr.Dataset
+        Extended prior, modified in place.
+    a_init : np.ndarray
+        Derived initial-state mean over dims ``(state,)``.
+    P_init : np.ndarray
+        Derived initial-state variance over dims ``(state,)``.
+    overwrite_init : bool
+        Whether the derived moments replace an ``a0`` / ``P0`` already present on ``out``.
+    """
+    if overwrite_init or "a0" not in out:
+        out["a0"] = (("state",), a_init)
+    if overwrite_init or "P0" not in out:
+        out["P0"] = (("state",), P_init)
+
+
 def extend_states_prior_nearest(
     ssp_priors: xr.Dataset,
     Q: float | np.ndarray,
+    *,
+    overwrite_init: bool = False,
 ) -> xr.Dataset:
     r"""Extend disclosed anchors along the nearest-anchor random-walk marginal.
 
@@ -177,6 +209,12 @@ def extend_states_prior_nearest(
     already uses.  The ``(time, state)`` rectangle keeps its shape — ``time``
     stays length ``T`` — so nothing that indexes by step is disturbed.
 
+    **Precedence.** Those derived moments are a *placeholder*, not an authority: a real
+    initial-state prior the caller supplies (the ``base_ds`` block merged downstream)
+    always wins.  Each of ``a0`` / ``P0`` is therefore written only when it is absent from
+    ``ssp_priors``, independently of the other; pass ``overwrite_init=True`` to let the
+    derived placeholder replace one that is already there.
+
     This is the exact marginal only for an isolated channel; treat the result as
     a prior fed into the augmented-measurement step, not a final posterior.
 
@@ -193,14 +231,17 @@ def extend_states_prior_nearest(
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying
         ``a_obs`` and ``P_obs`` over dims ``(time, state)``.  All other
         variables (``positivity``, any ``sigma_q`` block, and attrs) are passed
-        through unchanged; an ``a0`` / ``P0`` already present is **overwritten**
-        by the backward-extended moments.
+        through unchanged; an ``a0`` / ``P0`` already present is **preserved**
+        unless ``overwrite_init`` is set.
     Q : float or np.ndarray
         Per-state process variance ``σ_q²``.  A scalar is broadcast to every
         state; an array must have length ``n_states``.  Must be finite-or-``inf``
         and non-negative.  ``Q → inf`` recovers the un-extended prior (only the
         original anchors stay informed, and ``P0`` stays ``inf``), while
         ``Q → 0`` holds each anchor's variance flat across its region.
+    overwrite_init : bool, optional
+        Whether the derived ``a0`` / ``P0`` replace ones already present on
+        ``ssp_priors``, by default ``False`` (a real initial-state prior wins).
 
     Returns
     -------
@@ -208,7 +249,8 @@ def extend_states_prior_nearest(
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored
         state's undisclosed steps filled by the nearest-anchor random-walk
         marginal, plus ``a0`` / ``P0`` over ``(state,)`` from the same marginal
-        at ``t = -1``.  Passes :func:`validate_prior` with ``require_init=True``,
+        at ``t = -1`` wherever the input did not already carry them.  Passes
+        :func:`validate_prior` with ``require_init=True``,
         so it can be promoted to an :class:`SspPrior` — though a ``P0 = inf``
         column (an unanchored state) would need handling before the a-space
         transforms could consume it.
@@ -264,8 +306,7 @@ def extend_states_prior_nearest(
     out = ssp_priors.copy()
     out["a_obs"] = (("time", "state"), a_obs)
     out["P_obs"] = (("time", "state"), p_obs)
-    out["a0"] = (("state",), a_init)
-    out["P0"] = (("state",), P_init)
+    _write_init_moments(out, a_init, P_init, overwrite_init)
     validate_prior(out, require_init=True)
     return out
 
@@ -274,6 +315,8 @@ def extend_states_prior_smoothed(
     ssp_priors: xr.Dataset,
     Q: float | np.ndarray,
     P0_diffuse: float = 1e8,
+    *,
+    overwrite_init: bool = False,
 ) -> xr.Dataset:
     r"""Extend disclosed anchors via an exact KF-forward + RTS-backward smoother.
 
@@ -309,6 +352,12 @@ def extend_states_prior_smoothed(
     ``(time, state)`` rectangle keeps its shape — ``time`` stays length ``T`` —
     so nothing that indexes by step is disturbed.
 
+    **Precedence.** Those derived moments are a *placeholder*, not an authority: a real
+    initial-state prior the caller supplies (the ``base_ds`` block merged downstream) always
+    wins.  Each of ``a0`` / ``P0`` is therefore written only when it is absent from
+    ``ssp_priors``, independently of the other; pass ``overwrite_init=True`` to let the derived
+    placeholder replace one that is already there.
+
     **When to use.** Prefer this for genuinely multi-anchor channels, where the
     nearest-anchor heuristic is a conservative, discontinuous approximation.  For a
     single-anchor channel the two agree to numerical noise (set by the diffuse-prior
@@ -321,7 +370,7 @@ def extend_states_prior_smoothed(
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying ``a_obs`` and
         ``P_obs`` over dims ``(time, state)``.  All other variables (``positivity``, any
         ``sigma_q`` block, and attrs) are passed through unchanged; an ``a0`` / ``P0``
-        already present is **overwritten** by the backward-extended moments.
+        already present is **preserved** unless ``overwrite_init`` is set.
     Q : float or np.ndarray
         Per-state process variance ``σ_q²``.  A scalar is broadcast to every state; an
         array must have length ``n_states``.  Must be finite-or-``inf`` and non-negative.
@@ -330,13 +379,17 @@ def extend_states_prior_smoothed(
     P0_diffuse : float, optional
         Large finite initial variance standing in for an uninformative prior, by default
         ``1e8`` (comfortable in float64).
+    overwrite_init : bool, optional
+        Whether the derived ``a0`` / ``P0`` replace ones already present on ``ssp_priors``,
+        by default ``False`` (a real initial-state prior wins).
 
     Returns
     -------
     xr.Dataset
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored state's
         undisclosed steps filled by the exact smoother marginal, plus ``a0`` / ``P0``
-        over ``(state,)`` from the same marginal at ``t = -1``.  Passes
+        over ``(state,)`` from the same marginal at ``t = -1`` wherever the input did not
+        already carry them.  Passes
         :func:`validate_prior` with ``require_init=True``, so it can be promoted to an
         :class:`SspPrior` — though a ``P0 = inf`` column (an unanchored state) would need
         handling before the a-space transforms could consume it.
@@ -401,7 +454,6 @@ def extend_states_prior_smoothed(
     out = ssp_priors.copy()
     out["a_obs"] = (("time", "state"), a_out)
     out["P_obs"] = (("time", "state"), p_out)
-    out["a0"] = (("state",), a_init)
-    out["P0"] = (("state",), P_init)
+    _write_init_moments(out, a_init, P_init, overwrite_init)
     validate_prior(out, require_init=True)
     return out
