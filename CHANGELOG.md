@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `extend_states_prior_smoothed` — exact KF-forward + RTS-backward anchor extension that
   fuses every anchor per state, for multi-anchor channels the nearest-anchor heuristic only
   approximates.
+- `combine_states_priors` — closed-form inverse-variance fusion of two independent states
+  priors over the same `time` / `state` grid, returning a validated `SspPrior`. Precision
+  adds, so `N(a, P)` fused with itself is `N(a, P/2)` and a tight prior dominates a loose
+  one. `P_obs = inf` is zero precision and drops out; a step undisclosed on both sides stays
+  undisclosed rather than going `NaN`. Mismatched coords, mismatched `positivity`, and a
+  full-covariance `P0` raise rather than aligning or guessing; non-moment variables and
+  attrs (`sdy`, the `sigma_q` block, ...) are taken from the left operand. Fusion assumes
+  the two priors carry disjoint evidence, and is a product of densities, not a mixture.
 
 ### Changed
 
