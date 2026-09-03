@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import itertools
+from functools import reduce
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -259,3 +262,89 @@ def test_inputs_are_not_mutated():
     np.testing.assert_allclose(left["P_obs"].values, left_p)
     np.testing.assert_allclose(right["a_obs"].values, right_a)
     np.testing.assert_allclose(right["P_obs"].values, right_p)
+
+
+def _random(seed: int, n_steps: int = 4, n_states: int = 3) -> xr.Dataset:
+    """Build a prior with pseudo-random finite moments, for order-invariance checks.
+
+    Parameters
+    ----------
+    seed : int
+        Seed for the moment draws.
+    n_steps : int, optional
+        Length of the ``time`` axis.
+    n_states : int, optional
+        Length of the ``state`` axis.
+
+    Returns
+    -------
+    xr.Dataset
+        Complete prior whose variances are all finite and strictly positive.
+    """
+    rng = np.random.default_rng(seed)
+    return _prior(
+        rng.normal(size=(n_steps, n_states)),
+        rng.uniform(0.5, 4.0, size=(n_steps, n_states)),
+        a0=rng.normal(size=n_states),
+        P0=rng.uniform(0.5, 4.0, size=n_states),
+    )
+
+
+def test_fusion_is_associative():
+    # Precision adds, so regrouping cannot change the result: (A * B) * C == A * (B * C).
+    a, b, c = _random(1), _random(2), _random(3)
+    left = combine_states_priors(combine_states_priors(a, b), c)
+    right = combine_states_priors(a, combine_states_priors(b, c))
+    for name in ("a_obs", "P_obs", "a0", "P0"):
+        np.testing.assert_allclose(left[name].values, right[name].values, rtol=1e-12)
+
+
+def test_fusion_is_associative_across_undisclosed_and_exact_steps():
+    # Regrouping is safe through both degenerate precisions too, as long as the leftmost
+    # operand is unchanged: `inf` contributes nothing and an exact disclosure wins outright.
+    a, b, c = _random(4), _random(5), _random(6)
+    a["P_obs"].values[0, 0] = np.inf
+    b["P_obs"].values[0, 0] = np.inf
+    b["P_obs"].values[1, 1] = 0.0
+    c["P_obs"].values[0, 0] = np.inf
+    c["P_obs"].values[2, 2] = np.inf
+    left = combine_states_priors(combine_states_priors(a, b), c)
+    right = combine_states_priors(a, combine_states_priors(b, c))
+    for name in ("a_obs", "P_obs", "a0", "P0"):
+        np.testing.assert_allclose(left[name].values, right[name].values, rtol=1e-12)
+    # The step every operand left undisclosed is still undisclosed, not NaN.
+    assert np.isinf(left["P_obs"].values[0, 0])
+
+
+def test_operand_order_does_not_change_finite_moments():
+    # With every variance finite the fusion is fully commutative, so all six orderings of a
+    # three-way fold agree; only the non-fused metadata tracks the leftmost operand.
+    priors = [_random(7), _random(8), _random(9)]
+    reference = reduce(combine_states_priors, priors)
+    for ordering in itertools.permutations(priors):
+        out = reduce(combine_states_priors, ordering)
+        for name in ("a_obs", "P_obs", "a0", "P0"):
+            np.testing.assert_allclose(out[name].values, reference[name].values, rtol=1e-11)
+
+
+def test_folding_many_fragments_matches_the_single_pass_closed_form():
+    # N-ary fusion needs no new entry point: `reduce` over the binary op equals the one-pass
+    # closed form summing all N precisions at once.
+    priors = [_random(seed) for seed in range(10, 15)]
+    folded = reduce(combine_states_priors, priors)
+
+    precisions = np.stack([1.0 / p["P_obs"].values for p in priors])
+    means = np.stack([p["a_obs"].values for p in priors])
+    expected_p = 1.0 / precisions.sum(axis=0)
+    expected_a = expected_p * (precisions * means).sum(axis=0)
+
+    np.testing.assert_allclose(folded["P_obs"].values, expected_p, rtol=1e-12)
+    np.testing.assert_allclose(folded["a_obs"].values, expected_a, rtol=1e-12)
+    assert isinstance(folded, SspPrior)
+
+
+def test_fusing_n_identical_priors_divides_the_variance_by_n():
+    # The N-ary analogue of the two-operand halving: N copies of N(a, P) fuse to N(a, P/N).
+    folded = reduce(combine_states_priors, [_simple(3.0, 0.6) for _ in range(4)])
+    np.testing.assert_allclose(folded["a_obs"].values, 3.0)
+    np.testing.assert_allclose(folded["P_obs"].values, 0.15)
