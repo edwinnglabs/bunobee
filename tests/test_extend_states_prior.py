@@ -461,7 +461,7 @@ def test_init_moments_output_is_promotable_to_ssp_prior(extend):
     ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
     out = extend(ds, 0.02)
     validate_prior(out, require_init=True)  # must not raise
-    SspPrior(out)  # must not raise
+    SspPrior(out.to_dataset())  # must not raise -- re-promoting the unwrapped dataset
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
@@ -565,3 +565,48 @@ def test_init_moments_nearest_uses_the_first_anchor():
     out = extend_states_prior_nearest(_prior(a_obs, p_obs), 0.05)
     assert out["a0"].values[0] == pytest.approx(1.0)
     assert out["P0"].values[0] == pytest.approx(0.1 + 3 * 0.05)
+
+
+# --------------------------------------------------------------------------- #
+# The extensions return an SspPrior and take one interchangeably with a Dataset #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_extension_returns_an_ssp_prior(extend):
+    # The complete-prior contract is now carried by the return type, not just
+    # asserted on the way out.
+    ds = _multi_state_multi_anchor()
+    out = extend(ds, np.array([0.02, 0.01, 0.02, 0.05]))
+
+    assert isinstance(out, SspPrior)
+    assert isinstance(out.to_dataset(), xr.Dataset)
+    validate_prior(out.to_dataset(), require_init=True)  # must not raise
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_extension_accepts_an_ssp_prior_with_identical_results(extend):
+    # Re-extending an already-complete prior is a fixed, deterministic call: the
+    # wrapper and its dataset must drive it to exactly the same output.
+    ds = _multi_state_multi_anchor()
+    q = np.array([0.02, 0.01, 0.02, 0.05])
+    complete = extend(ds, q)  # an SspPrior, hence a valid input for both forms
+
+    from_wrapper = extend(complete, q)
+    from_dataset = extend(complete.to_dataset(), q)
+
+    assert isinstance(from_wrapper, SspPrior)
+    xr.testing.assert_identical(from_wrapper.to_dataset(), from_dataset.to_dataset())
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_extension_does_not_mutate_a_wrapped_input(extend):
+    ds = _multi_anchor()
+    complete = extend(ds, 0.02)
+    before_a = complete["a_obs"].values.copy()
+    before_p = complete["P_obs"].values.copy()
+
+    extend(complete, 0.02)
+
+    assert np.array_equal(complete["a_obs"].values, before_a)
+    assert np.array_equal(complete["P_obs"].values, before_p, equal_nan=True)

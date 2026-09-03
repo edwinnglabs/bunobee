@@ -7,7 +7,7 @@ import numpy as np
 import xarray as xr
 
 from bunobee.models.ssp.kalman_1d import kalman_filter_1d, kalman_rts_smoother_1d
-from bunobee.models.ssp.transforms import validate_prior
+from bunobee.models.ssp.transforms import _unwrap, validate_prior
 
 REQUIRED_COORDS: tuple[str, ...] = ("time", "state")
 
@@ -26,6 +26,12 @@ class SspPrior:
     data vars, coords, or attrs (``sdy``,
     ``sigma_q_loc_prior``, ...) are unrestricted and pass through unchanged.
 
+    Read access is a thin facade over the wrapped dataset: ``prior["a0"]``,
+    ``prior.sizes``, ``"time" in prior``, ``len(prior)``, and iteration all
+    behave exactly as they do on the dataset itself. Every public
+    prior-consuming function accepts the wrapper and a bare ``xr.Dataset``
+    interchangeably, so promoting a prior is never forced on a caller.
+
     Parameters
     ----------
     dataset : xr.Dataset
@@ -37,12 +43,69 @@ class SspPrior:
         If ``dataset`` violates the SSP prior contract, is missing
         ``a_obs`` / ``P_obs``, or is missing the ``time`` / ``state``
         coordinates.
+
+    Notes
+    -----
+    Two limits are known and deliberately not papered over.
+
+    ``xr.merge`` rejects the wrapper outright, raising ``TypeError: objects
+    must be an iterable containing only ... Dataset(s), DataArray(s), and
+    dictionaries``. Merging is the usual construction idiom -- ``prior_ds =
+    xr.merge([base_prior, states_prior])`` -- so a *wrapped* prior must be
+    unwrapped with :meth:`to_dataset` before it can take part in one.
+
+    The wrapper does not survive xarray operations. ``.copy()``, ``.sel()``,
+    ``.isel()``, ``.assign()``, and netCDF / zarr round-trips all return a bare
+    ``xr.Dataset``, silently and without error. The invariant therefore holds
+    **at function boundaries only**: :class:`SspPrior` is a checkpoint that a
+    dataset was valid when it was promoted, not a durable guarantee that
+    everything derived from it still is. Re-promote with
+    :meth:`from_dataset` after any such operation to re-check the contract.
     """
 
     dataset: xr.Dataset
 
     def __post_init__(self) -> None:
         _validate(self.dataset)
+
+    @classmethod
+    def from_dataset(cls, dataset: xr.Dataset) -> SspPrior:
+        """Promote an ``xr.Dataset`` to a validated :class:`SspPrior`.
+
+        Named alternative to the constructor, for readability at the call site
+        and for re-checking a dataset that fell out of the wrapper through an
+        xarray operation (see the class Notes).
+
+        Parameters
+        ----------
+        dataset : xr.Dataset
+            Prior dataset satisfying the SSP prior schema.
+
+        Returns
+        -------
+        SspPrior
+            Wrapper around ``dataset``, validated at construction.
+
+        Raises
+        ------
+        ValueError
+            If ``dataset`` violates the complete SSP prior contract.
+        """
+        return cls(dataset=dataset)
+
+    def to_dataset(self) -> xr.Dataset:
+        """Return the wrapped ``xr.Dataset``.
+
+        The inverse of :meth:`from_dataset`, and the escape hatch for the
+        xarray APIs that reject the wrapper -- ``xr.merge`` above all (see the
+        class Notes). ``SspPrior.from_dataset(prior.to_dataset()) == prior``.
+
+        Returns
+        -------
+        xr.Dataset
+            The underlying dataset, not a copy.
+        """
+        return self.dataset
 
     @property
     def a0(self) -> xr.DataArray:
@@ -77,10 +140,22 @@ class SspPrior:
             raise AttributeError(name)
         return getattr(self.dataset, name)
 
+    def __contains__(self, key: object) -> bool:
+        """Delegate membership to the dataset, so coords count as present.
+
+        ``xr.Dataset.__contains__`` tests every variable, coordinates
+        included, while ``__iter__`` yields data-var names only. Without this
+        method ``in`` would fall back to iteration and ``"time" in prior``
+        would be ``False`` where ``"time" in prior.dataset`` is ``True``.
+        """
+        return key in self.dataset
+
     def __iter__(self):
+        """Iterate the dataset's data-var names, as ``xr.Dataset`` does."""
         return iter(self.dataset)
 
     def __len__(self) -> int:
+        """Return ``len(dataset)`` -- the number of data vars, as xarray counts them."""
         return len(self.dataset)
 
 
@@ -138,6 +213,7 @@ def disclosed_idx(ssp_prior: xr.Dataset | SspPrior) -> np.ndarray:
     KeyError
         If ``ssp_priors`` has no ``P_obs`` variable.
     """
+    ssp_prior = _unwrap(ssp_prior)
     if "P_obs" not in ssp_prior:
         raise KeyError("ssp_priors has no `P_obs`; cannot derive disclosure indices")
     p_obs = np.asarray(ssp_prior["P_obs"].values)
@@ -175,11 +251,11 @@ def _write_init_moments(
 
 
 def extend_states_prior_nearest(
-    ssp_priors: xr.Dataset,
+    ssp_priors: xr.Dataset | SspPrior,
     Q: float | np.ndarray,
     *,
     overwrite_init: bool = False,
-) -> xr.Dataset:
+) -> SspPrior:
     r"""Extend disclosed anchors along the nearest-anchor random-walk marginal.
 
     :func:`~bunobee.simulation.ssp.construct_states_prior` discloses anchors at a handful of timesteps
@@ -226,7 +302,7 @@ def extend_states_prior_nearest(
 
     Parameters
     ----------
-    ssp_priors : xr.Dataset
+    ssp_priors : xr.Dataset or SspPrior
         Disclosed prior as produced by
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying
         ``a_obs`` and ``P_obs`` over dims ``(time, state)``.  All other
@@ -245,22 +321,26 @@ def extend_states_prior_nearest(
 
     Returns
     -------
-    xr.Dataset
+    SspPrior
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored
         state's undisclosed steps filled by the nearest-anchor random-walk
         marginal, plus ``a0`` / ``P0`` over ``(state,)`` from the same marginal
-        at ``t = -1`` wherever the input did not already carry them.  Passes
-        :func:`validate_prior` with ``require_init=True``,
-        so it can be promoted to an :class:`SspPrior` — though a ``P0 = inf``
-        column (an unanchored state) would need handling before the a-space
-        transforms could consume it.
+        at ``t = -1`` wherever the input did not already carry them, promoted
+        to an :class:`SspPrior` — the output satisfies the complete-prior
+        contract by construction.  A ``P0 = inf`` column (an unanchored state)
+        still needs handling before the a-space transforms can consume it.
+        Reach the plain dataset with :meth:`SspPrior.to_dataset` when an
+        xarray API needs it.
 
     Raises
     ------
     ValueError
-        If ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block, or
-        ``Q`` is negative, ``NaN``, or has the wrong length.
+        If ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block, is
+        missing the ``time`` / ``state`` coordinates the :class:`SspPrior`
+        contract requires, or ``Q`` is negative, ``NaN``, or has the wrong
+        length.
     """
+    ssp_priors = _unwrap(ssp_priors)
     if "a_obs" not in ssp_priors or "P_obs" not in ssp_priors:
         raise ValueError("ssp_priors must contain `a_obs` and `P_obs` to extend the prior")
 
@@ -307,17 +387,16 @@ def extend_states_prior_nearest(
     out["a_obs"] = (("time", "state"), a_obs)
     out["P_obs"] = (("time", "state"), p_obs)
     _write_init_moments(out, a_init, P_init, overwrite_init)
-    validate_prior(out, require_init=True)
-    return out
+    return SspPrior(out)
 
 
 def extend_states_prior_smoothed(
-    ssp_priors: xr.Dataset,
+    ssp_priors: xr.Dataset | SspPrior,
     Q: float | np.ndarray,
     P0_diffuse: float = 1e8,
     *,
     overwrite_init: bool = False,
-) -> xr.Dataset:
+) -> SspPrior:
     r"""Extend disclosed anchors via an exact KF-forward + RTS-backward smoother.
 
     Like :func:`extend_states_prior_nearest`, this fills every undisclosed step of an
@@ -365,7 +444,7 @@ def extend_states_prior_smoothed(
 
     Parameters
     ----------
-    ssp_priors : xr.Dataset
+    ssp_priors : xr.Dataset or SspPrior
         Disclosed prior as produced by
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying ``a_obs`` and
         ``P_obs`` over dims ``(time, state)``.  All other variables (``positivity``, any
@@ -385,21 +464,24 @@ def extend_states_prior_smoothed(
 
     Returns
     -------
-    xr.Dataset
+    SspPrior
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored state's
         undisclosed steps filled by the exact smoother marginal, plus ``a0`` / ``P0``
-        over ``(state,)`` from the same marginal at ``t = -1`` wherever the input did not
-        already carry them.  Passes
-        :func:`validate_prior` with ``require_init=True``, so it can be promoted to an
-        :class:`SspPrior` — though a ``P0 = inf`` column (an unanchored state) would need
-        handling before the a-space transforms could consume it.
+        over ``(state,)`` from the same marginal at ``t = -1`` wherever the input did
+        not already carry them, promoted to an :class:`SspPrior` — the output satisfies
+        the complete-prior contract by construction.  A ``P0 = inf`` column (an
+        unanchored state) still needs handling before the a-space transforms can consume
+        it.  Reach the plain dataset with :meth:`SspPrior.to_dataset` when an xarray API
+        needs it.
 
     Raises
     ------
     ValueError
-        If ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block, or ``Q`` is
-        negative, ``NaN``, or has the wrong length.
+        If ``ssp_priors`` lacks the ``a_obs`` / ``P_obs`` disclosure block, is missing the
+        ``time`` / ``state`` coordinates the :class:`SspPrior` contract requires, or ``Q``
+        is negative, ``NaN``, or has the wrong length.
     """
+    ssp_priors = _unwrap(ssp_priors)
     if "a_obs" not in ssp_priors or "P_obs" not in ssp_priors:
         raise ValueError("ssp_priors must contain `a_obs` and `P_obs` to extend the prior")
 
@@ -455,5 +537,4 @@ def extend_states_prior_smoothed(
     out["a_obs"] = (("time", "state"), a_out)
     out["P_obs"] = (("time", "state"), p_out)
     _write_init_moments(out, a_init, P_init, overwrite_init)
-    validate_prior(out, require_init=True)
-    return out
+    return SspPrior(out)
