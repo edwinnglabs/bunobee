@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `SspPrior` is now load-bearing across the SSP prior API. `extend_states_prior_nearest` and
+  `extend_states_prior_smoothed` return an `SspPrior` instead of a bare `xr.Dataset` (values
+  unchanged), and `validate_prior`, `disclosed_idx`, `transform_to_ekf`, and
+  `transform_to_ekf_st` accept an `SspPrior` and an `xr.Dataset` interchangeably. The a-space
+  transform outputs stay plain `xr.Dataset`s, as does `construct_states_prior`.
+- `SspPrior.__contains__` now delegates to the wrapped dataset, so `"time" in prior` matches
+  `"time" in prior.dataset` for coordinates as well as data vars (it previously fell back to
+  iteration, which yields data-var names only). Added `SspPrior.from_dataset` /
+  `SspPrior.to_dataset`, and documented the wrapper's two limits: `xr.merge` rejects it, and no
+  xarray operation preserves it — the invariant holds at function boundaries only.
 - Renamed `extend_states_prior` to `extend_states_prior_nearest` so the nearest-anchor
   heuristic and the new `extend_states_prior_smoothed` are self-describing.
 - Both prior extensions now extend one step backward to `t = -1` and emit the initial-state

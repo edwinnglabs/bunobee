@@ -46,11 +46,14 @@ Two public entry points target the two EKF filters:
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle broken at runtime, see _unwrap
+    from bunobee.models.ssp.prior import SspPrior
 
 logger = logging.getLogger("bunobee")
 
@@ -70,7 +73,36 @@ def _validate_match(match: str) -> None:
         raise ValueError(f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}")
 
 
-def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True, require_sigma_q: bool = False) -> None:
+def _unwrap(ssp_priors: xr.Dataset | SspPrior) -> xr.Dataset:
+    """Return the plain ``xr.Dataset`` behind a prior argument.
+
+    Single adapter that lets every prior-consuming function accept an
+    ``xr.Dataset`` and an :class:`~bunobee.models.ssp.prior.SspPrior`
+    interchangeably: the wrapper is reduced to its ``dataset`` field and a bare
+    dataset is passed straight through, so the body below only ever sees an
+    ``xr.Dataset``. The :class:`~bunobee.models.ssp.prior.SspPrior` import is
+    deferred to call time because ``prior`` imports this module -- a
+    module-level import would be circular.
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset or SspPrior
+        Prior in either representation.
+
+    Returns
+    -------
+    xr.Dataset
+        ``ssp_priors.dataset`` for an :class:`~bunobee.models.ssp.prior.SspPrior`,
+        otherwise ``ssp_priors`` unchanged.
+    """
+    from bunobee.models.ssp.prior import SspPrior
+
+    return ssp_priors.dataset if isinstance(ssp_priors, SspPrior) else ssp_priors
+
+
+def validate_prior(
+    ssp_priors: xr.Dataset | SspPrior, *, require_init: bool = True, require_sigma_q: bool = False
+) -> None:
     """Validate a time-point prior ``xr.Dataset`` against the SSP contract.
 
     Single source of truth for the prior's required variables, dims, and the
@@ -79,7 +111,7 @@ def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True, require
 
     Parameters
     ----------
-    ssp_priors : xr.Dataset
+    ssp_priors : xr.Dataset or SspPrior
         Candidate prior dataset. Always required: ``positivity`` — a boolean
         mask over dims ``(state,)`` marking positivity-constrained states.
         When ``require_init`` is ``True`` (the transform contract), ``a0`` and
@@ -113,6 +145,7 @@ def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True, require
         ``require_sigma_q`` is ``True`` — a variable that family requires is
         missing.
     """
+    ssp_priors = _unwrap(ssp_priors)
     required = ("a0", "P0", "positivity") if require_init else ("positivity",)
     for name in required:
         if name not in ssp_priors:
@@ -224,7 +257,7 @@ def _transform_obs_block(
 
 
 def transform_to_ekf(
-    ssp_priors: xr.Dataset,
+    ssp_priors: xr.Dataset | SspPrior,
     exponent: float = 0.5,
     match: MatchMode = "mean",
 ) -> xr.Dataset:
@@ -242,7 +275,7 @@ def transform_to_ekf(
 
     Parameters
     ----------
-    ssp_priors : xr.Dataset
+    ssp_priors : xr.Dataset or SspPrior
         Required: ``a0`` ``(state,)``, ``P0`` ``(state,)`` diagonal,
         ``positivity`` ``(state,)`` boolean, and the ``sigma_q`` block
         for the chosen family (see :func:`transform_to_ekf_st` for the
@@ -261,7 +294,11 @@ def transform_to_ekf(
     xr.Dataset
         a-space prior dataset with ``P0`` dims ``(state,)``. Dimensions,
         coordinates, and ``attrs["sigma_q_family"]`` are preserved;
-        ``attrs["match"]`` records the mode used.
+        ``attrs["match"]`` records the mode used. Always a plain
+        ``xr.Dataset``, never an :class:`~bunobee.models.ssp.prior.SspPrior`,
+        even when the input was one: the a-space output shares the prior schema
+        but not its semantics (``x = exp(k * a)``), and the two spaces are not
+        distinguishable by type today.
 
     Raises
     ------
@@ -270,6 +307,7 @@ def transform_to_ekf(
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
+    ssp_priors = _unwrap(ssp_priors)
     validate_prior(ssp_priors, require_sigma_q=True)
     _validate_match(match)
 
@@ -307,7 +345,7 @@ def transform_to_ekf(
 
 
 def transform_to_ekf_st(
-    ssp_priors: xr.Dataset,
+    ssp_priors: xr.Dataset | SspPrior,
     exponent: float = 0.5,
     match: MatchMode = "mean",
 ) -> xr.Dataset:
@@ -336,7 +374,7 @@ def transform_to_ekf_st(
 
     Parameters
     ----------
-    ssp_priors : xr.Dataset
+    ssp_priors : xr.Dataset or SspPrior
         Required: ``a0`` ``(state,)``, ``P0`` ``(state, state_dual)`` full
         covariance, ``positivity`` ``(state,)`` boolean, and the
         ``sigma_q`` block for the chosen family.
@@ -374,7 +412,9 @@ def transform_to_ekf_st(
     xr.Dataset
         a-space prior dataset with ``P0`` dims ``(state, state_dual)``,
         symmetrised. Dimensions, coordinates, and ``attrs["sigma_q_family"]``
-        are preserved; ``attrs["match"]`` records the mode used.
+        are preserved; ``attrs["match"]`` records the mode used. Always a plain
+        ``xr.Dataset``, never an :class:`~bunobee.models.ssp.prior.SspPrior`
+        -- see :func:`transform_to_ekf` for why.
 
     Raises
     ------
@@ -383,6 +423,7 @@ def transform_to_ekf_st(
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
+    ssp_priors = _unwrap(ssp_priors)
     validate_prior(ssp_priors, require_sigma_q=True)
     _validate_match(match)
 
