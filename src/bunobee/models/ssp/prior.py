@@ -538,3 +538,223 @@ def extend_states_prior_smoothed(
     out["P_obs"] = (("time", "state"), p_out)
     _write_init_moments(out, a_init, P_init, overwrite_init)
     return SspPrior(out)
+
+
+def _fuse_moments(
+    a_left: np.ndarray,
+    P_left: np.ndarray,
+    a_right: np.ndarray,
+    P_right: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    r"""Inverse-variance fuse two independent Gaussian moment arrays elementwise.
+
+    Implements :math:`P = (P_1^{-1} + P_2^{-1})^{-1}` and
+    :math:`a = P\,(P_1^{-1} a_1 + P_2^{-1} a_2)` over broadcast-compatible arrays, with the
+    two degenerate precisions handled explicitly rather than left to produce ``NaN``:
+
+    * ``P = inf`` (undisclosed) is zero precision, so it drops out of the sum and the other
+      operand passes through untouched. When **both** operands are ``inf`` the precision sum
+      is ``0`` and the weighted mean would be ``0 / 0``; the entry keeps the left operand's
+      mean and stays ``inf``, so an undisclosed step fused with an undisclosed step is still
+      undisclosed.
+    * ``P = 0`` (an exact disclosure) is infinite precision, so the weighted mean would be
+      ``inf / inf``. The delta wins outright; the left operand breaks a tie between two.
+
+    Parameters
+    ----------
+    a_left, a_right : np.ndarray
+        Means of the two independent Gaussians.
+    P_left, P_right : np.ndarray
+        Variances of the two independent Gaussians; ``inf`` marks an undisclosed entry.
+
+    Returns
+    -------
+    tuple of np.ndarray
+        ``(a, P)`` — the fused mean and variance, same shape as the broadcast inputs.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prec_left = np.where(np.isfinite(P_left), 1.0 / P_left, 0.0)
+        prec_right = np.where(np.isfinite(P_right), 1.0 / P_right, 0.0)
+        prec = prec_left + prec_right
+        P = np.where(prec > 0.0, 1.0 / prec, np.inf)
+        a = np.where(prec > 0.0, (prec_left * a_left + prec_right * a_right) / prec, a_left)
+
+    exact_left = P_left == 0.0
+    exact_right = P_right == 0.0
+    a = np.where(exact_right & ~exact_left, a_right, a)
+    a = np.where(exact_left, a_left, a)
+    return np.asarray(a, dtype=float), np.asarray(P, dtype=float)
+
+
+def _check_diagonal_P0(ssp_priors: xr.Dataset, label: str) -> None:
+    """Reject a full-covariance ``P0``, which has no elementwise fusion rule.
+
+    Parameters
+    ----------
+    ssp_priors : xr.Dataset
+        Complete prior whose ``P0`` is being checked.
+    label : str
+        Operand name to name in the error message.
+
+    Raises
+    ------
+    ValueError
+        If ``P0`` is not the diagonal ``(state,)`` form.
+    """
+    dims = ssp_priors["P0"].dims
+    if dims != ("state",):
+        raise ValueError(
+            f"combine_states_priors supports diagonal `P0` with dims ('state',) only; "
+            f"{label} has full-covariance `P0` with dims {dims}"
+        )
+
+
+def _check_non_negative(values: np.ndarray, name: str, label: str) -> None:
+    """Reject ``NaN`` or negative variances, which have no precision.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Variance array to check.
+    name : str
+        Variable name to name in the error message.
+    label : str
+        Operand name to name in the error message.
+
+    Raises
+    ------
+    ValueError
+        If any entry is ``NaN`` or negative.
+    """
+    if np.any(np.isnan(values)) or np.any(values < 0):
+        raise ValueError(f"`{name}` on {label} must be non-negative (finite or inf) for every entry")
+
+
+def combine_states_priors(
+    prior_a: xr.Dataset | SspPrior,
+    prior_b: xr.Dataset | SspPrior,
+) -> SspPrior:
+    r"""Fuse two independent states priors over the same states by inverse-variance weighting.
+
+    Two sources of evidence about the same latent states — a vendor study and an internal
+    panel, two separately-extended anchor sets — are combined here into one prior.  For
+    independent Gaussian evidence the fusion is exact and closed-form, the product of the two
+    densities renormalised:
+
+    .. math::
+
+        P = \left(P_1^{-1} + P_2^{-1}\right)^{-1}, \qquad
+        a = P\left(P_1^{-1} a_1 + P_2^{-1} a_2\right).
+
+    Precision adds, so the fused variance is never wider than either input: two identical
+    ``N(a, P)`` priors fuse to ``N(a, P/2)``, and a tight prior dominates a loose one.  The
+    rule is applied elementwise to ``a_obs`` / ``P_obs`` over ``(time, state)`` and to
+    ``a0`` / ``P0`` over ``(state,)``.
+
+    **Undisclosed steps.** ``P_obs = inf`` is zero precision, so it drops out of the sum and
+    the other prior passes through unchanged — fusing any prior with a fully-undisclosed one
+    returns the first prior's moments.  Where *both* operands are ``inf`` the naive weighted
+    mean is ``0 / 0``; the step is kept undisclosed at ``(a, P) = (a_1, inf)`` instead of
+    going ``NaN``.
+
+    **What is fused, and what is not.** Only the four moment variables above are fused.
+    ``positivity`` is not a moment and must be *identical* on both operands — fusing a
+    positivity-constrained state with a linear one is undefined.  Everything else has no
+    fusion rule at all (what would the fused ``sdy`` of two studies be?), so ``sdy``, the
+    ``sigma_q`` hyperprior block, any other data vars, non-dimension coords, and ``attrs``
+    are **taken from the left operand** (``prior_a``) and ``prior_b``'s copies are dropped.
+    Order the arguments accordingly when the two carry different metadata.
+
+    **Scale.** Fusion is defined on whatever scale the priors are written in, and the EKF
+    a-space map is nonlinear, so fusing then transforming is *not* the same as transforming
+    then fusing.  Fuse natural-scale priors first, then call
+    :func:`~bunobee.models.ssp.transforms.transform_to_ekf` on the result.
+
+    Parameters
+    ----------
+    prior_a : xr.Dataset or SspPrior
+        Left operand: a complete prior carrying ``a0`` / ``P0`` over ``(state,)``,
+        ``a_obs`` / ``P_obs`` over ``(time, state)``, and ``positivity``.  Supplies every
+        non-fused variable, coord, and attr of the result.
+    prior_b : xr.Dataset or SspPrior
+        Right operand, on exactly the same ``time`` / ``state`` coordinates and with the
+        same ``positivity`` mask.  Only its moments contribute.
+
+    Returns
+    -------
+    SspPrior
+        Copy of ``prior_a`` whose ``a0`` / ``P0`` / ``a_obs`` / ``P_obs`` are the
+        inverse-variance fusion of the two operands, promoted to an :class:`SspPrior` — the
+        output satisfies the complete-prior contract by construction.  Reach the plain
+        dataset with :meth:`SspPrior.to_dataset` when an xarray API needs it.
+
+    Raises
+    ------
+    ValueError
+        If either operand violates the complete-prior contract; if the ``time`` or ``state``
+        coordinates differ; if the ``positivity`` masks differ; if either ``P0`` is the full
+        ``(state, state_dual)`` covariance rather than the diagonal ``(state,)`` form; or if
+        either variance array holds a ``NaN`` or negative entry.
+
+    See Also
+    --------
+    extend_states_prior_nearest : Fill one prior's undisclosed steps from its nearest anchor.
+    extend_states_prior_smoothed : Fill one prior's undisclosed steps with the exact marginal.
+
+    Notes
+    -----
+    **The independence assumption is load-bearing.** Inverse-variance fusion is the exact
+    posterior only when the two priors carry *disjoint* evidence.  Two priors extended from
+    overlapping anchors — or two extensions of the same anchor set under different ``Q`` —
+    share information, and fusing them counts that shared evidence twice, yielding a prior
+    that is too confident (``P`` too small) and whose mean is pulled toward the duplicated
+    source.  Nothing here can detect the overlap; it is the caller's to rule out.
+
+    **This is fusion, not a mixture.** Fusion multiplies the two densities and the variance
+    *shrinks*.  A mixture ``w N(a_1, P_1) + (1 - w) N(a_2, P_2)`` averages them and the
+    variance *grows* by ``w (1 - w) (a_1 - a_2)^2``, which is what you want for genuine
+    disagreement between two sources rather than complementary evidence about one truth.
+    A mixture helper is deliberately out of scope here.
+
+    Coordinates are compared, never aligned.  xarray's implicit alignment would quietly
+    intersect mismatched ``time`` axes and fill ``NaN``; a mismatch raises instead.
+    """
+    ds_a = _unwrap(prior_a)
+    ds_b = _unwrap(prior_b)
+
+    for label, ds in (("prior_a", ds_a), ("prior_b", ds_b)):
+        try:
+            _validate(ds)
+        except ValueError as exc:
+            raise ValueError(f"{label} is not a complete SSP prior: {exc}") from exc
+        _check_diagonal_P0(ds, label)
+
+    for coord in REQUIRED_COORDS:
+        if not np.array_equal(ds_a[coord].values, ds_b[coord].values):
+            raise ValueError(
+                f"prior_a and prior_b must share identical `{coord}` coordinates to be fused; "
+                f"got sizes {ds_a.sizes[coord]} and {ds_b.sizes[coord]} with differing values"
+            )
+
+    if not np.array_equal(ds_a["positivity"].values, ds_b["positivity"].values):
+        raise ValueError("prior_a and prior_b must share an identical `positivity` mask to be fused")
+
+    moments = {}
+    for name in ("a_obs", "P_obs", "a0", "P0"):
+        moments[name] = (
+            np.array(ds_a[name].values, dtype=float),
+            np.array(ds_b[name].values, dtype=float),
+        )
+    for name in ("P_obs", "P0"):
+        for label, values in zip(("prior_a", "prior_b"), moments[name]):
+            _check_non_negative(values, name, label)
+
+    a_obs, p_obs = _fuse_moments(moments["a_obs"][0], moments["P_obs"][0], moments["a_obs"][1], moments["P_obs"][1])
+    a0, P0 = _fuse_moments(moments["a0"][0], moments["P0"][0], moments["a0"][1], moments["P0"][1])
+
+    out = ds_a.copy()
+    out["a_obs"] = (("time", "state"), a_obs)
+    out["P_obs"] = (("time", "state"), p_obs)
+    out["a0"] = (("state",), a0)
+    out["P0"] = (("state",), P0)
+    return SspPrior(out)

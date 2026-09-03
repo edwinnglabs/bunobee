@@ -5,6 +5,7 @@ from bunobee.models.ssp.plotting import plot_prior_density, plot_prior_heatmap, 
 from bunobee.models.ssp.posterior import a_to_lam, lam_to_a
 from bunobee.models.ssp.prior import (
     SspPrior,
+    combine_states_priors,
     disclosed_idx,
     extend_states_prior_nearest,
     extend_states_prior_smoothed,
@@ -15,6 +16,7 @@ __all__ = [
     "SspPrior",
     "a_to_lam",
     "build_forecast_design",
+    "combine_states_priors",
     "disclosed_idx",
     "extend_states_prior_nearest",
     "extend_states_prior_smoothed",
