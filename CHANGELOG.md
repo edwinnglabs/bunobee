@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Renamed `extend_states_prior` to `extend_states_prior_nearest` so the nearest-anchor
   heuristic and the new `extend_states_prior_smoothed` are self-describing.
+- Both prior extensions now extend one step backward to `t = -1` and emit the initial-state
+  moments `a0` / `P0` over dims `(state,)`, so their output satisfies the complete-prior
+  contract and can be promoted to an `SspPrior`. The `(time, state)` rectangle keeps its
+  shape. Unanchored states get `a0 = 0`, `P0 = inf`; an `a0` / `P0` already present on the
+  input is overwritten rather than passed through.
 
 ## [v0.0.4]
 
