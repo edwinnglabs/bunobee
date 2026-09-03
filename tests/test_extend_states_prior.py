@@ -6,6 +6,7 @@ import pytest
 import xarray as xr
 
 from bunobee.models.ssp.prior import (
+    SspPrior,
     disclosed_idx,
     extend_states_prior_nearest,
     extend_states_prior_smoothed,
@@ -391,3 +392,122 @@ def test_smoothed_missing_obs_block_raises():
     )
     with pytest.raises(ValueError, match="a_obs.*P_obs"):
         extend_states_prior_smoothed(ds, 0.02)
+
+
+# --------------------------------------------------------------------------- #
+# a0 / P0: the same marginal extended one step backward, to t = -1             #
+# --------------------------------------------------------------------------- #
+
+_EXTENSIONS = (extend_states_prior_nearest, extend_states_prior_smoothed)
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_have_state_dims_and_rectangle_is_unchanged_in_shape(extend):
+    # a0 / P0 come back over (state,) while the (time, state) rectangle keeps its shape.
+    ds = _multi_state_multi_anchor()
+    out = extend(ds, np.array([0.02, 0.01, 0.02, 0.05]))
+
+    n_steps, n_states = ds.sizes["time"], ds.sizes["state"]
+    assert out["a0"].dims == ("state",)
+    assert out["P0"].dims == ("state",)
+    assert out["a0"].shape == (n_states,)
+    assert out["P0"].shape == (n_states,)
+    assert out["a_obs"].shape == (n_steps, n_states)
+    assert out["P_obs"].shape == (n_steps, n_states)
+    assert out.sizes["time"] == n_steps
+
+
+@pytest.mark.parametrize("t_star", [0, 3, 12, 24])
+def test_init_moments_agree_on_single_anchor_closed_form(t_star):
+    # Both extensions evaluate the driftless random-walk marginal at t = -1, so
+    # a0 = a* and P0 = P* + (t* + 1).Q -- the smoother to the diffuse-prior floor.
+    a_star, p_star, q = 0.6, 0.03, 0.02
+    ds = _single_anchor(n_steps=25, t_star=t_star, a_star=a_star, p_star=p_star)
+    nearest = extend_states_prior_nearest(ds, q)
+    smoothed = extend_states_prior_smoothed(ds, q)
+
+    expected_p0 = p_star + (t_star + 1) * q
+    assert nearest["a0"].values[0] == pytest.approx(a_star)
+    assert nearest["P0"].values[0] == pytest.approx(expected_p0)
+    assert smoothed["a0"].values[0] == pytest.approx(a_star, abs=1e-6)
+    assert smoothed["P0"].values[0] == pytest.approx(expected_p0, abs=1e-6)
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_unanchored_state_is_uninformed(extend):
+    # An unanchored column carries no information back to t = -1 either:
+    # a0 = 0, P0 = inf, matching how P_obs already encodes "no information".
+    ds = _multi_state_multi_anchor()  # s0 is the unanchored column
+    out = extend(ds, np.array([0.02, 0.01, 0.02, 0.05]))
+
+    assert out["a0"].values[0] == 0.0
+    assert np.isinf(out["P0"].values[0])
+    assert np.all(np.isfinite(out["P0"].values[1:]))
+
+
+def test_init_moments_smoothed_p0_tighter_on_multi_anchor():
+    # Fusing every anchor is never less informative than picking the nearest one,
+    # at t = -1 just as at every disclosed step.
+    ds = _multi_anchor()
+    q = 0.02
+    nearest = extend_states_prior_nearest(ds, q)
+    smoothed = extend_states_prior_smoothed(ds, q)
+    assert smoothed["P0"].values[0] <= nearest["P0"].values[0] + 1e-9
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_output_is_promotable_to_ssp_prior(extend):
+    # With a0 / P0 present the output satisfies the complete-prior contract.
+    ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
+    out = extend(ds, 0.02)
+    validate_prior(out, require_init=True)  # must not raise
+    SspPrior(out)  # must not raise
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_overwrite_any_input_a0_p0(extend):
+    # Documented consequence: an a0 / P0 already on the input is replaced.
+    ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
+    ds["a0"] = (("state",), np.array([99.0]))
+    ds["P0"] = (("state",), np.array([99.0]))
+    out = extend(ds, 0.02)
+
+    assert out["a0"].values[0] == pytest.approx(0.5, abs=1e-6)
+    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-6)
+    # and the input itself is untouched
+    assert ds["a0"].values[0] == 99.0
+    assert ds["P0"].values[0] == 99.0
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_preserve_passthrough_vars_coords_and_attrs(extend):
+    # Adding a0 / P0 disturbs nothing else on the dataset.
+    ds = _multi_state_multi_anchor()
+    ds["positivity"] = (("state",), np.array([False, True, False, True]))
+    ds["sdy"] = ((), 2.5)
+    ds.attrs["sigma_q_family"] = "beta"
+    out = extend(ds, np.array([0.02, 0.01, 0.02, 0.05]))
+
+    assert np.array_equal(out["positivity"].values, ds["positivity"].values)
+    assert out["sdy"].values == ds["sdy"].values
+    assert out.attrs == ds.attrs
+    assert np.array_equal(out["time"].values, ds["time"].values)
+    assert np.array_equal(out["state"].values, ds["state"].values)
+
+
+def test_init_moments_nearest_q_inf_leaves_p0_uninformed():
+    # Q -> inf carries nothing back past the first anchor: P0 stays inf.
+    ds = _single_anchor(n_steps=8, t_star=2, a_star=3.0, p_star=0.25)
+    out = extend_states_prior_nearest(ds, np.inf)
+    assert np.isinf(out["P0"].values[0])
+
+
+def test_init_moments_nearest_uses_the_first_anchor():
+    # The nearest anchor to t = -1 is always the earliest one.
+    a_obs = np.zeros((11, 1))
+    p_obs = np.full((11, 1), np.inf)
+    a_obs[2, 0], p_obs[2, 0] = 1.0, 0.1
+    a_obs[8, 0], p_obs[8, 0] = 3.0, 0.1
+    out = extend_states_prior_nearest(_prior(a_obs, p_obs), 0.05)
+    assert out["a0"].values[0] == pytest.approx(1.0)
+    assert out["P0"].values[0] == pytest.approx(0.1 + 3 * 0.05)

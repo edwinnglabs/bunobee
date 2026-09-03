@@ -169,6 +169,14 @@ def extend_states_prior_nearest(
     the per-state process variance ``σ_q²``.  States with no disclosed anchor
     are left fully undisclosed (``P_obs`` stays ``inf``).
 
+    The same marginal is evaluated one step *before* the series at ``t = -1`` and
+    returned as the initial-state moments ``a0`` / ``P0`` over dims ``(state,)``.
+    The nearest anchor to ``t = -1`` is always the *first* one, so in closed form
+    ``a0 = a*`` and ``P0 = P* + (t* + 1)·Q``; an unanchored state gets
+    ``a0 = 0``, ``P0 = inf``, the same "no information" encoding ``P_obs``
+    already uses.  The ``(time, state)`` rectangle keeps its shape — ``time``
+    stays length ``T`` — so nothing that indexes by step is disturbed.
+
     This is the exact marginal only for an isolated channel; treat the result as
     a prior fed into the augmented-measurement step, not a final posterior.
 
@@ -184,21 +192,26 @@ def extend_states_prior_nearest(
         Disclosed prior as produced by
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying
         ``a_obs`` and ``P_obs`` over dims ``(time, state)``.  All other
-        variables (``positivity``, any ``a0`` / ``P0`` or ``sigma_q`` block, and
-        attrs) are passed through unchanged.
+        variables (``positivity``, any ``sigma_q`` block, and attrs) are passed
+        through unchanged; an ``a0`` / ``P0`` already present is **overwritten**
+        by the backward-extended moments.
     Q : float or np.ndarray
         Per-state process variance ``σ_q²``.  A scalar is broadcast to every
         state; an array must have length ``n_states``.  Must be finite-or-``inf``
         and non-negative.  ``Q → inf`` recovers the un-extended prior (only the
-        original anchors stay informed), while ``Q → 0`` holds each anchor's
-        variance flat across its region.
+        original anchors stay informed, and ``P0`` stays ``inf``), while
+        ``Q → 0`` holds each anchor's variance flat across its region.
 
     Returns
     -------
     xr.Dataset
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored
         state's undisclosed steps filled by the nearest-anchor random-walk
-        marginal.  Passes :func:`validate_prior` with ``require_init=False``.
+        marginal, plus ``a0`` / ``P0`` over ``(state,)`` from the same marginal
+        at ``t = -1``.  Passes :func:`validate_prior` with ``require_init=True``,
+        so it can be promoted to an :class:`SspPrior` — though a ``P0 = inf``
+        column (an unanchored state) would need handling before the a-space
+        transforms could consume it.
 
     Raises
     ------
@@ -217,33 +230,43 @@ def extend_states_prior_nearest(
     if np.any(np.isnan(q_vec)) or np.any(q_vec < 0):
         raise ValueError("Q must be non-negative (finite or inf) for every state")
 
-    tgrid = np.arange(n_steps)
+    # Row 0 of the grid is t = -1, the initial-state step: the same marginal one
+    # step before the series, which becomes (a0, P0).  Rows 1: are the rectangle.
+    tgrid = np.arange(-1, n_steps)
+    rows = np.arange(tgrid.size)
+    a_init = np.zeros(n_states)
+    P_init = np.full(n_states, np.inf)
+
     for s in range(n_states):
         anchor_t = np.where(np.isfinite(p_obs[:, s]))[0]
         if anchor_t.size == 0:
-            continue  # no anchor -> state stays fully undisclosed (inf)
+            continue  # no anchor -> state stays undisclosed (inf) at every step, a0 = 0 / P0 = inf
 
         anchor_a = a_obs[anchor_t, s]
         anchor_p = p_obs[anchor_t, s]
-        dist = np.abs(tgrid[:, None] - anchor_t[None, :])  # (n_steps, n_anchors)
+        dist = np.abs(tgrid[:, None] - anchor_t[None, :])  # (n_steps + 1, n_anchors)
 
         # Multiply only at nonzero lags so 0 * inf never arises: anchors stay
         # exact (lag 0 -> variance P*) even when Q is inf.
         lag_var = np.zeros_like(dist, dtype=float)
         np.multiply(dist, q_vec[s], out=lag_var, where=dist != 0)
-        cand_p = anchor_p[None, :] + lag_var  # (n_steps, n_anchors)
+        cand_p = anchor_p[None, :] + lag_var  # (n_steps + 1, n_anchors)
 
         # Nearest anchor by variogram distance; ties broken toward smaller variance.
         min_dist = dist.min(axis=1, keepdims=True)
         chosen = np.argmin(np.where(dist == min_dist, cand_p, np.inf), axis=1)
 
-        a_obs[:, s] = anchor_a[chosen]
-        p_obs[:, s] = cand_p[tgrid, chosen]
+        filled_a = anchor_a[chosen]
+        filled_p = cand_p[rows, chosen]
+        a_init[s], P_init[s] = filled_a[0], filled_p[0]
+        a_obs[:, s], p_obs[:, s] = filled_a[1:], filled_p[1:]
 
     out = ssp_priors.copy()
     out["a_obs"] = (("time", "state"), a_obs)
     out["P_obs"] = (("time", "state"), p_obs)
-    validate_prior(out, require_init=False)
+    out["a0"] = (("state",), a_init)
+    out["P0"] = (("state",), P_init)
+    validate_prior(out, require_init=True)
     return out
 
 
@@ -277,6 +300,15 @@ def extend_states_prior_smoothed(
     back diffuse-but-finite from the filter and are reset here to ``inf`` (fully
     undisclosed), matching :func:`extend_states_prior_nearest`.
 
+    The pass runs over ``T + 1`` steps rather than ``T``: one all-``inf``
+    (predict-only) disclosure step is prepended, so the anchors are carried one
+    step *before* the series to ``t = -1``, and row 0 of the smoother output is
+    returned as the initial-state moments ``a0`` / ``P0`` over dims ``(state,)``
+    while rows ``1:`` are the rectangle.  Unanchored states get ``a0 = 0``,
+    ``P0 = inf``, the same "no information" encoding ``P_obs`` already uses.  The
+    ``(time, state)`` rectangle keeps its shape — ``time`` stays length ``T`` —
+    so nothing that indexes by step is disturbed.
+
     **When to use.** Prefer this for genuinely multi-anchor channels, where the
     nearest-anchor heuristic is a conservative, discontinuous approximation.  For a
     single-anchor channel the two agree to numerical noise (set by the diffuse-prior
@@ -288,7 +320,8 @@ def extend_states_prior_smoothed(
         Disclosed prior as produced by
         :func:`~bunobee.simulation.ssp.construct_states_prior`, carrying ``a_obs`` and
         ``P_obs`` over dims ``(time, state)``.  All other variables (``positivity``, any
-        ``a0`` / ``P0`` or ``sigma_q`` block, and attrs) are passed through unchanged.
+        ``sigma_q`` block, and attrs) are passed through unchanged; an ``a0`` / ``P0``
+        already present is **overwritten** by the backward-extended moments.
     Q : float or np.ndarray
         Per-state process variance ``σ_q²``.  A scalar is broadcast to every state; an
         array must have length ``n_states``.  Must be finite-or-``inf`` and non-negative.
@@ -302,8 +335,11 @@ def extend_states_prior_smoothed(
     -------
     xr.Dataset
         Copy of ``ssp_priors`` whose ``a_obs`` / ``P_obs`` have every anchored state's
-        undisclosed steps filled by the exact smoother marginal.  Passes
-        :func:`validate_prior` with ``require_init=False``.
+        undisclosed steps filled by the exact smoother marginal, plus ``a0`` / ``P0``
+        over ``(state,)`` from the same marginal at ``t = -1``.  Passes
+        :func:`validate_prior` with ``require_init=True``, so it can be promoted to an
+        :class:`SspPrior` — though a ``P0 = inf`` column (an unanchored state) would need
+        handling before the a-space transforms could consume it.
 
     Raises
     ------
@@ -324,36 +360,48 @@ def extend_states_prior_smoothed(
 
     sigma_q = jnp.sqrt(jnp.asarray(q_vec))
 
+    # One prepended all-inf (predict-only) disclosure step extends the pass back to
+    # t = -1, whose smoothed marginal is the initial-state prior (a0, P0).
+    a_obs_ext = np.concatenate([np.zeros((1, n_states)), a_obs], axis=0)
+    p_obs_ext = np.concatenate([np.full((1, n_states), np.inf), p_obs], axis=0)
+
     # Extension mode: Z = 0 -> zero Kalman gain -> no y-update, states stay independent
     # univariate random walks fed only through the anchor state-fusion path.
-    a0 = jnp.zeros(n_states)
-    P0 = jnp.full(n_states, P0_diffuse)
-    Z = jnp.zeros((n_steps, n_states))
-    y = jnp.zeros(n_steps)
+    a_diffuse = jnp.zeros(n_states)
+    P_diffuse = jnp.full(n_states, P0_diffuse)
+    Z = jnp.zeros((n_steps + 1, n_states))
+    y = jnp.zeros(n_steps + 1)
 
     _, at, Pt, *_ = kalman_filter_1d(
-        a0=a0,
-        P0=P0,
+        a0=a_diffuse,
+        P0=P_diffuse,
         Z=Z,
         sigma_h=jnp.array(1.0),
         sigma_q=sigma_q,
         y=y,
-        a_obs=jnp.asarray(a_obs),
-        P_obs=jnp.asarray(p_obs),
+        a_obs=jnp.asarray(a_obs_ext),
+        P_obs=jnp.asarray(p_obs_ext),
     )
     at_smooth, Pt_smooth = kalman_rts_smoother_1d(at=at, Pt=Pt, sigma_q=sigma_q)
 
-    a_out = np.array(at_smooth, dtype=float)
-    p_out = np.array(Pt_smooth, dtype=float)
+    # Row 0 is t = -1 (the initial-state moments); rows 1: are the (time, state) rectangle.
+    a_ext = np.array(at_smooth, dtype=float)
+    p_ext = np.array(Pt_smooth, dtype=float)
+    a_init, P_init = a_ext[0], p_ext[0]
+    a_out, p_out = a_ext[1:], p_ext[1:]
 
     # A state with no anchor comes back diffuse-but-finite from the diffuse P0; reset it
     # to fully-undisclosed (inf), matching extend_states_prior_nearest.
     unanchored = ~np.isfinite(p_obs).any(axis=0)
     a_out[:, unanchored] = a_obs[:, unanchored]
     p_out[:, unanchored] = p_obs[:, unanchored]
+    a_init[unanchored] = 0.0
+    P_init[unanchored] = np.inf
 
     out = ssp_priors.copy()
     out["a_obs"] = (("time", "state"), a_out)
     out["P_obs"] = (("time", "state"), p_out)
-    validate_prior(out, require_init=False)
+    out["a0"] = (("state",), a_init)
+    out["P0"] = (("state",), P_init)
+    validate_prior(out, require_init=True)
     return out
