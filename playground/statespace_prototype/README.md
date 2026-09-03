@@ -65,10 +65,10 @@ Each notebook now includes a short *"Time-point prior at a glance"* block that p
 `plot_prior_heatmap(..., quantity="both")` right after the prior is assembled. In `ssp_04`/`ssp_05` the default config
 sets `use_time_point_prior=False`, so the heatmap is fully grey — flip that flag to populate the anchor windows.
 
-## Prior deep dives — `ssp_07` / `ssp_08`
+## Prior deep dives — `ssp_07` … `ssp_09`
 
-Two self-contained chapters on the prior-extension utilities; they synthesise their own data and can be read on their
-own once `ssp_02`/`ssp_03` have introduced time-point priors.
+Three self-contained chapters on the prior data structure and its extension / fusion utilities; they synthesise their
+own data and can be read on their own once `ssp_02`/`ssp_03` have introduced time-point priors.
 
 - **`ssp_07_extend_states_prior` — Extending State Anchors via a Two-Sided Random Walk**
   (`extend_states_prior_nearest`): (1) builds a disclosed prior with `construct_states_prior`, (2) extends the sparse
@@ -78,6 +78,13 @@ own once `ssp_02`/`ssp_03` have introduced time-point priors.
 - **`ssp_08_multi_anchor_prior_extension` — Multi-Anchor Extension: Nearest-Anchor Heuristic vs. a KF + RTS Smoother**
   (`extend_states_prior_smoothed`): checks where the nearest-anchor heuristic of `ssp_07` stops being exact, and builds
   out the principled multi-anchor alternative.
+- **`ssp_09_combine_states_priors` — The `SspPrior` Contract, and Fusing Independent Priors**: two demos in one
+  notebook. First, what `SspPrior` actually validates and exposes — its read-only facade over the wrapped dataset,
+  and the two documented gotchas (`xr.merge` rejects the wrapper; ordinary xarray ops like `.isel()` don't preserve
+  it). Second, `combine_states_priors` — inverse-variance fusion of two independent priors over the same states (a
+  vendor study and an internal panel, say), including the closed-form degenerate cases (identical priors halve the
+  variance, a tight prior dominates a loose one, an undisclosed operand passes the other through), n-ary fusion via
+  `functools.reduce`, and the coordinate/positivity contract checks.
 
 ## Running the notebooks
 
