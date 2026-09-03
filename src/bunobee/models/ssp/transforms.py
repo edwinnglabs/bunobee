@@ -57,13 +57,20 @@ logger = logging.getLogger("bunobee")
 MatchMode = Literal["mean", "median", "linearize"]
 _VALID_MATCH: tuple[str, ...] = ("mean", "median", "linearize")
 
+#: Variables each ``sigma_q`` family requires; single source of truth for both
+#: the known-family check and the presence check in :func:`validate_prior`.
+_SIGMA_Q_REQUIRED: dict[str, tuple[str, ...]] = {
+    "truncated_normal": ("sigma_q_loc_prior", "sigma_q_scale_prior"),
+    "beta": ("sigma_q_alpha_prior", "sigma_q_beta_prior", "sigma_q_scale_prior"),
+}
+
 
 def _validate_match(match: str) -> None:
     if match not in _VALID_MATCH:
         raise ValueError(f"unknown match mode: {match!r}; expected one of {_VALID_MATCH}")
 
 
-def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True) -> None:
+def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True, require_sigma_q: bool = False) -> None:
     """Validate a time-point prior ``xr.Dataset`` against the SSP contract.
 
     Single source of truth for the prior's required variables, dims, and the
@@ -79,20 +86,32 @@ def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True) -> None
         ``P0`` over ``state`` are also required (``P0`` diagonal ``(state,)``
         or full ``(state, state_dual)``). Optional: ``a_obs`` / ``P_obs`` over
         ``(time, state)`` — both present or both absent — and a ``sigma_q``
-        block whose family is set by ``attrs['sigma_q_family']``.
+        block whose family is set by ``attrs['sigma_q_family']`` (required
+        when ``require_sigma_q`` is ``True``).
     require_init : bool, optional
         Whether ``a0`` / ``P0`` must be present, by default ``True``. Pass
         ``False`` to validate a disclosure-only prior (as produced by
         :func:`~bunobee.simulation.ssp.construct_states_prior`, which carries
         the observation block but not the initial-state moments).
+    require_sigma_q : bool, optional
+        Whether the ``sigma_q`` block for the selected family must be present,
+        by default ``False``. Pass ``True`` for the transform contract
+        (:func:`transform_to_ekf` / :func:`transform_to_ekf_st`), which needs
+        ``sigma_q_loc_prior`` / ``sigma_q_scale_prior`` for family
+        ``"truncated_normal"`` and ``sigma_q_alpha_prior`` /
+        ``sigma_q_beta_prior`` / ``sigma_q_scale_prior`` for family
+        ``"beta"``. Shape and value constraints on those variables are still
+        checked by the transforms themselves; only presence is checked here.
 
     Raises
     ------
     ValueError
         If a required variable is missing, ``positivity`` is not a boolean
         ``(state,)`` mask, exactly one of ``a_obs`` / ``P_obs`` is present, the
-        ``state`` dim length is inconsistent across variables, or
-        ``attrs['sigma_q_family']`` names an unknown family.
+        ``state`` dim length is inconsistent across variables,
+        ``attrs['sigma_q_family']`` names an unknown family, or — when
+        ``require_sigma_q`` is ``True`` — a variable that family requires is
+        missing.
     """
     required = ("a0", "P0", "positivity") if require_init else ("positivity",)
     for name in required:
@@ -117,8 +136,13 @@ def validate_prior(ssp_priors: xr.Dataset, *, require_init: bool = True) -> None
             raise ValueError(f"`{name}` has state dim {got}, expected {n_states}")
 
     family = ssp_priors.attrs.get("sigma_q_family", "truncated_normal")
-    if family not in ("truncated_normal", "beta"):
+    if family not in _SIGMA_Q_REQUIRED:
         raise ValueError(f"unknown sigma_q_family: {family!r}; expected 'truncated_normal' or 'beta'")
+
+    if require_sigma_q:
+        for name in _SIGMA_Q_REQUIRED[family]:
+            if name not in ssp_priors:
+                raise ValueError(f"sigma_q_family={family!r} requires {name!r}")
 
 
 def _compute_a0_a_space(
@@ -246,7 +270,7 @@ def transform_to_ekf(
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
-    validate_prior(ssp_priors)
+    validate_prior(ssp_priors, require_sigma_q=True)
     _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
@@ -359,7 +383,7 @@ def transform_to_ekf_st(
         of ``a_obs`` / ``P_obs`` is present, if ``match`` is not recognised,
         or if the ``sigma_q`` block violates its family-specific constraints.
     """
-    validate_prior(ssp_priors)
+    validate_prior(ssp_priors, require_sigma_q=True)
     _validate_match(match)
 
     P0 = jnp.asarray(ssp_priors["P0"].values)
@@ -508,6 +532,10 @@ def _transform_sigma_q_block(
     ``_moment_match_sigma`` for sigma-like quantities and
     ``_resolve_sigma_alignment`` for the per-state vs compressed ``(2,)``
     shape rules; ``match`` is forwarded to ``_moment_match_sigma``.
+
+    Presence of each family's required variables is checked upstream by
+    :func:`validate_prior` with ``require_sigma_q=True``; the branches here
+    only enforce the shape and value constraints.
     """
     if family == "truncated_normal":
         return _transform_sigma_q_truncated_normal(ssp_priors, n_states, safe_init, positivity, k, match)
@@ -524,10 +552,6 @@ def _transform_sigma_q_truncated_normal(
     k: float,
     match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
-    for name in ("sigma_q_loc_prior", "sigma_q_scale_prior"):
-        if name not in ssp_priors:
-            raise ValueError(f"sigma_q_family='truncated_normal' requires {name!r}")
-
     loc_nat = jnp.asarray(ssp_priors["sigma_q_loc_prior"].values)
     scale_nat = jnp.asarray(ssp_priors["sigma_q_scale_prior"].values)
     if loc_nat.shape != scale_nat.shape:
@@ -572,11 +596,6 @@ def _transform_sigma_q_beta(
     k: float,
     match: MatchMode = "mean",
 ) -> dict[str, tuple[tuple[str, ...], np.ndarray]]:
-    required = ("sigma_q_alpha_prior", "sigma_q_beta_prior", "sigma_q_scale_prior")
-    for name in required:
-        if name not in ssp_priors:
-            raise ValueError(f"sigma_q_family='beta' requires {name!r}")
-
     alpha = jnp.asarray(ssp_priors["sigma_q_alpha_prior"].values)
     beta = jnp.asarray(ssp_priors["sigma_q_beta_prior"].values)
     scale_nat = jnp.asarray(ssp_priors["sigma_q_scale_prior"].values)
