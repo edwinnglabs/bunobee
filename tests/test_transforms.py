@@ -9,7 +9,7 @@ import xarray as xr
 jax.config.update("jax_enable_x64", True)
 
 from bunobee.models.ssp.prior import disclosed_idx
-from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st
+from bunobee.models.ssp.transforms import transform_to_ekf, transform_to_ekf_st, validate_prior
 
 K = 0.5
 
@@ -70,6 +70,58 @@ def _make_priors(
         data_vars["P_obs"] = (("time", "state"), np.asarray(P_obs_nat))
 
     return xr.Dataset(data_vars, attrs={"sigma_q_family": family})
+
+
+class TestValidatePriorSigmaQ:
+    """`require_sigma_q` presence checks, and their opt-out by default."""
+
+    @staticmethod
+    def _tn_prior() -> xr.Dataset:
+        return _make_priors(jnp.array([1.0, 2.0]), jnp.array([0.1, 0.2]), jnp.array([True, True]), sigma_loc=0.1)
+
+    @staticmethod
+    def _beta_prior() -> xr.Dataset:
+        return _make_priors(
+            jnp.array([1.0, 2.0]),
+            jnp.array([0.1, 0.2]),
+            jnp.array([True, True]),
+            family="beta",
+            alpha=2.0,
+            beta=10.0,
+            sigma_scale=0.1,
+        )
+
+    @pytest.mark.parametrize("missing", ["sigma_q_loc_prior", "sigma_q_scale_prior"])
+    def test_truncated_normal_missing_var_raises(self, missing):
+        priors = self._tn_prior().drop_vars(missing)
+        with pytest.raises(ValueError, match=f"sigma_q_family='truncated_normal' requires '{missing}'"):
+            validate_prior(priors, require_sigma_q=True)
+
+    @pytest.mark.parametrize("missing", ["sigma_q_alpha_prior", "sigma_q_beta_prior", "sigma_q_scale_prior"])
+    def test_beta_missing_var_raises(self, missing):
+        priors = self._beta_prior().drop_vars(missing)
+        with pytest.raises(ValueError, match=f"sigma_q_family='beta' requires '{missing}'"):
+            validate_prior(priors, require_sigma_q=True)
+
+    def test_complete_block_passes(self):
+        validate_prior(self._tn_prior(), require_sigma_q=True)
+        validate_prior(self._beta_prior(), require_sigma_q=True)
+
+    @pytest.mark.parametrize("family", ["truncated_normal", "beta"])
+    def test_default_flag_ignores_missing_sigma_q(self, family):
+        priors = self._tn_prior() if family == "truncated_normal" else self._beta_prior()
+        stripped = priors.drop_vars([name for name in priors.data_vars if name.startswith("sigma_q")])
+        validate_prior(stripped)  # require_init=True, sigma_q not required
+        validate_prior(stripped.drop_vars(["a0", "P0"]), require_init=False)
+
+    @pytest.mark.parametrize("transform", [transform_to_ekf, transform_to_ekf_st])
+    def test_transforms_require_sigma_q(self, transform):
+        a0_nat = jnp.array([1.0, 2.0])
+        P0_nat = jnp.array([0.1, 0.2]) if transform is transform_to_ekf else jnp.eye(2) * 0.1
+        priors = _make_priors(a0_nat, P0_nat, jnp.array([True, True]), sigma_loc=0.1)
+        priors = priors.drop_vars("sigma_q_loc_prior")
+        with pytest.raises(ValueError, match="sigma_q_family='truncated_normal' requires 'sigma_q_loc_prior'"):
+            transform(priors)
 
 
 class TestTransformToEkf:
