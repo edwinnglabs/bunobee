@@ -465,18 +465,72 @@ def test_init_moments_output_is_promotable_to_ssp_prior(extend):
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
-def test_init_moments_overwrite_any_input_a0_p0(extend):
-    # Documented consequence: an a0 / P0 already on the input is replaced.
+def test_init_moments_preserve_an_existing_a0_p0(extend):
+    # Precedence: the derived moments are only a placeholder, so a real a0 / P0
+    # already on the input survives the extension bitwise.
+    ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
+    a0, P0 = np.array([99.0]), np.array([7.5])
+    ds["a0"] = (("state",), a0)
+    ds["P0"] = (("state",), P0)
+    out = extend(ds, 0.02)
+
+    assert np.array_equal(out["a0"].values, a0)
+    assert np.array_equal(out["P0"].values, P0)
+    # the rectangle is still extended
+    assert np.all(np.isfinite(out["P_obs"].values))
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_preserve_a_full_matrix_p0(extend):
+    # A full (state, state_dual) P0 — the shape a real prior may carry — is passed
+    # through untouched rather than flattened to the derived diagonal placeholder.
+    ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
+    P0 = np.array([[2.0]])
+    ds["a0"] = (("state",), np.array([1.25]))
+    ds["P0"] = (("state", "state_dual"), P0)
+    out = extend(ds, 0.02)
+
+    assert out["P0"].dims == ("state", "state_dual")
+    assert np.array_equal(out["P0"].values, P0)
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_fill_only_the_missing_one(extend):
+    # a0 / P0 are considered independently: a half-specified init keeps what it has
+    # and gets only the missing half from the extension.
+    ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
+    ds["a0"] = (("state",), np.array([99.0]))
+    out = extend(ds, 0.02)
+
+    assert out["a0"].values[0] == 99.0
+    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-6)
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_overwrite_init_replaces_an_existing_a0_p0(extend):
+    # The explicit escape hatch: overwrite_init=True lets the derived placeholder win.
     ds = _single_anchor(n_steps=12, t_star=4, a_star=0.5, p_star=0.05)
     ds["a0"] = (("state",), np.array([99.0]))
     ds["P0"] = (("state",), np.array([99.0]))
-    out = extend(ds, 0.02)
+    out = extend(ds, 0.02, overwrite_init=True)
 
     assert out["a0"].values[0] == pytest.approx(0.5, abs=1e-6)
     assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-6)
     # and the input itself is untouched
     assert ds["a0"].values[0] == 99.0
     assert ds["P0"].values[0] == 99.0
+
+
+@pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
+def test_init_moments_overwrite_init_is_a_no_op_without_an_existing_a0_p0(extend):
+    # The ssp_07 / ssp_08 path — no a0 / P0 on the input — is identical either way.
+    ds = _multi_state_multi_anchor()
+    q = np.array([0.02, 0.01, 0.02, 0.05])
+    kept = extend(ds, q)
+    forced = extend(ds, q, overwrite_init=True)
+
+    for name in ("a0", "P0", "a_obs", "P_obs"):
+        assert np.array_equal(kept[name].values, forced[name].values)
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
