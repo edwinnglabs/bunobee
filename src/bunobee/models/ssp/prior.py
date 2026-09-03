@@ -716,6 +716,15 @@ def combine_states_priors(
     disagreement between two sources rather than complementary evidence about one truth.
     A mixture helper is deliberately out of scope here.
 
+    **More than two fragments.** Precision adds, so the operation is associative and needs no
+    separate n-ary entry point — ``functools.reduce(combine_states_priors, fragments)`` equals
+    the one-pass closed form that sums all ``N`` precisions at once, and the leftmost fragment
+    supplies the non-fused variables of the result.  Fusing ``N`` copies of ``N(a, P)`` gives
+    ``N(a, P/N)``.  With every variance finite the fusion is commutative too, so the fold order
+    is free; order is only visible where two operands share a degenerate precision, since two
+    ``inf`` entries carry no information and two zero-variance entries are conflicting exact
+    deltas.  In both of those the argument order breaks a tie the math leaves open.
+
     Coordinates are compared, never aligned.  xarray's implicit alignment would quietly
     intersect mismatched ``time`` axes and fill ``NaN``; a mismatch raises instead.
     """
