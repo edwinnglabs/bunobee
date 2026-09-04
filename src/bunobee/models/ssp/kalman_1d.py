@@ -8,6 +8,30 @@ from jax import lax
 logger = logging.getLogger(__name__)
 
 
+def _safe_mul(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    """Elementwise product treating ``0 * inf`` as ``0`` rather than ``nan``.
+
+    IEEE754 defines ``0 * inf = nan``, but an unloaded state (``Z = 0``) contributes
+    nothing to the observation no matter how uncertain it is (``P = inf``) -- a
+    genuinely uninformative prior, not a large-but-finite proxy for one. This guards
+    the one product in :func:`kalman_filter_1d` where an infinite state variance can
+    meet an exact-zero loading (the extension-mode ``Z = 0`` callers in
+    :func:`~bunobee.models.ssp.prior.extend_states_prior_smoothed`). It is a no-op
+    for every finite-``P`` caller.
+
+    Parameters
+    ----------
+    a, b : jnp.ndarray
+        Broadcast-compatible arrays to multiply elementwise.
+
+    Returns
+    -------
+    jnp.ndarray
+        ``a * b``, except ``0`` wherever either operand is exactly ``0``.
+    """
+    return jnp.where((a == 0) | (b == 0), 0.0, a * b)
+
+
 def kalman_filter_1d(
     # (n_states, )
     a0: jnp.ndarray,
@@ -70,7 +94,9 @@ def kalman_filter_1d(
     a0 : jnp.ndarray, shape (n_states,)
         Initial state mean.
     P0 : jnp.ndarray, shape (n_states,)
-        Initial state variance (diagonal).
+        Initial state variance (diagonal). ``jnp.inf`` is a genuinely uninformative
+        prior (zero precision) and is handled cleanly by the state-fusion and
+        prediction steps -- no large-but-finite proxy is required.
     Z : jnp.ndarray, shape (n_steps, n_states)
         Design / measurement matrix. Each row Z[t] is the loading vector at time t.
     sigma_h : float or jnp.ndarray, shape ()
@@ -147,11 +173,20 @@ def kalman_filter_1d(
         if _has_obs_fusion:
             # Bayesian Gaussian fusion of filter prior N(at, Pt) with disclosed obs
             # N(at_obs, Pt_obs).
-            # Pt_obs = inf → prec_obs = 0 → no-op (pure filter carry-through).
+            # Pt_obs = inf → prec_obs = 0 → no-op (pure filter carry-through); Pt = inf
+            # (a genuinely uninformative carried state, not a large finite proxy) makes
+            # prec_filter = 0 the same clean way (1/inf = 0 under IEEE754).  But when
+            # *both* precisions are 0 -- nothing disclosed here, nothing carried in
+            # either -- the naive Pt * (...) reconstruction below multiplies an
+            # infinite Pt by an exact-zero precision sum, which is 0 * inf = nan, not
+            # the "no new information, keep at" it should be.  Guard that case
+            # explicitly rather than trusting the arithmetic to cancel it out.
             prec_filter = 1.0 / Pt
             prec_obs = 1.0 / Pt_obs
-            Pt = 1.0 / (prec_filter + prec_obs)
-            at = Pt * (prec_filter * at + prec_obs * at_obs)
+            prec_sum = prec_filter + prec_obs
+            has_info = prec_sum > 0
+            Pt = jnp.where(has_info, 1.0 / prec_sum, jnp.inf)
+            at = jnp.where(has_info, (prec_filter * at + prec_obs * at_obs) / prec_sum, at)
 
             # TODO: add logp if we observe latent states?
 
@@ -162,10 +197,11 @@ def kalman_filter_1d(
         # ------ Measurement step ------
         # scalar - (1,) -> (1,)
         vt = yt - yhat
-        # (n_states,) * (n_states,) -> sum -> (1,)  +  scalar -> (1,)
-        Ft = jnp.sum(Pt * jnp.square(Zt), -1, keepdims=True) + sigma_h_sq
+        # (n_states,) * (n_states,) -> sum -> (1,)  +  scalar -> (1,)  — _safe_mul guards
+        # Pt = inf meeting an exact-zero loading (extension-mode Z = 0).
+        Ft = jnp.sum(_safe_mul(Pt, jnp.square(Zt)), -1, keepdims=True) + sigma_h_sq
         # (n_states,) * (n_states,) / (1,) -> (n_states,)
-        Kt = Pt * Zt / Ft
+        Kt = _safe_mul(Pt, Zt) / Ft
 
         # scalar + scalar -> scalar
         if logp:
@@ -354,6 +390,17 @@ def kalman_rts_smoother_1d(
     boundary condition: at ``t = T-1`` the difference terms collapse and the
     iteration evaluates ``a_{T-1|T} = at[-1]``, ``P_{T-1|T} = Pt[-1] - σ_q²``.
 
+    ``Pt[t] = inf`` (no anchor has been fused in yet -- a genuinely uninformative
+    prior, not a large-but-finite proxy for one) makes ``J_t`` an ``inf / inf``
+    indeterminate rather than a numerically noisy ratio, and the variance update an
+    ``inf - inf`` one.  Both are replaced by their well-defined limit as the prior
+    variance tends to infinity: ``J_t → 1`` (a future disclosure back-propagates in
+    full, unweighted by an infinitely uncertain past) and
+    ``P_{t|T} → P_{t+1|T} + σ_q²`` -- variance grows by exactly one step's process
+    noise per step of backward extrapolation, reproducing the closed-form
+    ``P* + |t - t*|·Q`` marginal :func:`~bunobee.models.ssp.prior.extend_states_prior_nearest`
+    computes directly, rather than collapsing toward zero from float32 cancellation.
+
     Fusion observations (``a_obs``, ``P_obs``) and the soft positivity floor
     are already absorbed into ``at``, ``Pt`` by :func:`kalman_filter_1d`, so
     this smoother conditions on them implicitly — no extra arguments are
@@ -388,7 +435,15 @@ def kalman_rts_smoother_1d(
 
     sigma_q_sq = jnp.square(sigma_q)
     P_filt = Pt - sigma_q_sq
-    smoother_gain = P_filt / Pt
+
+    # Pt = inf -> J_t = P_filt/Pt is inf/inf (P_filt is also inf: inf - finite = inf).
+    # Guard the division and take the diffuse-prior limit explicitly (see docstring)
+    # rather than letting float32 (or any precision) turn this into a numerically
+    # noisy near-1 ratio riding on a huge-vs-huge cancellation.
+    diffuse = ~jnp.isfinite(Pt)
+    safe_Pt = jnp.where(diffuse, 1.0, Pt)
+    safe_P_filt = jnp.where(diffuse, 1.0, P_filt)
+    smoother_gain = jnp.where(diffuse, 1.0, safe_P_filt / safe_Pt)
 
     def _step(
         carry: tuple[jnp.ndarray, jnp.ndarray], t: int
@@ -396,7 +451,13 @@ def kalman_rts_smoother_1d(
         """Single backward RTS step at time t."""
         a_smooth_next, P_smooth_next = carry
         a_smooth_t = at[t] + smoother_gain[t] * (a_smooth_next - at[t])
-        P_smooth_t = P_filt[t] + jnp.square(smoother_gain[t]) * (P_smooth_next - Pt[t])
+        # The variance update has the same inf - inf indeterminate at a diffuse t;
+        # its limit is P_smooth_next + sigma_q_sq (see docstring). NaN produced by
+        # the unselected "informed" branch at those entries is discarded by the
+        # jnp.where, not propagated.
+        P_smooth_t_informed = P_filt[t] + jnp.square(smoother_gain[t]) * (P_smooth_next - Pt[t])
+        P_smooth_t_diffuse = P_smooth_next + sigma_q_sq
+        P_smooth_t = jnp.where(diffuse[t], P_smooth_t_diffuse, P_smooth_t_informed)
         return (a_smooth_t, P_smooth_t), (a_smooth_t, P_smooth_t)
 
     init = (at[-1], Pt[-1])

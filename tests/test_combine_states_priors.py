@@ -8,7 +8,7 @@ import pytest
 import xarray as xr
 
 from bunobee.models.ssp import combine_states_priors
-from bunobee.models.ssp.prior import SspPrior
+from bunobee.models.ssp.prior import SspPrior, extend_states_prior_smoothed
 from bunobee.models.ssp.transforms import validate_prior
 
 
@@ -348,3 +348,90 @@ def test_fusing_n_identical_priors_divides_the_variance_by_n():
     folded = reduce(combine_states_priors, [_simple(3.0, 0.6) for _ in range(4)])
     np.testing.assert_allclose(folded["a_obs"].values, 3.0)
     np.testing.assert_allclose(folded["P_obs"].values, 0.15)
+
+
+def _disclosure(a_obs: np.ndarray, p_obs: np.ndarray) -> xr.Dataset:
+    """Build a disclosure-only prior (no ``a0`` / ``P0``), the shape ``extend_states_prior_smoothed``
+    expects as input.
+
+    Parameters
+    ----------
+    a_obs : np.ndarray, shape (n_steps, n_states)
+        Disclosed state means.
+    p_obs : np.ndarray, shape (n_steps, n_states)
+        Disclosed state variances; ``inf`` marks undisclosed steps.
+
+    Returns
+    -------
+    xr.Dataset
+        Dataset carrying ``a_obs`` / ``P_obs`` over ``(time, state)`` and an all-linear
+        ``positivity`` mask, matching ``construct_states_prior``'s raw output.
+    """
+    a_obs = np.asarray(a_obs, dtype=float)
+    p_obs = np.asarray(p_obs, dtype=float)
+    n_steps, n_states = p_obs.shape
+    return xr.Dataset(
+        {
+            "a_obs": (("time", "state"), a_obs),
+            "P_obs": (("time", "state"), p_obs),
+            "positivity": (("state",), np.zeros(n_states, dtype=bool)),
+        },
+        coords={"time": np.arange(n_steps), "state": [f"s{i}" for i in range(n_states)]},
+    )
+
+
+def test_combine_smoothed_extensions_vendor_panel_style():
+    """Fuse two independently ``extend_states_prior_smoothed``-extended priors -- regression
+    coverage paralleling the vendor/panel demo in
+    ``playground/statespace_prototype/ssp_09_combine_states_priors.ipynb``, but built from
+    :func:`extend_states_prior_smoothed` rather than the nearest-anchor heuristic (issue #69: a
+    fused prior built from two ``_smoothed`` extensions is close to where the float32
+    variance-collapse bug -- a large-but-finite diffuse-prior proxy cancelling against small
+    anchor variances in the RTS backward pass -- would have surfaced in practice, since it runs
+    bunobee's own Kalman filter/smoother per channel rather than staying in plain NumPy)."""
+    n_steps = 30
+
+    # state 0 ("level"): disclosed by neither study, throughout.
+    # state 1 ("tv"): each study discloses its own multi-anchor read on the same channel, at
+    # different times and confidences -- vendor's first anchor at t=3 leaves steps 0-2
+    # pre-first-anchor, exactly where the collapse bug hit.
+    vendor_a = np.zeros((n_steps, 2))
+    vendor_p = np.full((n_steps, 2), np.inf)
+    vendor_a[3, 1], vendor_p[3, 1] = 0.30, 0.02
+    vendor_a[15, 1], vendor_p[15, 1] = 0.65, 0.15
+    vendor_a[27, 1], vendor_p[27, 1] = 0.35, 0.02
+
+    panel_a = np.zeros((n_steps, 2))
+    panel_p = np.full((n_steps, 2), np.inf)
+    panel_a[8, 1], panel_p[8, 1] = 0.55, 0.05
+    panel_a[22, 1], panel_p[22, 1] = 0.40, 0.05
+
+    q = 0.02
+    vendor = extend_states_prior_smoothed(_disclosure(vendor_a, vendor_p), q)
+    panel = extend_states_prior_smoothed(_disclosure(panel_a, panel_p), q)
+    fused = combine_states_priors(vendor, panel)
+
+    # No collapse toward zero anywhere in either extension (the #69 regression), including the
+    # pre-first-anchor region.
+    assert np.all(vendor["P_obs"].values[:, 1] > 0.01)
+    assert np.all(panel["P_obs"].values[:, 1] > 0.01)
+    assert np.isfinite(vendor["P0"].values[1]) and vendor["P0"].values[1] > 0.01
+    assert np.isfinite(panel["P0"].values[1]) and panel["P0"].values[1] > 0.01
+    assert not np.isnan(vendor["a_obs"].values).any()
+    assert not np.isnan(panel["a_obs"].values).any()
+
+    # Fusion is still sane on top of a smoothed extension: precision adds, so the fused variance
+    # never exceeds either input, at every step both disclose.
+    assert np.isfinite(fused["P_obs"].values[:, 1]).all()
+    assert np.all(fused["P_obs"].values[:, 1] <= vendor["P_obs"].values[:, 1] + 1e-6)
+    assert np.all(fused["P_obs"].values[:, 1] <= panel["P_obs"].values[:, 1] + 1e-6)
+    assert np.isfinite(fused["P0"].values[1])
+    assert fused["P0"].values[1] <= min(vendor["P0"].values[1], panel["P0"].values[1]) + 1e-6
+
+    # "level" is disclosed by neither study, so it stays fully undisclosed straight through the
+    # fusion -- inf, never NaN or a near-zero collapse artifact.
+    assert np.isinf(fused["P_obs"].values[:, 0]).all()
+    assert np.isinf(fused["P0"].values[0])
+    assert not np.isnan(fused["a_obs"].values[:, 0]).any()
+
+    validate_prior(fused, require_init=True)  # must not raise

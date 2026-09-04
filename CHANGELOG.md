@@ -12,7 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PEP 561 `py.typed` marker so downstream type checkers honor the package's type hints.
 - `extend_states_prior_smoothed` — exact KF-forward + RTS-backward anchor extension that
   fuses every anchor per state, for multi-anchor channels the nearest-anchor heuristic only
-  approximates.
+  approximates. Seeds the leading (pre-series) state with true zero precision (`P0 = inf`),
+  the same "no information" encoding `P_obs` already uses, rather than a large-but-finite
+  proxy; `kalman_filter_1d` and `kalman_rts_smoother_1d` handle that literal `inf` exactly, so
+  the result is correct at JAX's actual default precision (float32), not only under
+  `jax_enable_x64=True`.
 - `combine_states_priors` — closed-form inverse-variance fusion of two independent states
   priors over the same `time` / `state` grid, returning a validated `SspPrior`. Precision
   adds, so `N(a, P)` fused with itself is `N(a, P/2)` and a tight prior dominates a loose
