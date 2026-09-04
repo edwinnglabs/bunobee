@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import jax
+import json
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -13,7 +16,13 @@ from bunobee.models.ssp.prior import (
 )
 from bunobee.models.ssp.transforms import validate_prior
 
-jax.config.update("jax_enable_x64", True)  # exact single-anchor agreement needs float64
+# No module-level `jax.config.update("jax_enable_x64", True)` here on purpose (regression for
+# #69): that JAX config flag is process-global, so setting it at import time silently forces
+# float64 for every other test module pytest collects in the same run -- exactly what let the
+# float32 variance-collapse bug in extend_states_prior_smoothed go undetected by CI. Every
+# assertion below is written to hold at JAX's actual default precision (float32); see
+# test_smoothed_pre_anchor_region_matches_closed_form_at_default_precision, which additionally
+# runs in an isolated subprocess so it cannot inherit x64 from another already-collected module.
 
 
 def _prior(a_obs: np.ndarray, p_obs: np.ndarray, positivity: np.ndarray | None = None) -> xr.Dataset:
@@ -241,20 +250,23 @@ def _multi_anchor() -> xr.Dataset:
 
 
 def test_smoothed_single_anchor_matches_nearest():
-    # For a single-anchor channel the smoother marginal equals the nearest-anchor
-    # heuristic to numerical noise (set by the diffuse-prior proxy P0 in float64).
+    # For a single-anchor channel the smoother marginal equals the nearest-anchor heuristic
+    # exactly (post-#69 fix, at any JAX precision), up to ordinary floating-point rounding --
+    # 1e-5 comfortably clears that at float32 (JAX's actual default here; see the module
+    # docstring note) without being loose enough to miss a real regression.
     ds = _single_anchor(n_steps=25, t_star=12, a_star=0.6, p_star=0.03)
     q = 0.02
     nearest = extend_states_prior_nearest(ds, q)
     smoothed = extend_states_prior_smoothed(ds, q)
 
-    assert np.allclose(smoothed["a_obs"].values, nearest["a_obs"].values, atol=1e-7)
-    assert np.allclose(smoothed["P_obs"].values, nearest["P_obs"].values, atol=1e-7)
+    assert np.allclose(smoothed["a_obs"].values, nearest["a_obs"].values, atol=1e-5)
+    assert np.allclose(smoothed["P_obs"].values, nearest["P_obs"].values, atol=1e-5)
 
 
 def test_smoothed_variance_never_exceeds_nearest_multi_anchor():
     # Fusing every anchor is never less informative than picking the nearest one:
-    # the smoother variance is <= the heuristic at every step.
+    # the smoother variance is <= the heuristic at every step (1e-6 slack for float32
+    # rounding -- see test_smoothed_single_anchor_matches_nearest).
     ds = _multi_anchor()
     q = 0.02
     nearest = extend_states_prior_nearest(ds, q)
@@ -262,7 +274,7 @@ def test_smoothed_variance_never_exceeds_nearest_multi_anchor():
 
     p_near = nearest["P_obs"].values[:, 0]
     p_smooth = smoothed["P_obs"].values[:, 0]
-    assert np.all(p_smooth <= p_near + 1e-9)
+    assert np.all(p_smooth <= p_near + 1e-6)
     # and strictly tighter somewhere (the midpoints between anchors)
     assert np.any(p_smooth < p_near - 1e-6)
 
@@ -322,12 +334,13 @@ def test_smoothed_per_state_vector_Q():
     q = np.array([0.02, 0.2])
     out = extend_states_prior_smoothed(ds, q)
 
-    # Single anchor per column, so the smoother marginal is the exact
-    # P* + |t - t*|.Q cone, with a different slope on each column.
+    # Single anchor per column, so the smoother marginal is the exact P* + |t - t*|.Q
+    # cone, with a different slope on each column (1e-5 slack for float32 rounding --
+    # see test_smoothed_single_anchor_matches_nearest).
     lag = np.abs(np.arange(11) - 5)
-    assert np.allclose(out["P_obs"].values[:, 0], 0.01 + lag * q[0], atol=1e-7)
-    assert np.allclose(out["P_obs"].values[:, 1], 0.01 + lag * q[1], atol=1e-7)
-    assert np.allclose(out["a_obs"].values, 0.5, atol=1e-7)
+    assert np.allclose(out["P_obs"].values[:, 0], 0.01 + lag * q[0], atol=1e-5)
+    assert np.allclose(out["P_obs"].values[:, 1], 0.01 + lag * q[1], atol=1e-5)
+    assert np.allclose(out["a_obs"].values, 0.5, atol=1e-5)
 
 
 def test_smoothed_multi_state_columns_are_decoupled():
@@ -358,11 +371,11 @@ def test_smoothed_multi_state_tighter_than_nearest_per_column():
     p_near = nearest["P_obs"].values
     p_smooth = smoothed["P_obs"].values
     for i in (1, 2, 3):
-        assert np.all(p_smooth[:, i] <= p_near[:, i] + 1e-9)
+        assert np.all(p_smooth[:, i] <= p_near[:, i] + 1e-6)
     for i in (1, 2):  # multi-anchor columns fuse both directions
         assert np.any(p_smooth[:, i] < p_near[:, i] - 1e-6)
-    # single-anchor column: the two agree to the diffuse-prior noise floor
-    assert np.allclose(p_smooth[:, 3], p_near[:, 3], atol=1e-7)
+    # single-anchor column: the two agree exactly, to float32 rounding
+    assert np.allclose(p_smooth[:, 3], p_near[:, 3], atol=1e-5)
 
 
 def test_smoothed_output_passes_validate_prior():
@@ -429,8 +442,8 @@ def test_init_moments_agree_on_single_anchor_closed_form(t_star):
     expected_p0 = p_star + (t_star + 1) * q
     assert nearest["a0"].values[0] == pytest.approx(a_star)
     assert nearest["P0"].values[0] == pytest.approx(expected_p0)
-    assert smoothed["a0"].values[0] == pytest.approx(a_star, abs=1e-6)
-    assert smoothed["P0"].values[0] == pytest.approx(expected_p0, abs=1e-6)
+    assert smoothed["a0"].values[0] == pytest.approx(a_star, abs=1e-5)
+    assert smoothed["P0"].values[0] == pytest.approx(expected_p0, abs=1e-5)
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
@@ -452,7 +465,7 @@ def test_init_moments_smoothed_p0_tighter_on_multi_anchor():
     q = 0.02
     nearest = extend_states_prior_nearest(ds, q)
     smoothed = extend_states_prior_smoothed(ds, q)
-    assert smoothed["P0"].values[0] <= nearest["P0"].values[0] + 1e-9
+    assert smoothed["P0"].values[0] <= nearest["P0"].values[0] + 1e-6
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
@@ -503,7 +516,7 @@ def test_init_moments_fill_only_the_missing_one(extend):
     out = extend(ds, 0.02)
 
     assert out["a0"].values[0] == 99.0
-    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-6)
+    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-5)
 
 
 @pytest.mark.parametrize("extend", _EXTENSIONS, ids=["nearest", "smoothed"])
@@ -514,8 +527,8 @@ def test_init_moments_overwrite_init_replaces_an_existing_a0_p0(extend):
     ds["P0"] = (("state",), np.array([99.0]))
     out = extend(ds, 0.02, overwrite_init=True)
 
-    assert out["a0"].values[0] == pytest.approx(0.5, abs=1e-6)
-    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-6)
+    assert out["a0"].values[0] == pytest.approx(0.5, abs=1e-5)
+    assert out["P0"].values[0] == pytest.approx(0.05 + 5 * 0.02, abs=1e-5)
     # and the input itself is untouched
     assert ds["a0"].values[0] == 99.0
     assert ds["P0"].values[0] == 99.0
@@ -610,3 +623,115 @@ def test_extension_does_not_mutate_a_wrapped_input(extend):
 
     assert np.array_equal(complete["a_obs"].values, before_a)
     assert np.array_equal(complete["P_obs"].values, before_p, equal_nan=True)
+
+
+# --------------------------------------------------------------------------- #
+# Regression for #69: the pre-first-anchor region must not collapse toward     #
+# zero at JAX's actual default (float32) precision.                           #
+# --------------------------------------------------------------------------- #
+
+# Runs in a subprocess -- rather than an in-process `jax.config` reset -- because several other
+# test modules in this suite (test_kalman_smoothers.py, test_kalman_filters.py, test_saturation.py,
+# test_transforms.py, test_dlt.py) and src/bunobee/models/dlt.py itself set the process-global
+# `jax_enable_x64` flag to True as an import side effect; whichever of them pytest happens to
+# collect first would silently force float64 here too if this ran in the same process. A fresh
+# subprocess is guaranteed to start with JAX's real default (float32, jax_enable_x64=False)
+# regardless of collection order.
+_FLOAT32_CHECK_SCRIPT = """
+import json
+
+import numpy as np
+import xarray as xr
+
+from bunobee.models.ssp.prior import extend_states_prior_nearest, extend_states_prior_smoothed
+
+
+def _prior(a_obs, p_obs):
+    a_obs = np.asarray(a_obs, dtype=float)
+    p_obs = np.asarray(p_obs, dtype=float)
+    n_steps, n_states = p_obs.shape
+    return xr.Dataset(
+        {
+            "a_obs": (("time", "state"), a_obs),
+            "P_obs": (("time", "state"), p_obs),
+            "positivity": (("state",), np.zeros(n_states, dtype=bool)),
+        },
+        coords={"time": np.arange(n_steps), "state": [f"s{i}" for i in range(n_states)]},
+    )
+
+
+cases = {}
+
+# Single-anchor: the smoother marginal must equal the exact P* + |t-t*|.Q cone at every step,
+# including every step strictly before the anchor.
+n_steps, t_star, a_star, p_star, q = 25, 12, 0.6, 0.03, 0.02
+a_obs = np.zeros((n_steps, 1))
+p_obs = np.full((n_steps, 1), np.inf)
+a_obs[t_star, 0], p_obs[t_star, 0] = a_star, p_star
+single = extend_states_prior_smoothed(_prior(a_obs, p_obs), q)
+cases["single_p_obs"] = single["P_obs"].values[:, 0].tolist()
+cases["single_a_obs"] = single["a_obs"].values[:, 0].tolist()
+cases["single_p0"] = float(single["P0"].values[0])
+
+# Multi-anchor: the pre-first-anchor region (t < 5) is where the bug collapsed P_obs toward 0.
+a_obs2 = np.zeros((40, 1))
+p_obs2 = np.full((40, 1), np.inf)
+a_obs2[5, 0], p_obs2[5, 0] = 0.30, 0.02
+a_obs2[20, 0], p_obs2[20, 0] = 0.65, 0.15
+a_obs2[34, 0], p_obs2[34, 0] = 0.35, 0.02
+ds2 = _prior(a_obs2, p_obs2)
+multi_smoothed = extend_states_prior_smoothed(ds2, 0.02)
+multi_nearest = extend_states_prior_nearest(ds2, 0.02)
+cases["multi_p_smooth"] = multi_smoothed["P_obs"].values[:, 0].tolist()
+cases["multi_p_near"] = multi_nearest["P_obs"].values[:, 0].tolist()
+
+import jax  # local import: confirm this process never touched jax_enable_x64
+
+cases["x64_enabled"] = bool(jax.config.jax_enable_x64)
+
+print(json.dumps(cases))
+"""
+
+
+def _run_float32_check() -> dict:
+    """Run :data:`_FLOAT32_CHECK_SCRIPT` in a fresh, isolated subprocess.
+
+    Returns
+    -------
+    dict
+        The JSON payload the subprocess printed on its last stdout line.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _FLOAT32_CHECK_SCRIPT],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_smoothed_pre_anchor_region_matches_closed_form_at_default_precision():
+    """Regression for #69 -- extend_states_prior_smoothed must not collapse pre-anchor P_obs/P0
+    toward zero at JAX's actual default (float32) precision, for both a single- and a
+    multi-anchor prior."""
+    cases = _run_float32_check()
+    assert cases["x64_enabled"] is False, "isolated subprocess unexpectedly inherited jax_enable_x64"
+
+    # Single anchor: exact closed form at every step, including every pre-anchor step.
+    t_star, a_star, p_star, q = 12, 0.6, 0.03, 0.02
+    p = np.array(cases["single_p_obs"])
+    a = np.array(cases["single_a_obs"])
+    expected_p = p_star + np.abs(np.arange(25) - t_star) * q
+    assert np.allclose(p, expected_p, atol=1e-4)
+    assert np.allclose(a, a_star, atol=1e-4)
+    assert cases["single_p0"] == pytest.approx(p_star + (t_star + 1) * q, abs=1e-4)
+    # Not collapsed toward zero anywhere before the anchor (the pre-fix failure mode).
+    assert np.all(p[:t_star] > p_star)
+
+    # Multi-anchor: steps 0..4 are strictly before the first anchor (t=5) -- exactly where the
+    # cancellation bug drove P_obs toward ~0 instead of growing away from the anchor.
+    p_smooth = np.array(cases["multi_p_smooth"])
+    p_near = np.array(cases["multi_p_near"])
+    assert np.all(p_smooth[:5] > 0.01), f"pre-first-anchor P_obs collapsed toward zero: {p_smooth[:5]}"
+    assert np.all(np.diff(p_smooth[:5]) < 0)  # strictly decreasing toward the anchor
+    assert np.all(p_smooth <= p_near + 1e-4)  # fusing is never less informative than nearest-anchor

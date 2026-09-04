@@ -393,7 +393,6 @@ def extend_states_prior_nearest(
 def extend_states_prior_smoothed(
     ssp_priors: xr.Dataset | SspPrior,
     Q: float | np.ndarray,
-    P0_diffuse: float = 1e8,
     *,
     overwrite_init: bool = False,
 ) -> SspPrior:
@@ -409,8 +408,14 @@ def extend_states_prior_smoothed(
        a zero design matrix ``Z`` so there is no scalar ``y`` observation coupling the
        states.  Each disclosed anchor :math:`(a^*, P^*)` enters through the filter's
        precision-weighted state-fusion path (as a *soft* observation with noise
-       variance :math:`P^*`), while ``P_obs = inf`` steps are pure predict-through.  A
-       large finite ``P0_diffuse`` stands in for an uninformative initial prior.
+       variance :math:`P^*`), while ``P_obs = inf`` steps are pure predict-through.
+       The leading (pre-series) state is seeded with true zero precision
+       (``P0 = inf``) -- the same "no information" encoding ``P_obs`` already uses --
+       rather than a large-but-finite proxy: :func:`~bunobee.models.ssp.kalman_1d.kalman_filter_1d`
+       and :func:`~bunobee.models.ssp.kalman_1d.kalman_rts_smoother_1d` both handle a
+       literal ``inf`` exactly, at any JAX precision, whereas a finite proxy (e.g.
+       ``1e8``) fused against an O(0.1-1) anchor variance in the RTS backward pass
+       causes float32 catastrophic cancellation.
     2. :func:`~bunobee.models.ssp.kalman_1d.kalman_rts_smoother_1d` -- a backward pass
        that returns the smoothed mean **and** marginal variance at every step.
 
@@ -418,9 +423,8 @@ def extend_states_prior_smoothed(
     per-step posterior marginal, fusing *every* anchor in the channel by inverse-variance
     weighting.  Compared with the nearest-anchor heuristic it blends means between anchors
     instead of hard-switching, tightens the variance (never wider), and revises even the
-    disclosed anchors once more than one is present.  States with no disclosed anchor come
-    back diffuse-but-finite from the filter and are reset here to ``inf`` (fully
-    undisclosed), matching :func:`extend_states_prior_nearest`.
+    disclosed anchors once more than one is present.  States with no disclosed anchor stay
+    at ``inf`` (fully undisclosed) throughout, matching :func:`extend_states_prior_nearest`.
 
     The pass runs over ``T + 1`` steps rather than ``T``: one all-``inf``
     (predict-only) disclosure step is prepended, so the anchors are carried one
@@ -439,8 +443,8 @@ def extend_states_prior_smoothed(
 
     **When to use.** Prefer this for genuinely multi-anchor channels, where the
     nearest-anchor heuristic is a conservative, discontinuous approximation.  For a
-    single-anchor channel the two agree to numerical noise (set by the diffuse-prior
-    proxy ``P0_diffuse``), so the cheaper :func:`extend_states_prior_nearest` suffices.
+    single-anchor channel the two agree exactly (to ordinary floating-point rounding,
+    not an approximation), so the cheaper :func:`extend_states_prior_nearest` suffices.
 
     Parameters
     ----------
@@ -455,9 +459,6 @@ def extend_states_prior_smoothed(
         array must have length ``n_states``.  Must be finite-or-``inf`` and non-negative.
         The filter itself takes a standard deviation, so internally this passes
         ``sqrt(Q)``.
-    P0_diffuse : float, optional
-        Large finite initial variance standing in for an uninformative prior, by default
-        ``1e8`` (comfortable in float64).
     overwrite_init : bool, optional
         Whether the derived ``a0`` / ``P0`` replace ones already present on ``ssp_priors``,
         by default ``False`` (a real initial-state prior wins).
@@ -501,9 +502,11 @@ def extend_states_prior_smoothed(
     p_obs_ext = np.concatenate([np.full((1, n_states), np.inf), p_obs], axis=0)
 
     # Extension mode: Z = 0 -> zero Kalman gain -> no y-update, states stay independent
-    # univariate random walks fed only through the anchor state-fusion path.
+    # univariate random walks fed only through the anchor state-fusion path. P0 = inf
+    # is a genuinely uninformative prior (zero precision), not a large finite proxy --
+    # kalman_filter_1d / kalman_rts_smoother_1d handle it exactly, at any precision.
     a_diffuse = jnp.zeros(n_states)
-    P_diffuse = jnp.full(n_states, P0_diffuse)
+    P_diffuse = jnp.full(n_states, jnp.inf)
     Z = jnp.zeros((n_steps + 1, n_states))
     y = jnp.zeros(n_steps + 1)
 
@@ -525,8 +528,10 @@ def extend_states_prior_smoothed(
     a_init, P_init = a_ext[0], p_ext[0]
     a_out, p_out = a_ext[1:], p_ext[1:]
 
-    # A state with no anchor comes back diffuse-but-finite from the diffuse P0; reset it
-    # to fully-undisclosed (inf), matching extend_states_prior_nearest.
+    # A state with no anchor never gets fused with anything, so both the filter and
+    # smoother's diffuse-prior limits (see kalman_1d.py) leave it at a=0, P=inf all
+    # the way through -- already fully-undisclosed. Reassigning is a defensive no-op
+    # matching extend_states_prior_nearest's explicit reset for the same case.
     unanchored = ~np.isfinite(p_obs).any(axis=0)
     a_out[:, unanchored] = a_obs[:, unanchored]
     p_out[:, unanchored] = p_obs[:, unanchored]
