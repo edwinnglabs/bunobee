@@ -162,6 +162,8 @@ cython_debug/
 *.csv
 # committed test fixtures are the exception — CI needs them checked in
 !tests/fixtures/*.csv
+# packaged datasets ship with the library — see src/bunobee/datasets/
+!src/bunobee/datasets/data/*.csv
 *.pkl
 
 push_package.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ``tests/fixtures/m5_aggregate.csv`` — the hermetic panel behind the accuracy guard.
+"""Build ``src/bunobee/datasets/data/m5_aggregate.csv`` — the hermetic panel behind the accuracy guard.
 
 Source
 ------
@@ -8,8 +8,9 @@ The raw competition dump lives untracked in ``playground/resource/m5-forecasting
 gitignored by ``*.csv`` / ``*.nc``), so CI never sees it.
 
 The committed CSV is a **derived aggregate** — 10 summed series over a 756-day window — not a
-redistribution of the raw competition data. It exists so ``tests/test_m5_accuracy.py`` has something
-dense and deterministic to score against without a download.
+redistribution of the raw competition data. It is packaged (not test-only) so
+``tests/test_m5_accuracy.py`` and any notebook or prototype script share the same panel via
+``bunobee.datasets.load_m5_aggregate()``.
 
 What it contains
 ----------------
@@ -50,7 +51,7 @@ import xarray as xr
 
 _HERE = Path(__file__).resolve().parent
 _DEFAULT_DATA_DIR = _HERE.parent / "resource" / "m5-forecasting-accuracy"
-_DEFAULT_OUTPUT = _HERE.parents[1] / "tests" / "fixtures" / "m5_aggregate.csv"
+_DEFAULT_OUTPUT = _HERE.parents[1] / "src" / "bunobee" / "datasets" / "data" / "m5_aggregate.csv"
 
 # Window: the training span plus one M5 evaluation window, ending at d_1941.
 N_STEPS = 728

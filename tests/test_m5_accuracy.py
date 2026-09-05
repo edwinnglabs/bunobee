@@ -6,12 +6,15 @@ lands the scoring harness on top of it — the fit, the forecast, the metrics, a
 the eventual thresholds will assert on. The thresholds themselves are deliberately still absent: this
 module measures error and proves the measurement is stable, it does not yet fail on it.
 
-The data is ``tests/fixtures/m5_aggregate.csv``, built by
+The data is ``bunobee.datasets.load_m5_aggregate()``, backed by the packaged
+``src/bunobee/datasets/data/m5_aggregate.csv``, built by
 ``playground/m5_prototype/m5_make_accuracy_fixture.py`` from the M5 Forecasting — Accuracy competition
 dump. That dump is 980 MB and untracked (``*.csv`` / ``*.nc`` are gitignored), so CI cannot see it; the
 committed file is a derived aggregate of it — 3 states x 3 categories plus a national ``TOTAL``, summed
 over all 30 490 item-store series, for the last ``N_STEPS + HORIZON`` observed days — not a
-redistribution of the raw competition data.
+redistribution of the raw competition data. It is packaged rather than kept test-only so the same panel
+is one import away in a demo notebook or a prototype script: ``from bunobee.datasets import
+load_m5_aggregate``.
 
 Aggregating is what makes the panel scoreable at all: raw M5 item-store series are intermittent and
 zero-inflated, and MAPE on a series that spends half its life at zero means nothing. The aggregates run
@@ -44,13 +47,14 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from bunobee.datasets import M5_AGGREGATE_PATH, load_m5_aggregate
 from bunobee.models.ssp import build_forecast_design, forecast_ssp, transform_to_ekf_st
 from bunobee.regression import make_peridoic_dummies
 
 logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parents[1]
-M5_PANEL = _ROOT / "tests" / "fixtures" / "m5_aggregate.csv"
+M5_PANEL = M5_AGGREGATE_PATH
 M5_SOURCE = _ROOT / "playground" / "resource" / "m5-forecasting-accuracy"
 M5_BUILDER = _ROOT / "playground" / "m5_prototype" / "m5_make_accuracy_fixture.py"
 
@@ -147,14 +151,14 @@ def _load_builder() -> ModuleType:
 
 
 def _read_panel() -> pd.DataFrame:
-    """Read the committed fixture into a long panel.
+    """Read the committed fixture into a long panel, via the packaged loader.
 
     Returns
     -------
     pd.DataFrame
         Columns ``date`` (datetime64), ``series_id`` (str), ``sales`` (int).
     """
-    return pd.read_csv(M5_PANEL, parse_dates=["date"])
+    return load_m5_aggregate()
 
 
 class TestFixtureProvenance:
@@ -186,8 +190,9 @@ class TestFixtureProvenance:
         assert (dates.to_series().diff().dropna() == pd.Timedelta(days=1)).all()
 
     def test_file_is_committed_and_small(self):
-        # ``.gitignore`` ignores ``*.csv`` but re-includes ``tests/fixtures/*.csv``; if that exception
-        # ever goes away the file vanishes from CI and every check above fails for the wrong reason.
+        # ``.gitignore`` ignores ``*.csv`` but re-includes ``src/bunobee/datasets/data/*.csv``; if that
+        # exception ever goes away the file vanishes from CI and every check above fails for the wrong
+        # reason.
         assert M5_PANEL.exists()
         assert M5_PANEL.stat().st_size < MAX_FIXTURE_BYTES
 

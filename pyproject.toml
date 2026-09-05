@@ -51,7 +51,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-bunobee = ["py.typed"]
+bunobee = ["py.typed", "datasets/data/*.csv"]
 
 [tool.black]
 line-length = 120
