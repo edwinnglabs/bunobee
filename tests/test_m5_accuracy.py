@@ -2,9 +2,9 @@
 
 This module holds the hermetic benchmark behind issue #59: a small, dense, deterministic panel that a
 broken forecast can be scored against. Issue #60 lands the fixture and its provenance guard; issue #61
-lands the scoring harness on top of it — the fit, the forecast, the metrics, and the per-series table
-the eventual thresholds will assert on. The thresholds themselves are deliberately still absent: this
-module measures error and proves the measurement is stable, it does not yet fail on it.
+lands the scoring harness on top of it — the fit, the forecast, the metrics, and the per-series table;
+issue #62 lands the three thresholds that turn the measurement into a guard, so a quality regression
+now fails the suite instead of merely printing a worse number.
 
 The data is ``bunobee.datasets.load_m5_aggregate()``, backed by the packaged
 ``src/bunobee/datasets/data/m5_aggregate.csv``, built by
@@ -31,6 +31,11 @@ whenever a working copy has it, so the committed copy cannot silently drift.
 ``scope="module"`` fixture, because the fit is expensive and the assertions are cheap. Everything about
 it is pinned: the fixture, the 728/28 split, the NUTS configuration, and both PRNG seeds, so two
 consecutive runs log the same numbers to the last digit.
+
+:class:`TestAccuracyThresholds` is the tripwire itself: two generous absolute ceilings
+(:data:`PANEL_MAPE_MAX`, :data:`SERIES_MAPE_MAX`) plus the scale-free
+:data:`MAX_NAIVE_RATIO`. It closes with a test that breaks the forecast on purpose and asserts the
+guard fires, because a tripwire nobody has tripped is not known to work.
 """
 
 from __future__ import annotations
@@ -132,6 +137,49 @@ FORECAST_SEED = 0
 
 #: Seasonal period of the naive baseline: "same weekday last week", carried across the horizon.
 NAIVE_PERIOD = 7
+
+# ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+
+# Calibrated 2026-09-03 on the committed fixture, at the NUTS configuration above. The full run:
+#
+#   series            MAPE%   naive%   ratio
+#   CA_FOODS           6.20     6.70   0.925
+#   CA_HOBBIES         6.21     8.38   0.742
+#   CA_HOUSEHOLD       6.15     5.28   1.166
+#   TOTAL              7.38     8.31   0.889
+#   TX_FOODS           7.90     9.70   0.815
+#   TX_HOBBIES        11.96    12.02   0.995
+#   TX_HOUSEHOLD       6.87    10.72   0.641
+#   WI_FOODS          14.23    13.19   1.079
+#   WI_HOBBIES        10.45     8.79   1.189
+#   WI_HOUSEHOLD       9.84     7.99   1.233
+#   panel mean: MAPE 8.72% | seasonal-naive MAPE 9.11% | ratio 0.958
+#
+# The two absolute ceilings carry 50% relative headroom over their calibrated value, rounded up to a
+# clean number: they are meant to pass through ordinary tuning and fail on a broken algorithm, not to
+# rank fits. Re-derive them by re-running this module and applying the same rule; do not nudge one
+# because a change moved the number a little.
+
+#: Panel-mean MAPE ceiling, in percent. Calibrated 8.72; 8.72 x 1.5 = 13.08, rounded up.
+PANEL_MAPE_MAX = 14.0
+
+#: Per-series MAPE ceiling, in percent, so one blown-up series cannot hide behind nine good ones.
+#: Calibrated on the worst series, ``WI_FOODS`` at 14.23; 14.23 x 1.5 = 21.35, rounded up.
+SERIES_MAPE_MAX = 22.0
+
+#: Panel-mean model MAPE must be at or below seasonal-naive. Scale-free, so unlike the two ceilings it
+#: survives a fixture change untouched, and it cannot silently absorb a regression that a lucky
+#: calibration run baked into an absolute number.
+#:
+#: Calibrated at 0.958 — the model does beat "same weekday last week", but by only 4%, and four of the
+#: ten series (CA_HOUSEHOLD, WI_FOODS, WI_HOBBIES, WI_HOUSEHOLD) score *worse* than naive. That is a
+#: real property of the deliberately minimal design here — a random-walk level plus six weekly dummies,
+#: no covariates, no trend, no holidays — not of the forecasting engine, and it is why the guard is on
+#: the panel mean rather than per series. The thin margin is the point of the guard, not a reason to
+#: loosen it: the ceilings above are the loose half of the pair.
+MAX_NAIVE_RATIO = 1.0
 
 
 def _load_builder() -> ModuleType:
@@ -544,6 +592,29 @@ def _score_table(scores: M5Scores) -> str:
     return "\n".join([f"M5 aggregate accuracy ({HORIZON}-day holdout, {N_SERIES} series)", header, *rows, summary])
 
 
+def _threshold_failure(headline: str, scores: M5Scores) -> str:
+    """Compose a self-explaining threshold-failure message.
+
+    The headline carries the observed value and the threshold it broke; the table underneath carries
+    every series, so whoever reads the failure can tell a panel-wide regression from one series moving
+    without re-running a 75-second fit.
+
+    Parameters
+    ----------
+    headline : str
+        One line naming what was observed, what the limit was, and — where the check is per-series —
+        which series broke it.
+    scores : M5Scores
+        The scores the assertion read.
+
+    Returns
+    -------
+    str
+        The headline followed by :func:`_score_table`.
+    """
+    return f"{headline}\n{_score_table(scores)}"
+
+
 @pytest.fixture(scope="module")
 def fit() -> M5Fit:
     """Fit the aggregated panel once, forecast the holdout, and return everything un-normalized.
@@ -603,12 +674,12 @@ def scores(fit: M5Fit) -> M5Scores:
 
 
 class TestAccuracyHarness:
-    """The machinery the thresholds will later assert on: shapes, scale, and seed stability.
+    """The machinery the thresholds assert on: shapes, scale, and seed stability.
 
-    No error ceiling lives here on purpose — issue #61 lands the measurement, and calibrating what
-    counts as "too much error" is the next step. What is asserted is everything a threshold would
-    silently depend on: that the arrays line up, that they are on the fixture's own scale, and that
-    the numbers do not move between runs.
+    No error ceiling lives here on purpose — those are :class:`TestAccuracyThresholds`. What is
+    asserted here is everything a threshold silently depends on: that the arrays line up, that they
+    are on the fixture's own scale, and that the numbers do not move between runs. When a threshold
+    fails, these tests are what says whether the error moved or the harness did.
     """
 
     def test_fixture_shapes_and_scale(self, fit: M5Fit):
@@ -708,3 +779,82 @@ class TestAccuracyHarness:
             assert name in captured, f"{name} missing from the logged table"
         assert "panel mean:" in captured
         assert f"{scores.panel_mape_model:.2f}%" in captured
+
+
+class TestAccuracyThresholds:
+    """The tripwire: three assertions, loosest first, plus a check that they actually fire.
+
+    The two absolute ceilings are the loose half of the pair — 50% relative headroom over the
+    calibrated number, so ordinary tuning passes — and :data:`MAX_NAIVE_RATIO` is the half that cannot
+    rot, because it is measured against a baseline recomputed from the same split on every run.
+
+    They are not redundant. Measured 2026-09-03: zeroing the weekly block in ``Z_future`` moves the
+    panel mean to 13.57% and the worst series to 19.47%, both *inside* the ceilings — only the ratio
+    guard catches it, at 1.490. Forecasting from ``at[:, :, 0, :]`` instead of the last state breaks
+    all three (24.72% panel, 31.75% worst, ratio 2.714).
+    """
+
+    def test_panel_mape_is_under_the_ceiling(self, scores: M5Scores):
+        observed = scores.panel_mape_model
+
+        assert observed <= PANEL_MAPE_MAX, _threshold_failure(
+            f"panel-mean MAPE {observed:.2f}% exceeds PANEL_MAPE_MAX {PANEL_MAPE_MAX:.2f}%",
+            scores,
+        )
+
+    def test_no_series_is_over_the_per_series_ceiling(self, scores: M5Scores):
+        # Per-series, not just the mean: nine good series can hide one that blew up, and a broken
+        # state or a mis-continued seasonal block often shows on one series before the panel moves.
+        offenders = [
+            (name, scores.mape_model[i]) for i, name in enumerate(SERIES) if scores.mape_model[i] > SERIES_MAPE_MAX
+        ]
+
+        assert not offenders, _threshold_failure(
+            f"{len(offenders)} series over SERIES_MAPE_MAX {SERIES_MAPE_MAX:.2f}%: "
+            + ", ".join(f"{name} {value:.2f}%" for name, value in offenders),
+            scores,
+        )
+
+    def test_panel_beats_the_seasonal_naive_baseline(self, scores: M5Scores):
+        # Scale-free, so it survives a fixture change that moves every absolute MAPE, and it is the
+        # only one of the three that asserts the model is doing something rather than merely not
+        # doing something terrible.
+        observed = scores.panel_ratio
+
+        assert observed <= MAX_NAIVE_RATIO, _threshold_failure(
+            f"panel-mean model MAPE {scores.panel_mape_model:.2f}% is {observed:.3f}x the "
+            f"seasonal-naive {scores.panel_mape_naive:.2f}%, over MAX_NAIVE_RATIO {MAX_NAIVE_RATIO:.3f}",
+            scores,
+        )
+
+    def test_the_thresholds_fire_on_a_broken_forecast(self, fit: M5Fit, scores: M5Scores):
+        # A tripwire nobody has tripped is not known to work. Zeroing the weekly block in Z_future is
+        # the cheapest realistic break — the shapes, the identities and the fit all stay valid, and
+        # only the seasonal continuation is gone, which is exactly the class of regression the rest of
+        # the suite lands green on. Reuses the module fit, so this costs one forecast, not another
+        # NUTS run.
+        Z_broken = fit.Z_future.copy()
+        Z_broken[:, :, 1:PERIOD] = 0.0
+        out = forecast_ssp(fit.idata, Z_broken, noise_embed=False, seed=FORECAST_SEED)
+        broken = _score(
+            M5Fit(
+                idata=fit.idata,
+                Z_future=Z_broken,
+                forecast=np.median(out["forecast_samples"].values, axis=0) * fit.scale,
+                truth=fit.truth,
+                naive=fit.naive,
+                scale=fit.scale,
+            )
+        )
+
+        assert broken.panel_mape_model > scores.panel_mape_model, _threshold_failure(
+            f"a forecast with no weekly block scored {broken.panel_mape_model:.2f}%, no worse than "
+            f"the healthy {scores.panel_mape_model:.2f}% — the weekly states are not reaching the "
+            "forecast, so this module is guarding nothing",
+            broken,
+        )
+        assert broken.panel_ratio > MAX_NAIVE_RATIO, _threshold_failure(
+            f"a forecast with no weekly block scored ratio {broken.panel_ratio:.3f}, still within "
+            f"MAX_NAIVE_RATIO {MAX_NAIVE_RATIO:.3f} — the guard would not catch this break",
+            broken,
+        )
