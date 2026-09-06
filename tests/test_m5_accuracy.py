@@ -36,6 +36,12 @@ consecutive runs log the same numbers to the last digit.
 (:data:`PANEL_MAPE_MAX`, :data:`SERIES_MAPE_MAX`) plus the scale-free
 :data:`MAX_NAIVE_RATIO`. It closes with a test that breaks the forecast on purpose and asserts the
 guard fires, because a tripwire nobody has tripped is not known to work.
+
+:class:`TestDltAccuracyHarness` and :class:`TestDltAccuracyThresholds` (issue #65) repeat the whole
+arrangement for the DLT path — ``run_dlt_model`` -> :func:`make_inference` -> ``forecast_samples`` —
+on the same fixture, the same 728/28 split, the same metric helpers and the same logged table, with
+its own calibrated thresholds. ``dlt_model`` is single-series, so the panel is scored one column at a
+time behind :func:`dlt_fit`.
 """
 
 from __future__ import annotations
@@ -54,7 +60,7 @@ import xarray as xr
 
 from bunobee.datasets import M5_AGGREGATE_PATH, load_m5_aggregate
 from bunobee.models.ssp import build_forecast_design, forecast_ssp, transform_to_ekf_st
-from bunobee.regression import make_peridoic_dummies
+from bunobee.regression import RegressionScheme, make_peridoic_dummies
 
 logger = logging.getLogger(__name__)
 
@@ -543,6 +549,34 @@ def _seasonal_naive(y_train: np.ndarray, horizon: int, period: int = NAIVE_PERIO
     return y_train[-period:][np.arange(horizon) % period]
 
 
+def _score_forecast(truth: np.ndarray, forecast: np.ndarray, naive: np.ndarray) -> M5Scores:
+    """Score a point forecast against a holdout and its seasonal-naive baseline.
+
+    The scoring core shared by both paths: :class:`TestAccuracyThresholds` (SSP) reaches it through
+    :func:`_score`, and :class:`TestDltAccuracyThresholds` calls it directly. Keeping it here means the
+    two guards read the same metric helpers rather than each carrying a copy.
+
+    Parameters
+    ----------
+    truth, forecast, naive : np.ndarray, shape (horizon, n_series)
+        Actuals, model point forecast, and seasonal-naive baseline, on the same scale.
+
+    Returns
+    -------
+    M5Scores
+        Per-series and panel-mean error of the model and the baseline.
+    """
+    mape_model = _mape(truth, forecast)
+    mape_naive = _mape(truth, naive)
+    return M5Scores(
+        mape_model=mape_model,
+        mape_naive=mape_naive,
+        smape_model=_smape(truth, forecast),
+        smape_naive=_smape(truth, naive),
+        ratio=mape_model / mape_naive,
+    )
+
+
 def _score(fit: M5Fit) -> M5Scores:
     """Score a fit against its holdout and its seasonal-naive baseline.
 
@@ -556,15 +590,7 @@ def _score(fit: M5Fit) -> M5Scores:
     M5Scores
         Per-series and panel-mean error of both forecasts.
     """
-    mape_model = _mape(fit.truth, fit.forecast)
-    mape_naive = _mape(fit.truth, fit.naive)
-    return M5Scores(
-        mape_model=mape_model,
-        mape_naive=mape_naive,
-        smape_model=_smape(fit.truth, fit.forecast),
-        smape_naive=_smape(fit.truth, fit.naive),
-        ratio=mape_model / mape_naive,
-    )
+    return _score_forecast(fit.truth, fit.forecast, fit.naive)
 
 
 def _score_table(scores: M5Scores) -> str:
@@ -860,5 +886,409 @@ class TestAccuracyThresholds:
         assert broken.panel_ratio > MAX_NAIVE_RATIO, _threshold_failure(
             f"a forecast with no weekly block scored ratio {broken.panel_ratio:.3f}, still within "
             f"MAX_NAIVE_RATIO {MAX_NAIVE_RATIO:.3f} — the guard would not catch this break",
+            broken,
+        )
+
+
+# ===========================================================================
+# The DLT forecast path — issue #65
+# ===========================================================================
+#
+# The block above guards the SSP path (``_ekf_prior`` -> ``transform_to_ekf_st`` -> NUTS ->
+# ``forecast_ssp``). The Damped Local Trend path — ``run_dlt_model`` -> ``make_inference`` ->
+# ``forecast_samples`` — is the other public forecasting API in the package, and the same class of
+# silent quality regression can land there. This block scores it on the *same* committed fixture and
+# the *same* 728/28 split, through the *same* :func:`_mape` / :func:`_smape` / :func:`_seasonal_naive`
+# helpers and the *same* :func:`_score_table` logging, with its own calibrated thresholds.
+#
+# The one structural difference from the SSP block: ``dlt_model`` is single-series, so the panel is
+# scored one column at a time — ten independent NUTS fits behind the module fixture instead of one
+# shared-state fit. The DLT recursion carries its own level and damped trend, so seasonality is the
+# only thing the design has to supply: six positional weekly dummies as neutral-sign regressors, the
+# same weekly block the SSP design uses, with the dropped reference day folded into the DLT level.
+
+
+#: Smoothing and damping for :func:`run_dlt_model`. Inside ``bunobee.hyper_tune``'s search space
+#: (``lev_sm`` <= 0.1, ``slp_sm`` <= 0.1, ``theta`` in ``[0, 1]``): a slow level, a very slow trend and
+#: middling damping, which is the usual ordering for a daily retail aggregate and keeps the 28-day
+#: trend extrapolation from running away on the noisier state x category series.
+DLT_LEV_SM = 0.05
+DLT_SLP_SM = 0.01
+DLT_THETA = 0.5
+
+#: Neutral-sign prior for every weekly dummy coefficient, on the mean-normalized scale the panel is
+#: fit on. Wide enough not to bind (weekly deviations sit near +/-0.1 of the normalized level).
+DLT_COEF_LOC = 0.0
+DLT_COEF_SCALE = 0.5
+
+#: Column names for the six positional weekly dummies, in design order.
+DLT_WEEKDAY_COLS = [f"weekday_{i}" for i in range(1, PERIOD)]
+
+# NUTS budget for one series. Half the SSP block's draw count and a single chain: the DLT posterior
+# here is seven well-identified parameters (``sigma`` plus six weekly coefficients), so the geometry
+# is trivial and the point forecast this module scores is a *median*. Measured 2026-09-06 on the
+# committed fixture: 100 vs 200 draws and 1 vs 2 chains move the panel-mean MAPE by under 0.05 points
+# and the worst series by under 0.1. Ten sequential fits at this budget land the DLT block near 75 s,
+# on top of the SSP block's ~70 s.
+DLT_NUM_WARMUP = 100
+DLT_NUM_SAMPLES = 100
+DLT_NUM_CHAINS = 1
+DLT_N_POSTERIOR = DLT_NUM_CHAINS * DLT_NUM_SAMPLES
+
+#: Base PRNG seed. Each series folds its index into this, so the ten fits are distinct but pinned.
+DLT_SEED = 0
+
+# ---------------------------------------------------------------------------
+# DLT thresholds
+# ---------------------------------------------------------------------------
+
+# Calibrated 2026-09-06 on the committed fixture, at the DLT configuration above. The full run:
+#
+#   series            MAPE%   naive%   ratio
+#   CA_FOODS           5.72     6.70   0.853
+#   CA_HOBBIES         7.49     8.38   0.894
+#   CA_HOUSEHOLD       5.13     5.28   0.972
+#   TOTAL              6.32     8.31   0.761
+#   TX_FOODS           8.71     9.70   0.898
+#   TX_HOBBIES        10.32    12.02   0.859
+#   TX_HOUSEHOLD       7.08    10.72   0.661
+#   WI_FOODS          12.01    13.19   0.911
+#   WI_HOBBIES         8.43     8.79   0.959
+#   WI_HOUSEHOLD       8.73     7.99   1.094
+#   panel mean: MAPE 7.99% | seasonal-naive MAPE 9.11% | ratio 0.878
+#
+# Same headroom rule as the SSP block: the two absolute ceilings carry 50% relative headroom over
+# their calibrated value, rounded up to a clean number, so they pass through ordinary tuning and fail
+# on a broken algorithm. Re-derive them by re-running this block and applying the same rule.
+
+#: Panel-mean MAPE ceiling, in percent. Calibrated 7.99; 7.99 x 1.5 = 11.99, rounded up.
+DLT_PANEL_MAPE_MAX = 12.0
+
+#: Per-series MAPE ceiling, in percent, so one blown-up series cannot hide behind nine good ones.
+#: Calibrated on the worst series, ``WI_FOODS`` at 12.01; 12.01 x 1.5 = 18.02, rounded up.
+DLT_SERIES_MAPE_MAX = 19.0
+
+#: Panel-mean model MAPE must be at or below seasonal-naive — the same scale-free guard the SSP block
+#: carries as :data:`MAX_NAIVE_RATIO`. Calibrated at 0.878: the DLT path does beat "same weekday last
+#: week" on the panel mean, though ``WI_HOUSEHOLD`` scores worse than naive, which is why the guard is
+#: on the panel mean rather than per series.
+DLT_MAX_NAIVE_RATIO = 1.0
+
+
+def _dlt_weekday_covariates(n_all: int) -> pd.DataFrame:
+    """Build the positional weekly-dummy covariate frame the DLT regression consumes.
+
+    Parameters
+    ----------
+    n_all : int
+        Number of time steps.
+
+    Returns
+    -------
+    pd.DataFrame, shape (n_all, PERIOD - 1)
+        Columns :data:`DLT_WEEKDAY_COLS`, one 0/1 dummy per weekday with the reference day dropped.
+        Positional, so ``iloc[N_STEPS:]`` gives the correctly phased future dummies.
+    """
+    dummies = np.asarray(make_peridoic_dummies(n_all, period=PERIOD, drop_first=True), dtype=float)
+    return pd.DataFrame(dummies, columns=DLT_WEEKDAY_COLS)
+
+
+def _dlt_regression_scheme() -> RegressionScheme:
+    """Neutral-sign scheme with one entry per weekly dummy.
+
+    Returns
+    -------
+    RegressionScheme
+        Every weekday dummy declared sign ``"="`` with a ``Normal(DLT_COEF_LOC, DLT_COEF_SCALE)``
+        coefficient prior.
+    """
+    scheme = pd.DataFrame(
+        {
+            "regressor": DLT_WEEKDAY_COLS,
+            "sign": ["="] * len(DLT_WEEKDAY_COLS),
+            "loc_prior": [DLT_COEF_LOC] * len(DLT_WEEKDAY_COLS),
+            "scale_prior": [DLT_COEF_SCALE] * len(DLT_WEEKDAY_COLS),
+        }
+    ).set_index("regressor")
+    return RegressionScheme(scheme)
+
+
+@dataclass(frozen=True)
+class DltM5Fit:
+    """Ten per-series DLT fits of the aggregated M5 panel, scored on the shared 28-day holdout.
+
+    Every array is on the **un-normalized** scale of the fixture — units of sales per day — so a
+    threshold read off this object means the same thing as one read off the raw CSV.
+
+    Attributes
+    ----------
+    idatas : tuple of xr.Dataset
+        One :func:`run_dlt_model` posterior per series, in :data:`SERIES` order. Kept so the
+        broken-forecast check can re-forecast without a second NUTS run.
+    forecast : np.ndarray, shape (HORIZON, N_SERIES)
+        Point forecast: the posterior **median** over the ``sample`` axis, un-normalized.
+    truth : np.ndarray, shape (HORIZON, N_SERIES)
+        Held-out actuals over the same window as the SSP block.
+    naive : np.ndarray, shape (HORIZON, N_SERIES)
+        Seasonal-naive baseline, ``y[t - 7]`` carried across the horizon.
+    scale : np.ndarray, shape (N_SERIES,)
+        Per-series training-window mean used to normalize, kept so the un-normalization is auditable.
+    """
+
+    idatas: tuple
+    forecast: np.ndarray
+    truth: np.ndarray
+    naive: np.ndarray
+    scale: np.ndarray
+
+
+def _dlt_panel_forecast(idatas: tuple, scale: np.ndarray, cov_all: pd.DataFrame) -> np.ndarray:
+    """Continue each per-series DLT posterior across the horizon and assemble an un-normalized panel.
+
+    Parameters
+    ----------
+    idatas : tuple of xr.Dataset
+        Per-series :func:`run_dlt_model` posteriors, in :data:`SERIES` order.
+    scale : np.ndarray, shape (N_SERIES,)
+        Per-series normalization means.
+    cov_all : pd.DataFrame, shape (N_DATES, PERIOD - 1)
+        Weekly-dummy covariates over the full window; its length fixes ``end_step`` inside
+        :func:`make_inference`.
+
+    Returns
+    -------
+    np.ndarray, shape (HORIZON, N_SERIES)
+        Posterior-median point forecast over the holdout, un-normalized.
+    """
+    from jax import random
+
+    from bunobee.models.dlt import make_inference
+
+    forecast = np.zeros((HORIZON, N_SERIES))
+    for j, idata in enumerate(idatas):
+        key = random.fold_in(random.PRNGKey(DLT_SEED), j)
+        out = make_inference(key, idata, DLT_LEV_SM, DLT_SLP_SM, DLT_THETA, covariates_df=cov_all)
+        forecast[:, j] = np.median(out["forecast_samples"].values, axis=0)[N_STEPS:] * scale[j]
+    return forecast
+
+
+@pytest.fixture(scope="module")
+def dlt_fit() -> DltM5Fit:
+    """Fit all ten panel columns with the DLT path once, forecast the holdout, return un-normalized.
+
+    Returns
+    -------
+    DltM5Fit
+        Per-series posteriors, point forecast, actuals, and the seasonal-naive baseline.
+    """
+    pytest.importorskip("numpyro")
+
+    from jax import random
+
+    from bunobee.models.dlt import run_dlt_model
+
+    y_raw = _to_panel(_read_panel())
+    assert y_raw.shape == (N_DATES, N_SERIES)
+
+    # Per-series mean normalization fitted on the training window only, matching the SSP block: the
+    # holdout stays out of sample and scoring happens after un-normalizing.
+    scale = y_raw[:N_STEPS].mean(axis=0)
+
+    cov_all = _dlt_weekday_covariates(N_DATES)
+    cov_train = cov_all.iloc[:N_STEPS].reset_index(drop=True)
+    scheme = _dlt_regression_scheme()
+    mcmc_args = {
+        "num_warmup": DLT_NUM_WARMUP,
+        "num_samples": DLT_NUM_SAMPLES,
+        "num_chains": DLT_NUM_CHAINS,
+        "chain_method": "sequential",
+        "progress_bar": False,
+    }
+
+    idatas = []
+    for j in range(N_SERIES):
+        y_train = y_raw[:N_STEPS, j] / scale[j]
+        key = random.fold_in(random.PRNGKey(DLT_SEED), j)
+        idatas.append(
+            run_dlt_model(
+                key,
+                DLT_LEV_SM,
+                DLT_SLP_SM,
+                DLT_THETA,
+                y_train,
+                mcmc_run_args=mcmc_args,
+                regression_scheme=scheme,
+                covariates_df=cov_train,
+            )
+        )
+    idatas = tuple(idatas)
+
+    return DltM5Fit(
+        idatas=idatas,
+        forecast=_dlt_panel_forecast(idatas, scale, cov_all),
+        truth=y_raw[N_STEPS:],
+        naive=_seasonal_naive(y_raw[:N_STEPS], HORIZON),
+        scale=scale,
+    )
+
+
+@pytest.fixture(scope="module")
+def dlt_scores(dlt_fit: DltM5Fit) -> M5Scores:
+    """Score the DLT panel fit once; every DLT assertion reads this.
+
+    Parameters
+    ----------
+    dlt_fit : DltM5Fit
+        The module fixture.
+
+    Returns
+    -------
+    M5Scores
+        Per-series and panel-mean error, via the shared :func:`_score_forecast`.
+    """
+    return _score_forecast(dlt_fit.truth, dlt_fit.forecast, dlt_fit.naive)
+
+
+class TestDltAccuracyHarness:
+    """The DLT machinery the thresholds assert on: shapes, scale, and seed stability.
+
+    Mirrors :class:`TestAccuracyHarness` for the DLT path. No error ceiling lives here — those are
+    :class:`TestDltAccuracyThresholds`. What is asserted is everything a threshold silently depends
+    on: that the arrays line up, that they are on the fixture's own scale, and that the numbers do not
+    move between runs.
+    """
+
+    def test_fixture_shapes_and_scale(self, dlt_fit: DltM5Fit):
+        assert dlt_fit.forecast.shape == (HORIZON, N_SERIES)
+        assert dlt_fit.truth.shape == (HORIZON, N_SERIES)
+        assert dlt_fit.naive.shape == (HORIZON, N_SERIES)
+        assert len(dlt_fit.idatas) == N_SERIES
+        assert np.isfinite(dlt_fit.forecast).all()
+        # Un-normalized: the panel runs in the thousands of units per day, so a forecast still on the
+        # ~1.0 normalized scale would be an un-normalization bug, not a modelling one.
+        np.testing.assert_allclose(dlt_fit.scale, _to_panel(_read_panel())[:N_STEPS].mean(axis=0))
+        assert dlt_fit.forecast.min() > 1.0
+        assert 0.2 < dlt_fit.forecast.mean() / dlt_fit.truth.mean() < 5.0
+
+    def test_holdout_truth_matches_the_fixture_tail(self, dlt_fit: DltM5Fit):
+        # The split is the load-bearing part of the guard: an off-by-one here would score the model
+        # against data it trained on and every threshold would read as passing.
+        panel = _read_panel()
+        tail_dates = sorted(panel["date"].unique())[N_STEPS:]
+        expected = _to_panel(panel[panel["date"].isin(tail_dates)])
+
+        assert len(tail_dates) == HORIZON
+        np.testing.assert_array_equal(dlt_fit.truth, expected)
+
+    def test_seasonal_naive_repeats_the_last_training_week(self, dlt_fit: DltM5Fit):
+        y_raw = _to_panel(_read_panel())
+
+        np.testing.assert_array_equal(dlt_fit.naive[:NAIVE_PERIOD], y_raw[N_STEPS - NAIVE_PERIOD : N_STEPS])
+        for block in range(1, HORIZON // NAIVE_PERIOD):
+            start = block * NAIVE_PERIOD
+            np.testing.assert_array_equal(dlt_fit.naive[start : start + NAIVE_PERIOD], dlt_fit.naive[:NAIVE_PERIOD])
+
+    def test_weekday_covariates_continue_the_weekly_cycle(self):
+        cov = _dlt_weekday_covariates(N_DATES)
+
+        assert list(cov.columns) == DLT_WEEKDAY_COLS
+        assert cov.shape == (N_DATES, PERIOD - 1)
+        assert set(np.unique(cov.values)) <= {0.0, 1.0}
+        # Every step lands on at most one weekday dummy (the reference day is all-zero).
+        np.testing.assert_array_equal(np.unique(cov.values.sum(axis=1)), np.array([0.0, 1.0]))
+        # ... and the phase of the future block continues unbroken from the training block.
+        np.testing.assert_array_equal(
+            cov.iloc[N_STEPS:].to_numpy(), _dlt_weekday_covariates(N_DATES).iloc[N_STEPS:].to_numpy()
+        )
+
+    def test_metrics_are_finite_and_well_posed(self, dlt_scores: M5Scores):
+        for name in ("mape_model", "mape_naive", "smape_model", "smape_naive", "ratio"):
+            values = getattr(dlt_scores, name)
+            assert values.shape == (N_SERIES,)
+            assert np.isfinite(values).all(), f"{name} is not finite: {values}"
+            assert (values > 0).all(), f"{name} has a non-positive entry: {values}"
+        np.testing.assert_allclose(dlt_scores.ratio, dlt_scores.mape_model / dlt_scores.mape_naive)
+        np.testing.assert_allclose(dlt_scores.panel_mape_model, dlt_scores.mape_model.mean())
+
+    def test_point_forecast_is_reproducible(self, dlt_fit: DltM5Fit):
+        # The continuation and the median are the two steps between make_inference and every number
+        # this block reports, so pin both against a fresh pass over the same posteriors and seeds.
+        np.random.default_rng().standard_normal(1000)
+        again = _dlt_panel_forecast(dlt_fit.idatas, dlt_fit.scale, _dlt_weekday_covariates(N_DATES))
+
+        np.testing.assert_array_equal(dlt_fit.forecast, again)
+
+    def test_per_series_table_is_logged(self, caplog, dlt_scores: M5Scores):
+        with caplog.at_level(logging.INFO, logger=__name__):
+            logger.info("\n%s", _score_table(dlt_scores))
+
+        captured = caplog.text
+        for name in SERIES:
+            assert name in captured, f"{name} missing from the logged table"
+        assert "panel mean:" in captured
+        assert f"{dlt_scores.panel_mape_model:.2f}%" in captured
+
+
+class TestDltAccuracyThresholds:
+    """The DLT tripwire: three assertions, loosest first, plus a check that they actually fire.
+
+    Mirrors :class:`TestAccuracyThresholds`. The two absolute ceilings are the loose half of the pair
+    — 50% relative headroom over the calibrated number — and :data:`DLT_MAX_NAIVE_RATIO` is the half
+    that cannot rot, because it is measured against a baseline recomputed from the same split on every
+    run.
+    """
+
+    def test_panel_mape_is_under_the_ceiling(self, dlt_scores: M5Scores):
+        observed = dlt_scores.panel_mape_model
+
+        assert observed <= DLT_PANEL_MAPE_MAX, _threshold_failure(
+            f"DLT panel-mean MAPE {observed:.2f}% exceeds DLT_PANEL_MAPE_MAX {DLT_PANEL_MAPE_MAX:.2f}%",
+            dlt_scores,
+        )
+
+    def test_no_series_is_over_the_per_series_ceiling(self, dlt_scores: M5Scores):
+        offenders = [
+            (name, dlt_scores.mape_model[i])
+            for i, name in enumerate(SERIES)
+            if dlt_scores.mape_model[i] > DLT_SERIES_MAPE_MAX
+        ]
+
+        assert not offenders, _threshold_failure(
+            f"{len(offenders)} series over DLT_SERIES_MAPE_MAX {DLT_SERIES_MAPE_MAX:.2f}%: "
+            + ", ".join(f"{name} {value:.2f}%" for name, value in offenders),
+            dlt_scores,
+        )
+
+    def test_panel_beats_the_seasonal_naive_baseline(self, dlt_scores: M5Scores):
+        observed = dlt_scores.panel_ratio
+
+        assert observed <= DLT_MAX_NAIVE_RATIO, _threshold_failure(
+            f"DLT panel-mean model MAPE {dlt_scores.panel_mape_model:.2f}% is {observed:.3f}x the "
+            f"seasonal-naive {dlt_scores.panel_mape_naive:.2f}%, over DLT_MAX_NAIVE_RATIO {DLT_MAX_NAIVE_RATIO:.3f}",
+            dlt_scores,
+        )
+
+    def test_the_thresholds_fire_on_a_broken_forecast(self, dlt_fit: DltM5Fit, dlt_scores: M5Scores):
+        # A tripwire nobody has tripped is not known to work. Zeroing the future weekday dummies is
+        # the cheapest realistic break — the shapes, the identities and the fits all stay valid, and
+        # only the seasonal continuation is gone. Reuses the module fits, so this costs ten forecasts,
+        # not another NUTS run.
+        cov_broken = _dlt_weekday_covariates(N_DATES)
+        cov_broken.iloc[N_STEPS:, :] = 0.0
+        broken = _score_forecast(
+            dlt_fit.truth,
+            _dlt_panel_forecast(dlt_fit.idatas, dlt_fit.scale, cov_broken),
+            dlt_fit.naive,
+        )
+
+        assert broken.panel_mape_model > dlt_scores.panel_mape_model, _threshold_failure(
+            f"a forecast with no future weekly block scored {broken.panel_mape_model:.2f}%, no worse "
+            f"than the healthy {dlt_scores.panel_mape_model:.2f}% — the weekly regressors are not "
+            "reaching the forecast, so this block is guarding nothing",
+            broken,
+        )
+        assert broken.panel_ratio > DLT_MAX_NAIVE_RATIO, _threshold_failure(
+            f"a forecast with no future weekly block scored ratio {broken.panel_ratio:.3f}, still "
+            f"within DLT_MAX_NAIVE_RATIO {DLT_MAX_NAIVE_RATIO:.3f} — the guard would not catch this break",
             broken,
         )
