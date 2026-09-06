@@ -58,6 +58,10 @@ from bunobee.regression import make_peridoic_dummies
 
 logger = logging.getLogger(__name__)
 
+# The accuracy guard runs a real NUTS fit, so it is materially slower than the rest of the suite. It
+# stays in the default CI run; local iteration can deselect it with ``pytest -m "not slow"``.
+pytestmark = pytest.mark.slow
+
 _ROOT = Path(__file__).resolve().parents[1]
 M5_PANEL = M5_AGGREGATE_PATH
 M5_SOURCE = _ROOT / "playground" / "resource" / "m5-forecasting-accuracy"
