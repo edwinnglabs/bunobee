@@ -62,3 +62,6 @@ extend-exclude = ""
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "INFO"
+markers = [
+    "slow: marks a test as slow (deselect locally with -m 'not slow'; still runs in CI)",
+]
