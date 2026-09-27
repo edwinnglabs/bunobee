@@ -16,7 +16,6 @@ the single source of truth for their names, meanings, and colors.
 | `refactor` | `#5319e7` | Internal restructuring; behavior stays the same. |
 | `review` | `#cc317c` | Needs a review, audit, or discussion before action. |
 | `test` | `#1d76db` | Add, fix, or improve tests / coverage. |
-| 
 
 ## Priority (how urgent)
 
