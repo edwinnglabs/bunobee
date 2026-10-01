@@ -39,6 +39,10 @@ This gives a natural test-before-promote flow for a final version, e.g. `0.0.5`:
    `pip install -i https://test.pypi.org/simple/ bunobee==0.0.5`.
 4. Happy with it → approve the pending run → the `pypi` job executes and publishes for
    real. Not happy → don't approve (or cancel the run) — nothing reaches PyPI.
+5. Once `pypi` succeeds, the `github-release` job tags the commit `vX.Y.Z` and creates the
+   GitHub release, using the matching `## [vX.Y.Z]` section of `CHANGELOG.md` as the notes
+   (falling back to GitHub's generated notes if that section is missing). It no-ops if the
+   release already exists. Keep the changelog section written before you bump the version.
 
 ## Idempotency
 

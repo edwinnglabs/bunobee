@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.0.5] - 2026-10-01
+
+Adds SSP forecasting, prior fusion and smoothed prior extension, and a packaged M5 dataset
+with forecast-accuracy guards.
+
 ### Added
 
+- `forecast_ssp` — multi-series SSP predictive draws from a fitted posterior. Launches from
+  the last filtered state, propagates a driftless random walk forward, and returns
+  `forecast_samples` / `mu_samples` (and `eps_samples` with `noise_embed`) over
+  `(sample, time, series)`. `method="filter"` propagates the future state through the filter
+  itself, so missing future observations become pure predict steps.
+- `build_forecast_design` — continues a training design matrix past the end of the sample,
+  producing the `Z_future` array `forecast_ssp` consumes.
+- `mask` argument on `kalman_filter_1d_st` and `kalman_filter_1d_ekf_st` — an opt-in
+  predict-only step wherever an observation is missing. `log_p` scores only observed entries;
+  `mask=None` (the default) leaves outputs bitwise identical.
+- `plot_prior_density` — per-state density panel for SSP priors.
+- `bunobee.datasets` with `load_m5_aggregate()` — the aggregated M5 panel shipped as package
+  data.
+- Forecast-accuracy guards on the M5 aggregate for the SSP and DLT forecast paths, gated
+  behind a registered `slow` pytest marker.
+- Packaging CI (build, `twine check`, clean-venv install) and a version-driven publish
+  workflow: `.devN` / pre-release versions go to Test PyPI, final versions to PyPI after
+  approval. See `RELEASE.md`.
+- README rewritten as the PyPI landing page, with an SSP forecast quickstart; new SSP
+  notebooks covering forecasting, `combine_states_priors` and multi-anchor prior extension.
 - PEP 561 `py.typed` marker so downstream type checkers honor the package's type hints.
 - `extend_states_prior_smoothed` — exact KF-forward + RTS-backward anchor extension that
   fuses every anchor per state, for multi-anchor channels the nearest-anchor heuristic only
@@ -46,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape. Unanchored states get `a0 = 0`, `P0 = inf`. The derived moments are a placeholder,
   so an `a0` / `P0` already present on the input is preserved rather than overwritten — pass
   `overwrite_init=True` to let the placeholder win instead.
+- The M5 prediction path now runs on the shared SSP forecast core.
+
+### Fixed
+
+- `extend_states_prior_smoothed` no longer collapses pre-first-anchor variances toward zero
+  under float32 (JAX's default precision); see the `P0 = inf` seeding under Added.
+- The positivity mask is now disambiguated between the EKF and linear filters.
+- Extending a states prior preserves an `a0` / `P0` already present on the input.
 
 ## [v0.0.4]
 
@@ -72,5 +105,6 @@ consolidates the state-space (SSP) engine work that landed across them.
 
 - Unused `setuptools-scm` from build requirements.
 
-[Unreleased]: https://github.com/edwinnglabs/bunobee/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/edwinnglabs/bunobee/compare/v0.0.5...HEAD
+[v0.0.5]: https://github.com/edwinnglabs/bunobee/compare/v0.0.4...v0.0.5
 [v0.0.4]: https://github.com/edwinnglabs/bunobee/releases/tag/v0.0.4
