@@ -43,6 +43,8 @@ This gives a natural test-before-promote flow for a final version, e.g. `0.0.5`:
    GitHub release, using the matching `## [vX.Y.Z]` section of `CHANGELOG.md` as the notes
    (falling back to GitHub's generated notes if that section is missing). It no-ops if the
    release already exists. Keep the changelog section written before you bump the version.
+6. Once the GitHub release exists, bump `main` to the next dev version (see
+   [After a release](#after-a-release)).
 
 ## Idempotency
 
@@ -59,3 +61,11 @@ hit exactly this 400 error).
 - Ready to ship: bump to the final `X.Y.Z` — either from a `.devN` of the same version or
   directly from the prior release. Both paths publish to Test PyPI immediately and to PyPI
   once approved.
+
+## After a release
+
+While `main` sits at a final version, every later push to `main` (docs, notebooks, CI changes) reaches
+the `pypi` job and leaves a "Waiting" run that needs approval or cancelling. To avoid that, bump
+`pyproject.toml` to the next dev version as soon as the GitHub release for `vX.Y.Z` exists:
+`X.Y.(Z+1).dev0` (for example `0.0.5` -> `0.0.6.dev0`). Pushes then publish to Test PyPI only,
+unattended, until the next final version is bumped in.
