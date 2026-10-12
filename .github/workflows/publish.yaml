@@ -5,7 +5,12 @@ on:
     branches: [main]
 
 jobs:
+  # Nothing is built or published unless the full CI workflow passes for this commit.
+  ci:
+    uses: ./.github/workflows/ci.yaml
+
   resolve-version:
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -30,7 +35,7 @@ jobs:
           echo "Resolved version=$VERSION  is_prerelease=$IS_PRE"
 
   build:
-    needs: resolve-version
+    needs: [ci, resolve-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

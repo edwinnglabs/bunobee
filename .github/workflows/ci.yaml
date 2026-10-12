@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets Publish run this same workflow as a gate before building or publishing.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -45,6 +47,10 @@ jobs:
       # in the notebook metadata, which nbstripout honours.
       - name: Verify notebooks are stripped
         run: nbstripout --verify $(git ls-files '*.ipynb')
+
+      # --verify skips notebooks marked keep_output, so every opt-out must be allowlisted.
+      - name: Check keep_output allowlist
+        run: python .github/scripts/check_keep_output.py .github/keep_output_notebooks.txt $(git ls-files '*.ipynb')
 
       # Guards the opt-out: a "keep_output" notebook full of base64 PNGs is the one
       # thing --verify cannot catch, so cap every notebook's on-disk size.
