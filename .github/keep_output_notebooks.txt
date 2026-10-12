@@ -1,0 +1,6 @@
+# Notebooks allowed to commit rendered outputs ("keep_output": true in their metadata).
+# CI fails if a notebook opts out of nbstripout without being listed here, so adding a line is the
+# explicit, reviewed step for a new rendered notebook. Keep each one under the CI size budget.
+playground/m5_prototype/m5_aggregate_forecast_accuracy.ipynb
+playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb
+playground/statespace_prototype/ssp_10_coef_recovery_case_study.ipynb
