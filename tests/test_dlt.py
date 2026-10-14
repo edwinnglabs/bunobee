@@ -2,11 +2,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import xarray as xr
 from jax import lax
 
 jax.config.update("jax_enable_x64", True)
 
-from bunobee.models.dlt import dlt_transition_step, run_dlt_model, make_inference
+from bunobee.models.dlt import (
+    dlt_transition_step,
+    generate_dlt_components,
+    generate_noise_components,
+    make_inference,
+    run_dlt_model,
+)
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -174,3 +181,56 @@ class TestMakeInference:
             RNG, trained_posteriors, LEV_SM, SLP_SM, THETA, end_step=N_TRAIN, transform_callback=jnp.exp
         )
         assert float(jnp.min(jnp.array(result["forecast_samples"].values))) > 0.0
+
+
+class TestNoFutureState:
+    """#78: the predict path only uses the train-end state and noise draws, never states beyond it."""
+
+    N_SAMPLES, H, SIGMA, LAST_LEV, LAST_SLP = 4000, 8, 1.0, 10.0, 0.5
+
+    def _idata(self):
+        n = self.N_SAMPLES
+        return xr.Dataset(
+            {
+                "dlt_comp": (["chain", "draw", "time"], np.zeros((1, n, N_TRAIN))),
+                "sigma": (["chain", "draw"], np.full((1, n), self.SIGMA)),
+                "last_lev": (["chain", "draw"], np.full((1, n), self.LAST_LEV)),
+                "last_slp": (["chain", "draw"], np.full((1, n), self.LAST_SLP)),
+            }
+        )
+
+    def test_oos_states_depend_only_on_train_end_state_and_noise(self):
+        idata = self._idata()
+        comp = np.asarray(generate_dlt_components(RNG, idata, N_TRAIN + self.H, LEV_SM, SLP_SM, THETA))[:, N_TRAIN:]
+        eps = np.asarray(generate_noise_components(RNG, idata, self.H))
+
+        lev = np.full(self.N_SAMPLES, self.LAST_LEV)
+        slp = np.full(self.N_SAMPLES, self.LAST_SLP)
+        expected = np.empty_like(eps)
+        for t in range(self.H):
+            expected[:, t] = lev + THETA * slp
+            new_lev = LEV_SM * (expected[:, t] + eps[:, t]) + (1 - LEV_SM) * expected[:, t]
+            slp = SLP_SM * (new_lev - lev) + (1 - SLP_SM) * slp
+            lev = new_lev
+
+        np.testing.assert_allclose(comp, expected, rtol=1e-10)
+        np.testing.assert_allclose(comp[:, 0], self.LAST_LEV + THETA * self.LAST_SLP)
+
+    def test_noise_embed_spread_matches_true_process(self):
+        idata = self._idata()
+        out = make_inference(RNG, idata, LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + self.H, noise_embed=True)
+        forecast = np.asarray(out["forecast_samples"])[:, N_TRAIN:]
+
+        # simulate the true generative process from the same origin state
+        rng = np.random.default_rng(1)
+        lev = np.full(self.N_SAMPLES, self.LAST_LEV)
+        slp = np.full(self.N_SAMPLES, self.LAST_SLP)
+        truth = np.empty((self.N_SAMPLES, self.H))
+        for t in range(self.H):
+            comp = lev + THETA * slp
+            truth[:, t] = comp + rng.normal(scale=self.SIGMA, size=self.N_SAMPLES)
+            new_lev = LEV_SM * truth[:, t] + (1 - LEV_SM) * comp
+            slp = SLP_SM * (new_lev - lev) + (1 - SLP_SM) * slp
+            lev = new_lev
+
+        np.testing.assert_allclose(forecast.std(axis=0), truth.std(axis=0), rtol=0.1)
