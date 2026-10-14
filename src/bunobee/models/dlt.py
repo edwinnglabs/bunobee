@@ -467,7 +467,10 @@ def make_inference(
         ``forecast_samples`` to represent observation-level uncertainty.  The
         noise is sampled independently from the noise already used inside
         ``generate_dlt_components`` for stochastic state evolution.
-        Defaults to ``False`` (return the deterministic trend + regression).
+        Defaults to ``False`` (return the deterministic trend + regression), in which
+        case the band reflects only state-propagated uncertainty (zero at the first
+        step) and is narrower than the predictive distribution of ``y``.  Set
+        ``True`` for intervals that cover future observations.
 
     Returns
     -------
