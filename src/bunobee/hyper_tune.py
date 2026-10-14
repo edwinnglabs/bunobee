@@ -5,12 +5,15 @@ from jax import vmap
 import logging
 import xarray as xr
 
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+import pandas as pd
 
 from .utils import flatten_front_dim
 from .models.dlt import run_dlt_model
+from .regression import RegressionScheme
 
-logger = logging.getLogger("wunku")
+logger = logging.getLogger("bunobee")
 
 
 def slice_trend_single(trend_comp: jnp.ndarray, h: int) -> jnp.ndarray:
@@ -58,8 +61,8 @@ def generate_forecast_span_samples(idata: xr.Dataset, h: int) -> jnp.ndarray:
     dlt_comp = flatten_front_dim(idata["dlt_comp"].to_numpy(), n=2)
     reg_comp = flatten_front_dim(idata["reg_comp"].to_numpy(), n=2)
 
-    logger.debug("dlt_comp shape:", dlt_comp.shape)
-    logger.debug("reg_comp shape:", reg_comp.shape)
+    logger.debug("dlt_comp shape: %s", dlt_comp.shape)
+    logger.debug("reg_comp shape: %s", reg_comp.shape)
 
     dlt_comp_slice = dlt_comp[:, : -(h - 1), None]
     reg_comp_slice = slice_trend(reg_comp, h=h)
@@ -117,20 +120,42 @@ def compute_wbic(loglk: jnp.ndarray) -> float:
     return wbic
 
 
-def run_dlt_model_and_compute_wbic(params: Tuple, data: Dict[str, np.ndarray], h: int = 12) -> float:
+DEFAULT_MCMC_RUN_ARGS = {"num_warmup": 200, "num_samples": 200, "num_chains": 1, "progress_bar": False}
+
+
+def run_dlt_model_and_compute_wbic(
+    params: Tuple,
+    y: np.ndarray,
+    rng_key: jnp.ndarray,
+    mcmc_run_args: Dict[str, Any],
+    regression_scheme: Optional[RegressionScheme] = None,
+    covariates_df: Optional[pd.DataFrame] = None,
+    h: int = 12,
+) -> float:
+    """Fit the DLT model with the given hyper-params and return its WBIC over ``h``-step windows.
+
+    Args
+    ----
+    params: ``(lev_sm, slp_sm, theta)``.
+    y: Observations, shape ``(n_steps,)``.
+    rng_key: JAX random key forwarded to ``run_dlt_model``.
+    mcmc_run_args: Keyword arguments forwarded to ``numpyro.infer.MCMC``.
+    regression_scheme: Optional ``RegressionScheme`` for the regressors.
+    covariates_df: Optional covariates, required when ``regression_scheme`` is provided.
+    h: Forecast horizon of the sliding windows.
+    """
     lev_sm, slp_sm, theta = params
-    y = data["y"]
-    x_seas = data["x_seas"]
-    x_glb_trend = data["x_glb_trend"]
     logger.info(f"Trying lev_sm={lev_sm:.4f}, slp_sm={slp_sm:.4f}, theta={theta:.4f}")
 
     idata = run_dlt_model(
+        rng_key=rng_key,
         lev_sm=lev_sm,
         slp_sm=slp_sm,
         theta=theta,
-        x_seas=x_seas,
-        x_glb_trend=x_glb_trend,
         y=y,
+        mcmc_run_args=mcmc_run_args,
+        regression_scheme=regression_scheme,
+        covariates_df=covariates_df,
     )
 
     yhat_span = generate_forecast_span_samples(idata=idata, h=h)
@@ -141,26 +166,50 @@ def run_dlt_model_and_compute_wbic(params: Tuple, data: Dict[str, np.ndarray], h
     )
     wbic = compute_wbic(loglk)
 
-    print(f"WBIC: {wbic:.4f}")
+    logger.info(f"WBIC: {wbic:.4f}")
     return wbic
 
 
 def hyper_tuning_dlt_with_wbic(
-    data: Dict[str, np.ndarray],
+    y: np.ndarray,
+    regression_scheme: Optional[RegressionScheme] = None,
+    covariates_df: Optional[pd.DataFrame] = None,
+    mcmc_run_args: Optional[Dict[str, Any]] = None,
     # forecast horizon
     h: int = 12,
     n_calls: int = 15,
     random_state: int = 42,
-):
-    print("Starting hyperparameter tuning for DLT model using WBIC...")
-    # print args
-    print(f"h: {h}, n_calls: {n_calls}, random_state: {random_state}")
-    # try import skopt
+) -> Dict[str, Any]:
+    """Tune the DLT hyper-params (``lev_sm``, ``slp_sm``, ``theta``) by minimizing WBIC with Bayesian optimization.
+
+    Requires ``scikit-optimize`` (``pip install bunobee[tune]``).
+
+    Args
+    ----
+    y: Observations, shape ``(n_steps,)``.
+    regression_scheme: Optional ``RegressionScheme`` for the regressors.
+    covariates_df: Optional covariates, required when ``regression_scheme`` is provided.
+    mcmc_run_args: Keyword arguments forwarded to ``numpyro.infer.MCMC``; defaults to ``DEFAULT_MCMC_RUN_ARGS``.
+    h: Forecast horizon of the sliding windows used to score each candidate.
+    n_calls: Number of hyper-param candidates evaluated (``skopt`` requires at least 10).
+    random_state: Seed for both the optimizer and the MCMC ``rng_key``.
+
+    Returns
+    -------
+    Dict with ``lev_sm``, ``slp_sm``, ``theta`` and ``result`` (the raw ``skopt`` result).
+    """
+    logger.info(f"Starting hyperparameter tuning for DLT model using WBIC (h={h}, n_calls={n_calls})")
     try:
         from skopt import gp_minimize
         from skopt.space import Real
-    except ImportError:
-        raise ImportError("Please install scikit-optimize to run hyperparameter tuning.")
+    except ImportError as e:
+        raise ImportError(
+            "scikit-optimize is required for hyperparameter tuning. Install it with `pip install bunobee[tune]`."
+        ) from e
+
+    if mcmc_run_args is None:
+        mcmc_run_args = DEFAULT_MCMC_RUN_ARGS
+    rng_key = jax.random.PRNGKey(random_state)
 
     # Define the hyperparam space
     search_space = [
@@ -171,10 +220,19 @@ def hyper_tuning_dlt_with_wbic(
 
     # Run Bayesian Optimization
     result = gp_minimize(
-        func=lambda params: run_dlt_model_and_compute_wbic(params=params, data=data, h=h),
+        func=lambda params: run_dlt_model_and_compute_wbic(
+            params=params,
+            y=y,
+            rng_key=rng_key,
+            mcmc_run_args=mcmc_run_args,
+            regression_scheme=regression_scheme,
+            covariates_df=covariates_df,
+            h=h,
+        ),
         dimensions=search_space,
         n_calls=n_calls,
         random_state=random_state,
     )
 
-    return result
+    lev_sm, slp_sm, theta = result.x
+    return {"lev_sm": lev_sm, "slp_sm": slp_sm, "theta": theta, "result": result}

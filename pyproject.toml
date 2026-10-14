@@ -29,6 +29,9 @@ test = [
     "pytest>=8",
     "black==26.1.0",
 ]
+tune = [
+    "scikit-optimize",
+]
 m5 = [
     "optax",
     "tqdm",
