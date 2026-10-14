@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `conditional_response` argument on DLT `make_inference` — actuals past the train end update the latent
+  level and slope (NaN entries are forecast as usual); length and shape are validated.
+
 ## [v0.0.5] - 2026-10-01
 
 Adds SSP forecasting, prior fusion and smoothed prior extension, and a packaged M5 dataset

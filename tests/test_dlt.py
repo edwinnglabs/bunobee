@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 from jax import lax
@@ -234,3 +235,96 @@ class TestNoFutureState:
             lev = new_lev
 
         np.testing.assert_allclose(forecast.std(axis=0), truth.std(axis=0), rtol=0.1)
+
+
+class TestConditionalResponse:
+    """#79: actuals beyond the train end update the latent states in make_inference."""
+
+    H = 6
+
+    def _idata(self, with_coef=False):
+        n = TestNoFutureState.N_SAMPLES
+        data = {
+            "dlt_comp": (["chain", "draw", "time"], np.zeros((1, n, N_TRAIN))),
+            "sigma": (["chain", "draw"], np.full((1, n), 1.0)),
+            "last_lev": (["chain", "draw"], np.full((1, n), 10.0)),
+            "last_slp": (["chain", "draw"], np.full((1, n), 0.5)),
+        }
+        coords = {}
+        if with_coef:
+            data["coef"] = (["chain", "draw", "var_name"], np.full((1, n, 1), 2.0))
+            coords["var_name"] = ["x"]
+        return xr.Dataset(data, coords=coords)
+
+    def _reference(self, actuals, reg=0.0):
+        """Deterministic numpy recursion with NaN-free actuals, from the train-end state."""
+        lev, slp = 10.0, 0.5
+        comps = []
+        for a in actuals:
+            comp = lev + THETA * slp
+            comps.append(comp)
+            new_lev = LEV_SM * (a - reg) + (1 - LEV_SM) * comp
+            slp = SLP_SM * (new_lev - lev) + (1 - SLP_SM) * slp
+            lev = new_lev
+        return np.array(comps)
+
+    def _response(self, actuals):
+        return np.concatenate([np.full(N_TRAIN, 99.0), actuals])  # train span must be ignored
+
+    def test_actuals_update_states(self):
+        actuals = np.array([14.0, 15.0, 13.0, 16.0, 17.0, 15.5])
+        out = make_inference(
+            RNG, self._idata(), LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + self.H,
+            conditional_response=self._response(actuals),
+        )  # fmt: skip
+        comp = np.asarray(out["dlt_comp_samples"])[:, N_TRAIN:]
+        np.testing.assert_allclose(comp, np.tile(self._reference(actuals), (comp.shape[0], 1)), rtol=1e-10)
+
+    def test_all_nan_equals_unconditioned(self):
+        kwargs = dict(end_step=N_TRAIN + self.H)
+        base = make_inference(RNG, self._idata(), LEV_SM, SLP_SM, THETA, **kwargs)
+        cond = make_inference(
+            RNG, self._idata(), LEV_SM, SLP_SM, THETA, conditional_response=np.full(N_TRAIN + self.H, np.nan), **kwargs
+        )
+        np.testing.assert_allclose(cond["dlt_comp_samples"].values, base["dlt_comp_samples"].values)
+
+    def test_partial_nan_forecasts_after_actuals(self):
+        actuals = np.array([14.0, 15.0, np.nan, np.nan, np.nan, np.nan])
+        out = make_inference(
+            RNG, self._idata(), LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + self.H,
+            conditional_response=self._response(actuals),
+        )  # fmt: skip
+        comp = np.asarray(out["dlt_comp_samples"])[:, N_TRAIN:]
+        # steps 0-2 are deterministic given the actuals (step 2 sees both); later steps spread out via noise
+        np.testing.assert_allclose(comp[:, :3].std(axis=0), 0.0, atol=1e-10)
+        expected = self._reference([14.0, 15.0, 0.0])[:3]  # the third actual is never seen by comp[2]
+        np.testing.assert_allclose(comp[:, :3], np.tile(expected, (comp.shape[0], 1)), rtol=1e-10)
+        assert comp[:, 4].std() > 0.0
+
+    def test_regression_removed_before_update(self):
+        n_total = N_TRAIN + self.H
+        idata = self._idata(with_coef=True)
+        cov = pd.DataFrame({"x": np.full(n_total, 3.0)})  # reg_comp = 2 * 3 = 6 at every step
+        actuals = np.array([20.0, 21.0, 19.0, 22.0, 23.0, 21.5])
+        out = make_inference(
+            RNG, idata, LEV_SM, SLP_SM, THETA, covariates_df=cov, conditional_response=self._response(actuals)
+        )
+        comp = np.asarray(out["dlt_comp_samples"])[:, N_TRAIN:]
+        np.testing.assert_allclose(comp, np.tile(self._reference(actuals, reg=6.0), (comp.shape[0], 1)), rtol=1e-10)
+
+    @pytest.mark.parametrize(
+        "response",
+        [np.zeros(N_TRAIN + 5), np.zeros((N_TRAIN + 6, 1))],
+        ids=["wrong_length", "not_1d"],
+    )
+    def test_bad_shape_raises(self, response):
+        with pytest.raises(ValueError):
+            make_inference(
+                RNG, self._idata(), LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + self.H, conditional_response=response
+            )
+
+    def test_no_steps_beyond_train_raises(self):
+        with pytest.raises(ValueError, match="beyond the train end"):
+            make_inference(
+                RNG, self._idata(), LEV_SM, SLP_SM, THETA, end_step=N_TRAIN, conditional_response=np.zeros(N_TRAIN)
+            )
