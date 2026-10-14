@@ -440,6 +440,7 @@ def make_inference(
     covariates_df: Optional[pd.DataFrame] = None,
     transform_callback: Optional[Callable] = None,
     noise_embed: bool = False,
+    conditional_response: Optional[np.ndarray] = None,
 ) -> xr.Dataset:
     """Generate full forecast samples by combining DLT and regression components.
 
@@ -471,6 +472,15 @@ def make_inference(
         case the band reflects only state-propagated uncertainty (zero at the first
         step) and is narrower than the predictive distribution of ``y``.  Set
         ``True`` for intervals that cover future observations.
+    conditional_response: Optional actuals past the train end used to update the latent
+        level and slope, shape ``(total_steps,)`` where ``total_steps`` is
+        ``len(covariates_df)`` when covariates are given and ``end_step`` otherwise.
+        Entries in the train span are ignored.  Beyond the train end, NaN means "make a
+        real forecast for this step" and a finite value is used as the observation in
+        the state update.  The ``dlt_comp_samples`` at a conditioned step is still the
+        one-step-ahead forecast made before seeing that actual; later steps start from
+        the updated states.  Regression effects are removed from the actuals per
+        posterior sample before the update, consistent with ``dlt_model``.
 
     Returns
     -------
@@ -505,8 +515,29 @@ def make_inference(
         reg_comp_samples_total = 0
         has_regression = False
 
+    oos_y = None
+    if conditional_response is not None:
+        conditional_response = np.asarray(conditional_response, dtype=float)
+        n_train_steps = idata["dlt_comp"].shape[-1]
+        if conditional_response.ndim != 1:
+            raise ValueError(f"conditional_response must be 1-D, got shape {conditional_response.shape}.")
+        if conditional_response.shape[0] != end_step:
+            raise ValueError(
+                f"conditional_response must have length {end_step} "
+                f"({'len(covariates_df)' if has_regression else 'end_step'}), got {conditional_response.shape[0]}."
+            )
+        if end_step <= n_train_steps:
+            raise ValueError(
+                f"conditional_response needs steps beyond the train end ({n_train_steps}); total length is {end_step}."
+            )
+        # (n_oos_steps, n_samples): states are fitted on y - reg_comp, so remove it per posterior sample
+        oos_y = (
+            conditional_response[n_train_steps:, None]
+            - np.broadcast_to(reg_comp_samples_total, (idata["sigma"].size, end_step))[:, n_train_steps:].T
+        )
+
     rng_key = jax.random.split(rng_key, num=1)[0]
-    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta)
+    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta, oos_y=oos_y)
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
     rng_key = jax.random.split(rng_key, num=1)[0]
