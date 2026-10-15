@@ -26,13 +26,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import xarray as xr
+
+from m5_common import DATA_DIR, load_m5_ds
 
 logger = logging.getLogger(__name__)
 
 N_STEPS = 28
 EXPECTED_ROWS = 60_980
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,14 +47,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reference",
         type=Path,
-        default=_DEFAULT_DATA_DIR / "sample_submission2.csv",
+        default=DATA_DIR / "sample_submission2.csv",
         metavar="CSV",
         help="Reference benchmark submission CSV to diff against.",
     )
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=_DEFAULT_DATA_DIR,
+        default=DATA_DIR,
         metavar="DIR",
         help="Directory containing m5_ds.nc (for volume bucketing).",
     )
@@ -143,11 +143,8 @@ def _global_diff_stats(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
 
 def _load_train_sales(data_dir: Path) -> pd.Series:
     """Load per-series total training sales from m5_ds.nc, indexed by series_id."""
-    ds_path = data_dir / "m5_ds.nc"
-    if not ds_path.exists():
-        raise FileNotFoundError(f"m5_ds.nc not found at {ds_path}")
-    logger.info("Loading training sales from %s", ds_path)
-    ds = xr.open_dataset(ds_path)
+    logger.info("Loading training sales from %s", data_dir)
+    ds = load_m5_ds(data_dir)
     train_mask = ds["split"].values == "train"
     totals = np.nansum(ds["sales"].values[:, train_mask], axis=1)
     return pd.Series(totals, index=ds["series_id"].values, name="total_train_sales")

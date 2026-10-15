@@ -27,15 +27,15 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
-import xarray as xr
 
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+
+from m5_common import DATA_DIR, dow_dummies, load_m5_ds
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 HORIZON = 28
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
 _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
 
@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=_DEFAULT_DATA_DIR,
+        default=DATA_DIR,
         metavar="DIR",
         help="Directory containing m5_ds.nc and sample_submission.csv.",
     )
@@ -95,13 +95,6 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _dow_dummies(dow: np.ndarray) -> np.ndarray:
-    """Day-of-week dummies with Monday dropped as the reference category."""
-    dummies = pd.get_dummies(dow, dtype=np.float32).reindex(columns=range(7), fill_value=0.0)
-    # Drop Monday (col 0) → shape (n, 6)
-    return dummies.iloc[:, 1:].values
 
 
 def _make_submission(
@@ -162,7 +155,7 @@ def main() -> None:
     # 1. Load data
     # ------------------------------------------------------------------
     logger.info("Loading dataset from %s", args.data_dir)
-    ds = xr.open_dataset(args.data_dir / "m5_ds.nc")
+    ds = load_m5_ds(args.data_dir)
 
     train_mask = ds["split"].values == "train"
     val_mask = ds["split"].values == "validation"
@@ -177,8 +170,8 @@ def main() -> None:
     # 2. Build design matrices
     # ------------------------------------------------------------------
     dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))  # (n_train_steps, 6)
-    Z_future_shared = jnp.asarray(_dow_dummies(dow[val_mask]))  # (horizon, 6)
+    Z_shared = jnp.asarray(dow_dummies(dow[train_mask]))  # (n_train_steps, 6)
+    Z_future_shared = jnp.asarray(dow_dummies(dow[val_mask]))  # (horizon, 6)
     logger.info("Z_shared: %s  Z_future_shared: %s", Z_shared.shape, Z_future_shared.shape)
 
     # ------------------------------------------------------------------

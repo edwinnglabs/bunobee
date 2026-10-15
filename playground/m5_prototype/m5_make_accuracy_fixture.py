@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -50,7 +51,41 @@ import pandas as pd
 import xarray as xr
 
 _HERE = Path(__file__).resolve().parent
-_DEFAULT_DATA_DIR = _HERE.parent / "resource" / "m5-forecasting-accuracy"
+
+
+def _load_sibling(name: str) -> ModuleType:
+    """Import a sibling playground module by path and register it under its own name.
+
+    Loading by path rather than by name keeps this script importable from anywhere — the test suite
+    pulls it in from ``tests/`` — without mutating ``sys.path``. Registering the module in
+    ``sys.modules`` lets a sibling's own ``from m5_common import ...`` resolve to it.
+
+    Parameters
+    ----------
+    name : str
+        Module name, i.e. the file stem under ``playground/m5_prototype/``.
+
+    Returns
+    -------
+    ModuleType
+        The imported module.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, _HERE / f"{name}.py")
+    if spec is None or spec.loader is None:  # pragma: no cover - only on a broken checkout
+        raise ImportError(f"cannot load {name} from {_HERE}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]  # as the import system does, so a retry does not see a half-run module
+        raise
+    return module
+
+
+_DEFAULT_DATA_DIR = _load_sibling("m5_common").DATA_DIR
 _DEFAULT_OUTPUT = _HERE.parents[1] / "src" / "bunobee" / "datasets" / "data" / "m5_aggregate.csv"
 
 # Window: the training span plus one M5 evaluation window, ending at d_1941.
@@ -64,25 +99,6 @@ PERIOD = 7  # weekly cycle, used to repair the Christmas closure
 
 # Splits carrying observed sales; d_1942+ ("test") is NaN in the competition files.
 _OBSERVED_SPLITS = ("train", "validation")
-
-
-def _load_m5_preprocess() -> ModuleType:
-    """Import the sibling ``m5_preprocess`` module by path.
-
-    Loading by path rather than by name keeps this script importable from anywhere — the test suite
-    pulls it in from ``tests/`` — without mutating ``sys.path``.
-
-    Returns
-    -------
-    ModuleType
-        The imported ``m5_preprocess`` module.
-    """
-    spec = importlib.util.spec_from_file_location("m5_preprocess", _HERE / "m5_preprocess.py")
-    if spec is None or spec.loader is None:  # pragma: no cover - only on a broken checkout
-        raise ImportError(f"cannot load m5_preprocess from {_HERE}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def aggregate_state_cat(ds: xr.Dataset) -> pd.DataFrame:
@@ -191,7 +207,7 @@ def build_m5_aggregate(data_dir: Path | str = _DEFAULT_DATA_DIR) -> pd.DataFrame
         Long panel with columns ``date`` (datetime64), ``series_id`` (str), ``sales`` (int64),
         sorted by ``(date, series_id)``, covering the last ``N_DATES`` observed days.
     """
-    build_m5_dataset = _load_m5_preprocess().build_m5_dataset
+    build_m5_dataset = _load_sibling("m5_preprocess").build_m5_dataset
     wide = repair_closures(aggregate_state_cat(build_m5_dataset(data_dir))).iloc[-N_DATES:]
 
     long = wide.stack().rename("sales").reset_index()
