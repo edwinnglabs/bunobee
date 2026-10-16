@@ -7,6 +7,9 @@ Forecast quality is not the point yet; this is the workflow the model work build
 
 All commands run from the repo root. Every downloaded or generated file is gitignored.
 
+[WORKFLOW.md](WORKFLOW.md) explains what to rerun after a change, how runs are scored, where to work on
+the model, and what is still open.
+
 ## Prerequisites
 
 1. The `m5` extra: `pip install -e ".[m5]"` (adds `optax`, `tqdm`).
