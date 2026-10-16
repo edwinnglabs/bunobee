@@ -35,10 +35,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from m5_common import DATA_DIR, load_m5_ds
+
 logger = logging.getLogger(__name__)
 
 N_STEPS = 28
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
 
 # (level_number, human_name, grouping_keys). None = no grouping (Total level).
 _LEVELS: list[tuple[int, str, tuple[str, ...] | None]] = [
@@ -63,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=_DEFAULT_DATA_DIR,
+        default=DATA_DIR,
         metavar="DIR",
         help="Directory containing m5_ds.nc.",
     )
@@ -187,9 +188,8 @@ def main() -> None:
     forecasts = val_rows[f_cols].values.astype(np.float64)
     series_order = val_rows["series_id"].values
 
-    ds_path = args.data_dir / "m5_ds.nc"
-    logger.info("Loading dataset from %s", ds_path)
-    ds = xr.open_dataset(ds_path)
+    logger.info("Loading dataset from %s", args.data_dir)
+    ds = load_m5_ds(args.data_dir)
 
     per_level = compute_hierarchical_wrmsse(ds, forecasts, series_order)
     final_wrmsse = float(per_level["wrmsse"].mean())

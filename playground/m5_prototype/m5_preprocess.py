@@ -35,17 +35,29 @@ Attributes
     train_steps       : number of training days
     valid_steps       : number of validation days
     test_steps        : number of test days
+
+Caching
+-------
+The Dataset is saved as ``m5_ds.nc`` in the data directory, where the downstream scripts open it with
+``m5_common.load_m5_ds``. Building it from the CSVs takes minutes, so a run that finds ``m5_ds.nc``
+already in place reuses it and does nothing.
+
+Usage
+-----
+    python playground/m5_prototype/m5_preprocess.py           # no-op when m5_ds.nc is present
+    python playground/m5_prototype/m5_preprocess.py --force   # rebuild and overwrite m5_ds.nc
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
+from m5_common import DATA_DIR, DS_FILE
 
 # Competition split boundaries (day indices, 1-based)
 _TRAIN_END_D = 1913  # sales_train_validation.csv ends here
@@ -54,7 +66,7 @@ _VALID_END_D = 1941  # sales_train_evaluation.csv ends here
 
 
 def build_m5_dataset(
-    data_dir: Path | str = _DEFAULT_DATA_DIR,
+    data_dir: Path | str = DATA_DIR,
     output_path: Path | str | None = None,
 ) -> xr.Dataset:
     """Build a single xarray Dataset from all M5 source CSV files.
@@ -70,20 +82,30 @@ def build_m5_dataset(
     -------
     xr.Dataset
         Unified M5 dataset with dimensions (series_id, date).
+
+    Raises
+    ------
+    SystemExit
+        If a raw CSV the build reads is not in ``data_dir``.
     """
     data_dir = Path(data_dir)
 
     # ------------------------------------------------------------------
     # 1. Load raw CSVs
     # ------------------------------------------------------------------
-    print("Loading CSVs …")
-    calendar = pd.read_csv(data_dir / "calendar.csv", parse_dates=["date"])
-    sell_prices = pd.read_csv(data_dir / "sell_prices.csv")
-
     # Prefer evaluation CSV (d_1 … d_1941); fall back to validation (d_1 … d_1913)
     eval_path = data_dir / "sales_train_evaluation.csv"
     val_path = data_dir / "sales_train_validation.csv"
-    sales_train = pd.read_csv(eval_path if eval_path.exists() else val_path)
+    sales_path = eval_path if eval_path.exists() else val_path
+
+    missing = [p.name for p in (data_dir / "calendar.csv", data_dir / "sell_prices.csv", sales_path) if not p.is_file()]
+    if missing:
+        raise SystemExit(f"{', '.join(missing)} not found in {data_dir}; run m5_fetch.py first.")
+
+    print("Loading CSVs …")
+    calendar = pd.read_csv(data_dir / "calendar.csv", parse_dates=["date"])
+    sell_prices = pd.read_csv(data_dir / "sell_prices.csv")
+    sales_train = pd.read_csv(sales_path)
 
     # ------------------------------------------------------------------
     # 2. Series metadata
@@ -217,13 +239,33 @@ def build_m5_dataset(
     # ------------------------------------------------------------------
     if output_path is not None:
         output_path = Path(output_path)
+        # Write beside the target and rename, so an interrupted save never leaves a partial file
+        # that main() would then take for a valid cache.
+        tmp_path = output_path.with_suffix(".tmp.nc")
         print(f"Saving to {output_path} …")
-        ds.to_netcdf(output_path)
+        try:
+            ds.to_netcdf(tmp_path)
+            tmp_path.replace(output_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         print(f"Saved  ({output_path.stat().st_size / 1e6:.0f} MB)")
 
     return ds
 
 
+def main() -> None:
+    """Build and cache ``m5_ds.nc`` unless it is already present."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="raw M5 CSV directory; m5_ds.nc goes here")
+    parser.add_argument("--force", action="store_true", help="rebuild even if m5_ds.nc is present")
+    args = parser.parse_args()
+
+    ds_path = args.data_dir / DS_FILE
+    if ds_path.is_file() and not args.force:
+        print(f"{ds_path} is already built; nothing to do (--force rebuilds).")
+        return
+    print(build_m5_dataset(args.data_dir, output_path=ds_path))
+
+
 if __name__ == "__main__":
-    ds = build_m5_dataset(output_path=_DEFAULT_DATA_DIR / "m5_ds.nc")
-    print(ds)
+    main()

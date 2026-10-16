@@ -35,6 +35,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+from m5_common import DATA_DIR
+
 COMPETITION = "m5-forecasting-accuracy"
 EXPECTED_FILES = (
     "calendar.csv",
@@ -44,7 +46,6 @@ EXPECTED_FILES = (
     "sample_submission.csv",
 )
 
-_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "resource" / COMPETITION
 _RULES_URL = f"https://www.kaggle.com/competitions/{COMPETITION}/rules"
 
 # Kaggle CLI failure signatures. Current releases print "Authentication required ..." when no
@@ -139,7 +140,7 @@ def download(data_dir: Path | str, kaggle: str = "kaggle") -> None:
 def main() -> int:
     """Fetch the M5 files unless they are already present; return the process exit code."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--data-dir", type=Path, default=_DEFAULT_DATA_DIR, help="raw M5 CSV directory")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="raw M5 CSV directory")
     parser.add_argument("--force", action="store_true", help="re-download even if all files are present")
     args = parser.parse_args()
 

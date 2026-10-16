@@ -27,12 +27,12 @@ import xarray as xr
 
 from bunobee.models.ssp.univariate import kalman_filter_1d_batch
 
+from m5_common import DATA_DIR, dow_dummies, load_m5_ds
 from m5_score_submission import compute_hierarchical_wrmsse
 
 logger = logging.getLogger(__name__)
 
 HORIZON_VAL = 28
-_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "resource" / "m5-forecasting-accuracy"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=_DEFAULT_DATA_DIR,
+        default=DATA_DIR,
         metavar="DIR",
         help="Directory containing m5_ds.nc",
     )
@@ -59,12 +59,6 @@ def _parse_args() -> argparse.Namespace:
         help="Max series per Kalman batch; 0 = no chunking",
     )
     return p.parse_args()
-
-
-def _dow_dummies(dow: np.ndarray) -> np.ndarray:
-    """Day-of-week dummies with Monday dropped (replicates m5_run.py)."""
-    dummies = pd.get_dummies(dow, dtype=np.float32).reindex(columns=range(7), fill_value=0.0)
-    return dummies.iloc[:, 1:].values
 
 
 def _reconstruct_val_forecasts(
@@ -98,8 +92,8 @@ def _reconstruct_val_forecasts(
         raise RuntimeError("Training window too short to compute scale and states.")
 
     dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(_dow_dummies(dow[train_mask]))
-    Z_val = jnp.asarray(_dow_dummies(dow[val_mask]))
+    Z_shared = jnp.asarray(dow_dummies(dow[train_mask]))
+    Z_val = jnp.asarray(dow_dummies(dow[val_mask]))
 
     if Z_val.shape[0] != HORIZON_VAL:
         raise RuntimeError(f"Expected validation horizon {HORIZON_VAL}, got {Z_val.shape[0]}")
@@ -143,16 +137,12 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    ds_path = args.data_dir / "m5_ds.nc"
-    if not ds_path.exists():
-        raise SystemExit(f"m5_ds.nc not found at {ds_path}. Run m5_preprocess.py first.")
-
     batch_params_path = args.run_dir / "batch_params.npz"
     if not batch_params_path.exists():
         raise SystemExit(f"batch_params.npz not found in {args.run_dir}")
 
-    logger.info("Loading dataset from %s", ds_path)
-    ds = xr.open_dataset(ds_path)
+    logger.info("Loading dataset from %s", args.data_dir)
+    ds = load_m5_ds(args.data_dir)
 
     logger.info("Reconstructing 28-step validation forecasts from %s", batch_params_path)
     forecasts, fit_idx = _reconstruct_val_forecasts(ds, batch_params_path, args.chunk_size)
