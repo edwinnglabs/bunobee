@@ -10,7 +10,8 @@ Dimensions
     date      : 1 969   (2011-01-29 … 2016-06-19)
 
 Data variables
-    sales         (series_id, date) float32 — unit sales; NaN for forecast window
+    sales         (series_id, date) float32 — unit sales; the test window (d_1942–d_1969) is
+                                              NaN unless sales_test_evaluation.csv is present
     sell_price    (series_id, date) float32 — weekly price expanded to daily; NaN
                                               where not listed in sell_prices.csv
     snap          (series_id, date) int8    — SNAP eligibility for the series' state
@@ -35,12 +36,15 @@ Attributes
     train_steps       : number of training days
     valid_steps       : number of validation days
     test_steps        : number of test days
+    has_test_actuals  : 1 if the test window was filled from sales_test_evaluation.csv, else 0
 
 Caching
 -------
 The Dataset is saved as ``m5_ds.nc`` in the data directory, where the downstream scripts open it with
 ``m5_common.load_m5_ds``. Building it from the CSVs takes minutes, so a run that finds ``m5_ds.nc``
-already in place reuses it and does nothing.
+already in place reuses it and does nothing — unless ``sales_test_evaluation.csv`` has since been
+fetched and the cached Dataset was built without it, in which case it is rebuilt to pick up the
+test-window actuals.
 
 Usage
 -----
@@ -63,6 +67,7 @@ from m5_common import DATA_DIR, DS_FILE
 _TRAIN_END_D = 1913  # sales_train_validation.csv ends here
 _VALID_END_D = 1941  # sales_train_evaluation.csv ends here
 # Calendar ends at d_1969 → test window is d_1942–d_1969
+_TEST_ACTUALS = "sales_test_evaluation.csv"  # released after the competition; fetched by m5_fetch.py
 
 
 def build_m5_dataset(
@@ -150,6 +155,22 @@ def build_m5_dataset(
             axis=1,
         )
 
+    # Fill the test window from the post-competition actuals when m5_fetch.py has downloaded them
+    test_path = data_dir / _TEST_ACTUALS
+    has_test_actuals = test_path.is_file()
+    if has_test_actuals:
+        print(f"Filling the test window from {_TEST_ACTUALS} …")
+        test = pd.read_csv(test_path)
+        test.index = test["item_id"] + "_" + test["store_id"]
+        test_cols = [c for c in test.columns if c.startswith("d_")]
+        absent = np.setdiff1d(series_ids, test.index)
+        if absent.size:
+            raise SystemExit(
+                f"{test_path} lacks {absent.size} series (first: {absent[0]}); re-run m5_fetch.py --force."
+            )
+        day_pos = np.searchsorted(day_numbers, [int(c.split("_")[1]) for c in test_cols])
+        sales_mat[:, day_pos] = test.loc[series_ids, test_cols].values.astype(np.float32)
+
     # ------------------------------------------------------------------
     # 5. Sell-price matrix (series_id × date)  shape (30490, 1969)
     #
@@ -231,6 +252,7 @@ def build_m5_dataset(
             "train_steps": int(_TRAIN_END_D),
             "valid_steps": int(_VALID_END_D - _TRAIN_END_D),
             "test_steps": int(len(all_dates) - _VALID_END_D),
+            "has_test_actuals": int(has_test_actuals),
         },
     )
 
@@ -262,8 +284,12 @@ def main() -> None:
 
     ds_path = args.data_dir / DS_FILE
     if ds_path.is_file() and not args.force:
-        print(f"{ds_path} is already built; nothing to do (--force rebuilds).")
-        return
+        with xr.open_dataset(ds_path) as cached:
+            stale = (args.data_dir / _TEST_ACTUALS).is_file() and not cached.attrs.get("has_test_actuals", 0)
+        if not stale:
+            print(f"{ds_path} is already built; nothing to do (--force rebuilds).")
+            return
+        print(f"{ds_path} was built without {_TEST_ACTUALS}; rebuilding to add the test-window actuals.")
     print(build_m5_dataset(args.data_dir, output_path=ds_path))
 
 

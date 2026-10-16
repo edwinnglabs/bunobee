@@ -181,6 +181,9 @@ push_package.sh
 *.npz
 *.pdf
 
+# M5 prototype run outputs (playground/m5_prototype/m5_run.py)
+playground/m5_prototype/output/
+
 # avoid dictating claude performance
 .claude/
 CLAUDE.md
