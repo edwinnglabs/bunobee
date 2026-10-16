@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `conditional_response` argument on DLT `make_inference` — actuals past the train end update the latent
   level and slope (NaN entries are forecast as usual); length and shape are validated.
+- `tune` optional-dependency extra — `pip install bunobee[tune]` installs `scikit-optimize` for
+  `hyper_tuning_dlt_with_wbic`.
+
+### Changed
+
+- `hyper_tuning_dlt_with_wbic` takes `y` plus optional `regression_scheme`, `covariates_df` and
+  `mcmc_run_args` instead of a `data` dict, so models with regressors can be tuned. It returns a dict of
+  the tuned `lev_sm`, `slp_sm` and `theta`, with the raw `skopt` result under `result`, and logs through
+  the `bunobee` logger instead of printing.
+
+### Fixed
+
+- `hyper_tuning_dlt_with_wbic` runs again: it called `run_dlt_model` with arguments that no longer exist
+  and raised a `TypeError`.
+- DLT `make_inference` documents that with `noise_embed=False` (the default) the forecast band reflects
+  only state-propagated uncertainty, zero at the first step, and is narrower than the predictive
+  distribution of `y`; set `noise_embed=True` for intervals that cover future observations. New tests
+  confirm the forecast uses no state past the train end.
 
 ## [v0.0.5] - 2026-10-01
 
