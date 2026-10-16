@@ -12,17 +12,25 @@ Usage examples
 # Fit all 30,490 series and generate a submission CSV:
     python m5_run.py --n-demo 0
 
+# Same, fitting 8,192 series at a time to cap peak memory:
+    python m5_run.py --n-demo 0 --fit-chunk 8192
+
 Every run scores the fitted series on the validation window (d_1914-d_1941) with the 12-level
 hierarchical WRMSSE and writes the per-level table to ``wrmsse_per_level.csv`` in the run directory.
 A sampled run aggregates and weights only its own series, so its score is a smoke test that the
 pipeline runs end to end, not a number comparable to the full 30,490-series score.
+
+Every run also writes its wall-clock time and peak memory to ``run_stats.json`` in the run directory.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
+import resource
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,7 +91,16 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=4096,
         metavar="N",
-        help="Max series per vmap chunk (memory guard). 0 = no chunking.",
+        help="Max series per Kalman-filter vmap call. 0 = no chunking. All chunks share one gradient pass, "
+        "so this does not cap peak memory while fitting; use --fit-chunk for that.",
+    )
+    p.add_argument(
+        "--fit-chunk",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Fit at most N series per optimiser run, so peak memory scales with N rather than with the "
+        "number of series. 0 = one run over all series.",
     )
     p.add_argument(
         "--n-plot",
@@ -101,6 +118,83 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+#: Per-series outputs of ``fit_batch_series_opt`` kept after forecasting. The filtered states ``at`` and
+#: ``Pt`` (n_series x n_steps x n_states each) are only needed to forecast, so they are dropped per chunk.
+_FIT_KEYS = ("sigma_h", "sigma_q", "response_norm", "final_loss")
+
+
+def _fit_and_forecast(
+    sales: np.ndarray,
+    Z: jnp.ndarray,
+    Z_future: jnp.ndarray,
+    n_iter: int,
+    lr: float,
+    chunk_size: int | None,
+    fit_chunk: int | None,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Fit and forecast the series in independent runs of at most ``fit_chunk`` series.
+
+    ``fit_batch_series_opt`` chunks only its Kalman filter, inside one jitted ``value_and_grad``, so the
+    backward pass keeps every chunk's intermediates alive at once. Calling it once per ``fit_chunk``
+    series bounds that memory instead. The series are independent — the loss is a sum over series and
+    Adam updates each parameter on its own — so ``fit_chunk`` changes the forecasts only by float32
+    rounding: a different batch shape vectorises differently, and 100 Adam steps can amplify that to a
+    relative difference of up to ~4e-4 on a few series.
+
+    Parameters
+    ----------
+    sales : np.ndarray
+        Daily unit sales, shape ``(n_series, n_steps)``.
+    Z : jnp.ndarray
+        Design matrix over the fit window, shape ``(n_steps, n_states)``.
+    Z_future : jnp.ndarray
+        Design matrix over the forecast window, shape ``(horizon, n_states)``.
+    n_iter : int
+        Adam optimisation steps per run.
+    lr : float
+        Adam learning rate.
+    chunk_size : int | None
+        Max series per Kalman-filter ``vmap`` call within a run. ``None`` = no chunking.
+    fit_chunk : int | None
+        Max series per run. ``None`` = one run over all series.
+
+    Returns
+    -------
+    fit_params : dict of str to np.ndarray
+        The :data:`_FIT_KEYS` outputs of ``fit_batch_series_opt``, concatenated over runs in series order.
+    forecasts : np.ndarray
+        Lognormal-mean forecasts, shape ``(n_series, horizon)``.
+    """
+    n_series = sales.shape[0]
+    step = fit_chunk or n_series
+    n_runs = math.ceil(n_series / step)
+    fit_params: dict[str, list[np.ndarray]] = {key: [] for key in _FIT_KEYS}
+    forecasts = []
+    for run, start in enumerate(range(0, n_series, step), start=1):
+        end = min(start + step, n_series)
+        if n_runs > 1:
+            logger.info("Fit run %d/%d: series %d-%d", run, n_runs, start, end - 1)
+        result = fit_batch_series_opt(
+            sales[start:end],
+            n_iter=n_iter,
+            lr=lr,
+            Z=Z,
+            chunk_size=chunk_size,
+            log_every=100,
+            show_progress=True,
+        )
+        forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
+        for key in _FIT_KEYS:
+            fit_params[key].append(np.asarray(result[key]))
+    return {key: np.concatenate(parts) for key, parts in fit_params.items()}, np.concatenate(forecasts)
+
+
+def _peak_rss_gib() -> float:
+    """Peak resident set size of this process so far, in GiB."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is in bytes on macOS and in kilobytes on Linux.
+    return peak / 2**30 if sys.platform == "darwin" else peak / 2**20
 
 
 def _make_submission(
@@ -149,6 +243,7 @@ def _make_submission(
 
 
 def main() -> None:
+    t_start = time.time()
     args = _parse_args()
 
     # Create timestamped output directory
@@ -204,34 +299,42 @@ def main() -> None:
     # 4. Fit + predict
     # ------------------------------------------------------------------
     chunk_size = args.chunk_size if args.chunk_size > 0 else None
-    logger.info("Starting batch fit: n_iter=%d  lr=%g  chunk_size=%s", args.n_iter, args.lr, chunk_size)
+    fit_chunk = args.fit_chunk if args.fit_chunk > 0 else None
+    logger.info(
+        "Starting batch fit: n_iter=%d  lr=%g  chunk_size=%s  fit_chunk=%s", args.n_iter, args.lr, chunk_size, fit_chunk
+    )
     t0 = time.time()
-    batch_result = fit_batch_series_opt(
+    fit_params, forecasts = _fit_and_forecast(
         sales_matrix[fit_idx],
+        Z=Z_shared,
+        Z_future=Z_future_shared,
         n_iter=args.n_iter,
         lr=args.lr,
-        Z=Z_shared,
         chunk_size=chunk_size,
-        log_every=100,
-        show_progress=True,
+        fit_chunk=fit_chunk,
     )
-    forecasts = predict_batch_series_opt(batch_result, Z_future=Z_future_shared)
-    elapsed = time.time() - t0
-    logger.info("Fitted %d series in %.1fs  (%.1f ms/series)", n_fit, elapsed, elapsed / n_fit * 1000)
+    fit_seconds = time.time() - t0
+    logger.info(
+        "Fitted %d series in %.1fs  (%.1f ms/series, peak RSS so far %.1f GiB)",
+        n_fit,
+        fit_seconds,
+        fit_seconds / n_fit * 1000,
+        _peak_rss_gib(),
+    )
 
     # ------------------------------------------------------------------
     # 5. Diagnostics plot
     # ------------------------------------------------------------------
     fig, axes = plt.subplots(1, 2, figsize=(12, 3))
 
-    axes[0].hist(batch_result["final_loss"], bins=100, edgecolor="none")
+    axes[0].hist(fit_params["final_loss"], bins=100, edgecolor="none")
     axes[0].set_xlabel("Final neg-log-posterior")
     axes[0].set_ylabel("Count")
     axes[0].set_title("Loss distribution")
 
-    axes[1].hist(batch_result["sigma_h"], bins=100, edgecolor="none", alpha=0.7, label="σ_h")
-    axes[1].hist(batch_result["sigma_q"][:, 0], bins=100, edgecolor="none", alpha=0.7, label="σ_q level")
-    axes[1].hist(batch_result["sigma_q"][:, 1], bins=100, edgecolor="none", alpha=0.7, label="σ_q seas")
+    axes[1].hist(fit_params["sigma_h"], bins=100, edgecolor="none", alpha=0.7, label="σ_h")
+    axes[1].hist(fit_params["sigma_q"][:, 0], bins=100, edgecolor="none", alpha=0.7, label="σ_q level")
+    axes[1].hist(fit_params["sigma_q"][:, 1], bins=100, edgecolor="none", alpha=0.7, label="σ_q seas")
     axes[1].set_xlabel("Value")
     axes[1].set_ylabel("Count")
     axes[1].set_title("MAP parameter distributions")
@@ -286,14 +389,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 7. Save fitted parameters
     # ------------------------------------------------------------------
-    np.savez(
-        run_dir / "batch_params.npz",
-        sigma_h=batch_result["sigma_h"],
-        sigma_q=batch_result["sigma_q"],
-        response_norm=batch_result["response_norm"],
-        final_loss=batch_result["final_loss"],
-        fit_idx=fit_idx,
-    )
+    np.savez(run_dir / "batch_params.npz", **fit_params, forecasts=forecasts, fit_idx=fit_idx)
     logger.info("Saved batch_params.npz")
 
     # ------------------------------------------------------------------
@@ -326,6 +422,26 @@ def main() -> None:
             n_fit,
             n_series_total,
         )
+
+    # ------------------------------------------------------------------
+    # 10. Run stats (wall-clock and peak memory)
+    # ------------------------------------------------------------------
+    run_stats = {
+        "n_series": n_fit,
+        "n_iter": args.n_iter,
+        "chunk_size": chunk_size,
+        "fit_chunk": fit_chunk,
+        "fit_seconds": round(fit_seconds, 1),
+        "total_seconds": round(time.time() - t_start, 1),
+        "peak_rss_gib": round(_peak_rss_gib(), 2),
+    }
+    (run_dir / "run_stats.json").write_text(json.dumps(run_stats, indent=2) + "\n")
+    logger.info(
+        "Saved run_stats.json  (fit %.1fs, total %.1fs, peak RSS %.2f GiB)",
+        run_stats["fit_seconds"],
+        run_stats["total_seconds"],
+        run_stats["peak_rss_gib"],
+    )
 
     logger.info("Done. Outputs in %s", run_dir)
 
