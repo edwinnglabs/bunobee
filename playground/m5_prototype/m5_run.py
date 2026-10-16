@@ -15,10 +15,17 @@ Usage examples
 # Same, fitting 8,192 series at a time to cap peak memory:
     python m5_run.py --n-demo 0 --fit-chunk 8192
 
-Every run scores the fitted series on the validation window (d_1914-d_1941) with the 12-level
-hierarchical WRMSSE and writes the per-level table to ``wrmsse_per_level.csv`` in the run directory.
-A sampled run aggregates and weights only its own series, so its score is a smoke test that the
-pipeline runs end to end, not a number comparable to the full 30,490-series score.
+Every run fits the selected series twice, once per forecast origin (see ``WINDOWS`` in
+``m5_score_submission``):
+
+    validation : fit on d_1-d_1913, forecast d_1914-d_1941  (``_validation`` submission rows)
+    evaluation : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows)
+
+It scores each origin's forecasts with the 12-level hierarchical WRMSSE and writes the per-level tables
+to ``wrmsse_per_level.csv`` in the run directory, one ``window`` per origin. The evaluation window is
+scored only when the dataset carries its actuals (``m5_fetch.py`` + ``m5_preprocess.py``). A sampled
+run aggregates and weights only its own series, so its score is a smoke test that the pipeline runs
+end to end, not a number comparable to the full 30,490-series score.
 
 Every run also writes its wall-clock time and peak memory to ``run_stats.json`` in the run directory.
 """
@@ -44,7 +51,7 @@ import pandas as pd
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
 
 from m5_common import DATA_DIR, dow_dummies, load_m5_ds
-from m5_score_submission import compute_hierarchical_wrmsse, log_per_level
+from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, log_per_level
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -198,7 +205,8 @@ def _peak_rss_gib() -> float:
 
 
 def _make_submission(
-    predictions: pd.DataFrame,
+    forecasts: dict[str, np.ndarray],
+    base_ids: np.ndarray,
     sample_submission: pd.DataFrame,
     output_path: Path,
 ) -> pd.DataFrame:
@@ -206,8 +214,11 @@ def _make_submission(
 
     Parameters
     ----------
-    predictions : pd.DataFrame
-        Columns: ``id`` (validation ids) + F1–F28.
+    forecasts : dict of str to np.ndarray
+        Forecasts of shape ``(n_series, HORIZON)`` per window (``"validation"``, ``"evaluation"``); the
+        window name is the ``id`` suffix of its rows.
+    base_ids : np.ndarray
+        ``series_id`` of each forecast row, without a window suffix.
     sample_submission : pd.DataFrame
         Official sample_submission template for row ordering.
     output_path : Path
@@ -220,10 +231,12 @@ def _make_submission(
     """
     f_cols = [f"F{i}" for i in range(1, HORIZON + 1)]
 
-    eval_preds = predictions.copy()
-    eval_preds["id"] = eval_preds["id"].str.replace("_validation", "_evaluation", regex=False)
-
-    full = pd.concat([predictions, eval_preds], ignore_index=True)
+    parts = []
+    for window, window_forecasts in forecasts.items():
+        part = pd.DataFrame(window_forecasts, columns=f_cols)
+        part.insert(0, "id", [f"{sid}_{window}" for sid in base_ids])
+        parts.append(part)
+    full = pd.concat(parts, ignore_index=True)
 
     sub = sample_submission[["id"]].merge(full, on="id", how="left")
 
@@ -258,22 +271,14 @@ def main() -> None:
     logger.info("Loading dataset from %s", args.data_dir)
     ds = load_m5_ds(args.data_dir)
 
-    train_mask = ds["split"].values == "train"
-    val_mask = ds["split"].values == "validation"
+    split = ds["split"].values
+    train_mask = split == "train"
     sales_matrix = ds["sales"].values[:, train_mask]  # (n_series, n_train_steps)
     series_ids = np.array([f"{sid}_validation" for sid in ds["series_id"].values])
     n_series_total = sales_matrix.shape[0]
     logger.info(
         "sales_matrix: %s  (n_series=%d, n_steps=%d)", sales_matrix.shape, sales_matrix.shape[0], sales_matrix.shape[1]
     )
-
-    # ------------------------------------------------------------------
-    # 2. Build design matrices
-    # ------------------------------------------------------------------
-    dow = ds["day_of_week"].values
-    Z_shared = jnp.asarray(dow_dummies(dow[train_mask]))  # (n_train_steps, 6)
-    Z_future_shared = jnp.asarray(dow_dummies(dow[val_mask]))  # (horizon, 6)
-    logger.info("Z_shared: %s  Z_future_shared: %s", Z_shared.shape, Z_future_shared.shape)
 
     # ------------------------------------------------------------------
     # 3. Select series to fit
@@ -296,31 +301,50 @@ def main() -> None:
         logger.info("  … (%d more)", n_fit - 10)
 
     # ------------------------------------------------------------------
-    # 4. Fit + predict
+    # 4. Fit + predict, once per forecast origin
     # ------------------------------------------------------------------
     chunk_size = args.chunk_size if args.chunk_size > 0 else None
     fit_chunk = args.fit_chunk if args.fit_chunk > 0 else None
-    logger.info(
-        "Starting batch fit: n_iter=%d  lr=%g  chunk_size=%s  fit_chunk=%s", args.n_iter, args.lr, chunk_size, fit_chunk
-    )
-    t0 = time.time()
-    fit_params, forecasts = _fit_and_forecast(
-        sales_matrix[fit_idx],
-        Z=Z_shared,
-        Z_future=Z_future_shared,
-        n_iter=args.n_iter,
-        lr=args.lr,
-        chunk_size=chunk_size,
-        fit_chunk=fit_chunk,
-    )
-    fit_seconds = time.time() - t0
-    logger.info(
-        "Fitted %d series in %.1fs  (%.1f ms/series, peak RSS so far %.1f GiB)",
-        n_fit,
-        fit_seconds,
-        fit_seconds / n_fit * 1000,
-        _peak_rss_gib(),
-    )
+    dow = ds["day_of_week"].values
+    sales_fit = ds["sales"].values[fit_idx]  # (n_fit, n_dates)
+    fit_params_by_window: dict[str, dict[str, np.ndarray]] = {}
+    forecasts_by_window: dict[str, np.ndarray] = {}
+    fit_seconds_by_window: dict[str, float] = {}
+    for window, (fit_splits, forecast_split, days) in WINDOWS.items():
+        fit_mask = np.isin(split, fit_splits)
+        Z = jnp.asarray(dow_dummies(dow[fit_mask]))  # (n_fit_steps, 6)
+        Z_future = jnp.asarray(dow_dummies(dow[split == forecast_split]))  # (horizon, 6)
+        logger.info(
+            "Origin %s: fit on %d days, forecast %s  (n_iter=%d  lr=%g  chunk_size=%s  fit_chunk=%s)",
+            window,
+            Z.shape[0],
+            days,
+            args.n_iter,
+            args.lr,
+            chunk_size,
+            fit_chunk,
+        )
+        t0 = time.time()
+        fit_params_by_window[window], forecasts_by_window[window] = _fit_and_forecast(
+            sales_fit[:, fit_mask],
+            Z=Z,
+            Z_future=Z_future,
+            n_iter=args.n_iter,
+            lr=args.lr,
+            chunk_size=chunk_size,
+            fit_chunk=fit_chunk,
+        )
+        fit_seconds_by_window[window] = time.time() - t0
+        logger.info(
+            "Fitted %d series in %.1fs  (%.1f ms/series, peak RSS so far %.1f GiB)",
+            n_fit,
+            fit_seconds_by_window[window],
+            fit_seconds_by_window[window] / n_fit * 1000,
+            _peak_rss_gib(),
+        )
+    fit_seconds = sum(fit_seconds_by_window.values())
+    # The diagnostics and the forecast PDF show the validation origin, whose window has actuals in sales_matrix.
+    fit_params, forecasts = fit_params_by_window["validation"], forecasts_by_window["validation"]
 
     # ------------------------------------------------------------------
     # 5. Diagnostics plot
@@ -389,32 +413,49 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 7. Save fitted parameters
     # ------------------------------------------------------------------
-    np.savez(run_dir / "batch_params.npz", **fit_params, forecasts=forecasts, fit_idx=fit_idx)
+    np.savez(
+        run_dir / "batch_params.npz",
+        **fit_params,
+        forecasts=forecasts,
+        **{f"{key}_evaluation": value for key, value in fit_params_by_window["evaluation"].items()},
+        forecasts_evaluation=forecasts_by_window["evaluation"],
+        fit_idx=fit_idx,
+    )
     logger.info("Saved batch_params.npz")
 
     # ------------------------------------------------------------------
     # 8. Submission CSV (only when all series are fitted)
     # ------------------------------------------------------------------
+    base_ids = ds["series_id"].values[fit_idx]
     if n_fit == n_series_total:
-        f_cols = [f"F{i}" for i in range(1, HORIZON + 1)]
-        predictions = pd.DataFrame(forecasts, columns=f_cols)
-        predictions.insert(0, "id", series_ids[fit_idx])
         sample_sub = pd.read_csv(args.data_dir / "sample_submission.csv")
-        _make_submission(predictions, sample_sub, output_path=run_dir / "submission.csv")
+        _make_submission(forecasts_by_window, base_ids, sample_sub, output_path=run_dir / "submission.csv")
     else:
         logger.info(
             "Skipping submission — only %d / %d series fitted (use --n-demo 0 to fit all).", n_fit, n_series_total
         )
 
     # ------------------------------------------------------------------
-    # 9. Validation WRMSSE of the fitted series
+    # 9. WRMSSE of the fitted series, per window with actuals
     # ------------------------------------------------------------------
-    per_level = compute_hierarchical_wrmsse(
-        ds, np.asarray(forecasts, dtype=np.float64), ds["series_id"].values[fit_idx], window="validation"
+    tables = []
+    for window, (_, score_split, days) in WINDOWS.items():
+        if not np.isfinite(ds["sales"].values[:, split == score_split]).all():
+            logger.warning(
+                "Skipping the %s score: the dataset has no actuals for %s (run m5_fetch.py, then m5_preprocess.py).",
+                window,
+                days,
+            )
+            continue
+        per_level = compute_hierarchical_wrmsse(
+            ds, np.asarray(forecasts_by_window[window], dtype=np.float64), base_ids, window=window
+        )
+        log_per_level(per_level, window=window)
+        tables.append(per_level.assign(window=window)[["window", *per_level.columns]])
+    pd.concat(tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_level.csv", index=False)
+    logger.info(
+        "Saved wrmsse_per_level.csv  (%d series, windows: %s)", n_fit, ", ".join(t["window"][0] for t in tables)
     )
-    per_level.to_csv(run_dir / "wrmsse_per_level.csv", index=False)
-    logger.info("Saved wrmsse_per_level.csv  (%d series scored)", n_fit)
-    log_per_level(per_level, window="validation")
     if n_fit < n_series_total:
         logger.warning(
             "Sampled WRMSSE: only %d / %d series are aggregated and weighted, so this score is a smoke test, "
@@ -432,6 +473,7 @@ def main() -> None:
         "chunk_size": chunk_size,
         "fit_chunk": fit_chunk,
         "fit_seconds": round(fit_seconds, 1),
+        "fit_seconds_by_origin": {window: round(sec, 1) for window, sec in fit_seconds_by_window.items()},
         "total_seconds": round(time.time() - t_start, 1),
         "peak_rss_gib": round(_peak_rss_gib(), 2),
     }

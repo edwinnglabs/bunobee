@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Download the M5 Forecasting — Accuracy competition files with the Kaggle CLI.
+"""Download the M5 Forecasting — Accuracy competition files and the official reference files.
 
 Every M5 script reads the raw competition CSVs from ``playground/resource/m5-forecasting-accuracy/``.
 This script puts them there: it runs ``kaggle competitions download``, extracts the archive, deletes
-it (``*.zip`` is not gitignored), and checks that the five expected files are present.
+it (``*.zip`` is not gitignored), and checks that the five expected files are present. It then
+downloads the four reference files below into the same directory.
 
 Prerequisites
 -------------
@@ -13,15 +14,22 @@ Prerequisites
 3. The competition rules, accepted once while signed in at
    https://www.kaggle.com/competitions/m5-forecasting-accuracy/rules.
 
-Test-window actuals
--------------------
-The Kaggle files carry sales up to ``d_1941`` only. The ``d_1942``–``d_1969`` actuals were released by
-the organisers after the competition as ``sales_test_evaluation.csv`` — see the Google Drive "Dataset"
-folder linked from https://github.com/Mcompetitions/M5-methods. This script does not fetch them.
+Reference files
+---------------
+The Kaggle files carry sales up to ``d_1941`` only. After the competition the organisers released the
+test-period actuals and the official scoring weights (see the Google Drive "Dataset" folder linked from
+https://github.com/Mcompetitions/M5-methods). A public zip mirror of that dataset (:data:`REFERENCE_URL`)
+needs no credentials; this script extracts only :data:`REFERENCE_FILES` from it:
+
+- ``sales_test_validation.csv`` / ``sales_test_evaluation.csv`` — actuals for d_1914–d_1941 and
+  d_1942–d_1969. ``m5_preprocess.py`` fills the ``test`` split from the evaluation file, so the
+  ``_evaluation`` rows of a submission can be scored locally.
+- ``weights_validation.csv`` / ``weights_evaluation.csv`` — the official per-series WRMSSE weights,
+  which ``m5_check_weights.py`` compares with the local scorer's.
 
 Usage
 -----
-    python playground/m5_prototype/m5_fetch.py           # no-op when all five files are present
+    python playground/m5_prototype/m5_fetch.py           # no-op when all nine files are present
     python playground/m5_prototype/m5_fetch.py --force   # re-download and overwrite
 """
 
@@ -32,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -44,6 +53,14 @@ EXPECTED_FILES = (
     "sales_train_validation.csv",
     "sales_train_evaluation.csv",
     "sample_submission.csv",
+)
+
+REFERENCE_URL = "https://github.com/Nixtla/m5-forecasts/raw/main/datasets/m5.zip"
+REFERENCE_FILES = (
+    "sales_test_validation.csv",
+    "sales_test_evaluation.csv",
+    "weights_validation.csv",
+    "weights_evaluation.csv",
 )
 
 _RULES_URL = f"https://www.kaggle.com/competitions/{COMPETITION}/rules"
@@ -59,21 +76,23 @@ class FetchError(RuntimeError):
     """A failed fetch, carrying a message that says how to fix it."""
 
 
-def missing_files(data_dir: Path | str) -> list[str]:
-    """Return the expected competition files that are absent from ``data_dir``.
+def missing_files(data_dir: Path | str, names: tuple[str, ...] = EXPECTED_FILES) -> list[str]:
+    """Return the files in ``names`` that are absent from ``data_dir``.
 
     Parameters
     ----------
     data_dir : Path | str
         Directory that should hold the raw M5 CSV files.
+    names : tuple of str
+        File names to look for, by default :data:`EXPECTED_FILES`.
 
     Returns
     -------
     list[str]
-        Names from :data:`EXPECTED_FILES` with no matching file, in that order.
+        Names from ``names`` with no matching file, in that order.
     """
     data_dir = Path(data_dir)
-    return [name for name in EXPECTED_FILES if not (data_dir / name).is_file()]
+    return [name for name in names if not (data_dir / name).is_file()]
 
 
 def _diagnose(output: str) -> str:
@@ -137,34 +156,78 @@ def download(data_dir: Path | str, kaggle: str = "kaggle") -> None:
         archive.unlink(missing_ok=True)
 
 
+def download_reference(data_dir: Path | str, url: str = REFERENCE_URL) -> None:
+    """Download the reference mirror and extract :data:`REFERENCE_FILES` into ``data_dir``.
+
+    Existing files are overwritten. The archive is deleted afterwards, even if extraction fails.
+
+    Parameters
+    ----------
+    data_dir : Path | str
+        Destination directory; created if missing.
+    url : str
+        Zip archive holding the reference files at its root, by default :data:`REFERENCE_URL`.
+
+    Raises
+    ------
+    FetchError
+        If the download fails, the archive is not a valid zip, or it lacks a reference file.
+    """
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive = data_dir / "m5_reference.zip"
+    try:
+        try:
+            urllib.request.urlretrieve(url, archive)
+        except OSError as e:
+            raise FetchError(f"Could not download the reference files from {url} ({e}).") from e
+        with zipfile.ZipFile(archive) as zf:
+            absent = sorted(set(REFERENCE_FILES) - set(zf.namelist()))
+            if absent:
+                raise FetchError(f"{url} does not contain {', '.join(absent)}.")
+            for name in REFERENCE_FILES:
+                zf.extract(name, data_dir)
+    except zipfile.BadZipFile as e:
+        raise FetchError(f"{url} did not return a valid zip archive ({e}); re-run to download it again.") from e
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+def _fetch(label: str, names: tuple[str, ...], fetch, data_dir: Path, force: bool) -> bool:
+    """Run ``fetch(data_dir)`` unless all of ``names`` are present; return False on failure."""
+    missing = missing_files(data_dir, names)
+    if not missing and not force:
+        print(f"All {len(names)} {label} files are in {data_dir}; nothing to do (--force re-downloads).")
+        return True
+    if missing and len(missing) < len(names):
+        print(f"Missing from {data_dir}: {', '.join(missing)}")
+
+    print(f"Downloading the {label} files into {data_dir} …", flush=True)
+    try:
+        fetch(data_dir)
+    except FetchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return False
+
+    missing = missing_files(data_dir, names)
+    if missing:
+        print(f"error: the download did not contain {', '.join(missing)}", file=sys.stderr)
+        return False
+    for name in names:
+        print(f"  {name:<28} {(data_dir / name).stat().st_size / 1e6:8.1f} MB")
+    return True
+
+
 def main() -> int:
-    """Fetch the M5 files unless they are already present; return the process exit code."""
+    """Fetch the competition and reference files unless they are present; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="raw M5 CSV directory")
     parser.add_argument("--force", action="store_true", help="re-download even if all files are present")
     args = parser.parse_args()
 
-    missing = missing_files(args.data_dir)
-    if not missing and not args.force:
-        print(f"All {len(EXPECTED_FILES)} M5 files are in {args.data_dir}; nothing to do (--force re-downloads).")
-        return 0
-    if missing and len(missing) < len(EXPECTED_FILES):
-        print(f"Missing from {args.data_dir}: {', '.join(missing)}")
-
-    print(f"Downloading {COMPETITION} into {args.data_dir} …", flush=True)
-    try:
-        download(args.data_dir)
-    except FetchError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-
-    missing = missing_files(args.data_dir)
-    if missing:
-        print(f"error: the download did not contain {', '.join(missing)}", file=sys.stderr)
-        return 1
-    for name in EXPECTED_FILES:
-        print(f"  {name:<28} {(args.data_dir / name).stat().st_size / 1e6:8.1f} MB")
-    return 0
+    ok = _fetch(COMPETITION, EXPECTED_FILES, download, args.data_dir, args.force)
+    ok = _fetch("reference", REFERENCE_FILES, download_reference, args.data_dir, args.force) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

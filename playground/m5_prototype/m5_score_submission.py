@@ -34,8 +34,9 @@ Scoring windows (``--window``):
     validation : actuals d_1914-d_1941, trained on d_1-d_1913  (``_validation`` rows)
     evaluation : actuals d_1942-d_1969, trained on d_1-d_1941  (``_evaluation`` rows)
 
-The Kaggle files stop at d_1941 (see ``m5_fetch.py``), so the evaluation window
-only scores once the dataset's ``test`` split carries the released actuals.
+The Kaggle files stop at d_1941, so the evaluation window only scores once the
+dataset's ``test`` split carries the released actuals: ``m5_fetch.py`` downloads
+them and ``m5_preprocess.py`` fills them in.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ N_STEPS = 28
 
 # Scoring window -> (splits forming its training span, split holding its actuals, day range for logs). The
 # training span feeds the RMSSE scale, and its last N_STEPS days feed the dollar-sales weights.
-_WINDOWS: dict[str, tuple[tuple[str, ...], str, str]] = {
+WINDOWS: dict[str, tuple[tuple[str, ...], str, str]] = {
     "validation": (("train",), "validation", "d_1914-d_1941"),
     "evaluation": (("train", "validation"), "test", "d_1942-d_1969"),
 }
@@ -90,7 +91,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--window",
-        choices=tuple(_WINDOWS),
+        choices=tuple(WINDOWS),
         default="validation",
         help="Scoring window: validation (d_1914-d_1941) or evaluation (d_1942-d_1969).",
     )
@@ -112,6 +113,28 @@ def _aggregate(matrix: np.ndarray, group_idx: np.ndarray, n_groups: int) -> np.n
     out = np.zeros((n_groups, matrix.shape[1]), dtype=np.float64)
     np.add.at(out, group_idx, matrix)
     return out
+
+
+def _dollar_sales(sales: np.ndarray, prices: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
+    """Per-series dollar sales over the last ``N_STEPS`` days of the training span.
+
+    ``nansum``, not ``sum``: a day with no listed price drops out of the weight instead of zeroing the
+    series.
+
+    Parameters
+    ----------
+    sales, prices : np.ndarray, shape (n_series, T)
+        Daily unit sales and sell prices over the full calendar.
+    train_mask : np.ndarray, shape (T,)
+        True on the scoring window's training days.
+
+    Returns
+    -------
+    np.ndarray, shape (n_series,)
+        Dollar sales per series.
+    """
+    last_28_idx = np.where(train_mask)[0][-N_STEPS:]
+    return np.nansum(sales[:, last_28_idx].astype(np.float64) * prices[:, last_28_idx].astype(np.float64), axis=1)
 
 
 def _rmsse_scale(y_train: np.ndarray) -> np.ndarray:
@@ -211,7 +234,7 @@ def compute_hierarchical_wrmsse(
     series_order : np.ndarray, shape (n_series,)
         ``series_id`` of each forecast row.
     window : {"validation", "evaluation"}, optional
-        Scoring window, a key of ``_WINDOWS``. Default ``"validation"``.
+        Scoring window, a key of ``WINDOWS``. Default ``"validation"``.
 
     Returns
     -------
@@ -221,13 +244,13 @@ def compute_hierarchical_wrmsse(
     Raises
     ------
     ValueError
-        If ``window`` is not a key of ``_WINDOWS``.
+        If ``window`` is not a key of ``WINDOWS``.
     RuntimeError
         If the window is not ``N_STEPS`` days long or the dataset has no actuals for it.
     """
-    if window not in _WINDOWS:
-        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(_WINDOWS)}")
-    train_splits, score_split, days = _WINDOWS[window]
+    if window not in WINDOWS:
+        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
+    train_splits, score_split, days = WINDOWS[window]
 
     ds_ids = ds["series_id"].values
     id_to_idx = {sid: i for i, sid in enumerate(ds_ids)}
@@ -247,9 +270,7 @@ def compute_hierarchical_wrmsse(
     if not np.isfinite(y_score).all():
         raise RuntimeError(f"The dataset has no {window} actuals ({days}); see m5_fetch.py for where they come from")
 
-    # nansum, not sum: a day with no listed price drops out of the weight instead of zeroing the series.
-    last_28_idx = np.where(train_mask)[0][-N_STEPS:]
-    dollar_per_series = np.nansum(sales[:, last_28_idx] * prices[:, last_28_idx], axis=1)
+    dollar_per_series = _dollar_sales(sales, prices, train_mask)
 
     meta = {key: ds[key].values[idx] for key in ("state_id", "store_id", "cat_id", "dept_id", "item_id")}
 
@@ -273,6 +294,50 @@ def compute_hierarchical_wrmsse(
     return pd.DataFrame(rows)
 
 
+def level_weights(ds: xr.Dataset, window: str = "validation") -> pd.DataFrame:
+    """WRMSSE weight of every group at all 12 levels, as :func:`compute_hierarchical_wrmsse` weights them.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset from ``m5_preprocess.build_m5_dataset``.
+    window : {"validation", "evaluation"}, optional
+        Scoring window, a key of ``WINDOWS``; it fixes the 28 days the dollar sales are summed over.
+        Default ``"validation"``.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per group: ``level``, ``group`` (the level's keys in ``_LEVELS`` order joined by ``"|"``,
+        ``"Total"`` at level 1), ``dollar_sales`` and ``weight``. Weights sum to 1 within each level.
+    """
+    if window not in WINDOWS:
+        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
+    train_mask = np.isin(ds["split"].values, WINDOWS[window][0])
+    dollar = _dollar_sales(ds["sales"].values, ds["sell_price"].values, train_mask)
+
+    frames = []
+    for level_no, _, keys in _LEVELS:
+        if keys is None:
+            labels = np.full(len(dollar), "Total")
+        else:
+            labels = ds[keys[0]].values.astype(str)
+            for key in keys[1:]:
+                labels = np.char.add(np.char.add(labels, "|"), ds[key].values.astype(str))
+        by_group = pd.Series(dollar).groupby(labels).sum()
+        frames.append(
+            pd.DataFrame(
+                {
+                    "level": level_no,
+                    "group": by_group.index,
+                    "dollar_sales": by_group.values,
+                    "weight": by_group.values / by_group.sum(),
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 def log_per_level(per_level: pd.DataFrame, window: str = "validation") -> None:
     """Log a per-level WRMSSE + bias table and its 12-level mean.
 
@@ -283,7 +348,7 @@ def log_per_level(per_level: pd.DataFrame, window: str = "validation") -> None:
     window : {"validation", "evaluation"}, optional
         Scoring window ``per_level`` was computed on, named in the table header. Default ``"validation"``.
     """
-    logger.info("Per-level WRMSSE + bias (%s %s):", window, _WINDOWS[window][2])
+    logger.info("Per-level WRMSSE + bias (%s %s):", window, WINDOWS[window][2])
     logger.info(
         "  %-3s  %-22s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s",
         "lvl",
