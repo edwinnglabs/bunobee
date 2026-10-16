@@ -273,25 +273,17 @@ def compute_hierarchical_wrmsse(
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    args = _parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def log_per_level(per_level: pd.DataFrame, window: str = "validation") -> None:
+    """Log a per-level WRMSSE + bias table and its 12-level mean.
 
-    if not args.submission.exists():
-        raise SystemExit(f"Submission not found: {args.submission}")
-
-    logger.info("Loading submission from %s", args.submission)
-    sub = pd.read_csv(args.submission)
-    forecasts, series_order = _submission_rows(sub, args.window)
-    logger.info("Found %d _%s rows", len(series_order), args.window)
-
-    logger.info("Loading dataset from %s", args.data_dir)
-    ds = load_m5_ds(args.data_dir)
-
-    per_level = compute_hierarchical_wrmsse(ds, forecasts, series_order, window=args.window)
-    final_wrmsse = float(per_level["wrmsse"].mean())
-
-    logger.info("Per-level WRMSSE + bias (%s %s):", args.window, _WINDOWS[args.window][2])
+    Parameters
+    ----------
+    per_level : pd.DataFrame
+        Output of :func:`compute_hierarchical_wrmsse`.
+    window : {"validation", "evaluation"}, optional
+        Scoring window ``per_level`` was computed on, named in the table header. Default ``"validation"``.
+    """
+    logger.info("Per-level WRMSSE + bias (%s %s):", window, _WINDOWS[window][2])
     logger.info(
         "  %-3s  %-22s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s",
         "lvl",
@@ -315,7 +307,26 @@ def main() -> None:
             row["bias_signed"],
             row["bias_pct"],
         )
-    logger.info("Hierarchical WRMSSE (mean of 12 levels): %.6f", final_wrmsse)
+    logger.info("Hierarchical WRMSSE (mean of 12 levels): %.6f", float(per_level["wrmsse"].mean()))
+
+
+def main() -> None:
+    args = _parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if not args.submission.exists():
+        raise SystemExit(f"Submission not found: {args.submission}")
+
+    logger.info("Loading submission from %s", args.submission)
+    sub = pd.read_csv(args.submission)
+    forecasts, series_order = _submission_rows(sub, args.window)
+    logger.info("Found %d _%s rows", len(series_order), args.window)
+
+    logger.info("Loading dataset from %s", args.data_dir)
+    ds = load_m5_ds(args.data_dir)
+
+    per_level = compute_hierarchical_wrmsse(ds, forecasts, series_order, window=args.window)
+    log_per_level(per_level, window=args.window)
 
 
 if __name__ == "__main__":

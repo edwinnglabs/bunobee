@@ -94,7 +94,7 @@ Tier 1 (batch KF) → Tier 2 (batch optimizer) → Tier 3 (pmap)
 |---|---|
 | `src/bunobee/models/ssp/univariate.py` | Add `kalman_filter_1d_batch` (vmap wrapper) |
 | `src/bunobee/models/m5/m5_ssp_optim.py` | Add `fit_batch_series_opt`, `predict_batch_series_opt` |
-| `playground/m5_prototype/m5_accuracy.ipynb` | Replace per-series loop with single batch call |
+| `playground/m5_prototype/m5_run.py` | Replace per-series loop with single batch call |
 
 Existing single-series APIs (`fit_one_series_opt`, `predict_one_series_opt`) are preserved for debugging.
 
@@ -110,4 +110,4 @@ Existing single-series APIs (`fit_one_series_opt`, `predict_one_series_opt`) are
 
 1. **Correctness**: Run `fit_batch_series_opt` on 10-20 series and compare `at`, `sigma_h`, `sigma_q` against `fit_one_series_opt` loop — results should match within float32 tolerance.
 2. **Speed**: Time the batch fit on full 30K series vs. serial loop on a small subset — extrapolate and verify the expected speedup.
-3. **Notebook**: Update `m5_accuracy.ipynb` to use the batch API on the full dataset and verify forecasts are reasonable.
+3. **Script**: Run `m5_run.py` with the batch API on the full dataset and verify forecasts are reasonable.

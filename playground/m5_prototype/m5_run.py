@@ -11,6 +11,11 @@ Usage examples
 
 # Fit all 30,490 series and generate a submission CSV:
     python m5_run.py --n-demo 0
+
+Every run scores the fitted series on the validation window (d_1914-d_1941) with the 12-level
+hierarchical WRMSSE and writes the per-level table to ``wrmsse_per_level.csv`` in the run directory.
+A sampled run aggregates and weights only its own series, so its score is a smoke test that the
+pipeline runs end to end, not a number comparable to the full 30,490-series score.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import pandas as pd
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
 
 from m5_common import DATA_DIR, dow_dummies, load_m5_ds
+from m5_score_submission import compute_hierarchical_wrmsse, log_per_level
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -302,6 +308,23 @@ def main() -> None:
     else:
         logger.info(
             "Skipping submission — only %d / %d series fitted (use --n-demo 0 to fit all).", n_fit, n_series_total
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Validation WRMSSE of the fitted series
+    # ------------------------------------------------------------------
+    per_level = compute_hierarchical_wrmsse(
+        ds, np.asarray(forecasts, dtype=np.float64), ds["series_id"].values[fit_idx], window="validation"
+    )
+    per_level.to_csv(run_dir / "wrmsse_per_level.csv", index=False)
+    logger.info("Saved wrmsse_per_level.csv  (%d series scored)", n_fit)
+    log_per_level(per_level, window="validation")
+    if n_fit < n_series_total:
+        logger.warning(
+            "Sampled WRMSSE: only %d / %d series are aggregated and weighted, so this score is a smoke test, "
+            "not comparable to the full-run score.",
+            n_fit,
+            n_series_total,
         )
 
     logger.info("Done. Outputs in %s", run_dir)
