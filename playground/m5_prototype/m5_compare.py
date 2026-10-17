@@ -154,12 +154,13 @@ def compare_runs(run_a: Path, run_b: Path) -> pd.DataFrame:
 
 
 def _describe(run_dir: Path) -> str:
-    """The run directory, with its model and number of series when ``run_stats.json`` records them."""
+    """The run directory, with its model, number of series and rounding when ``run_stats.json`` records them."""
     stats_path = run_dir / "run_stats.json"
     if not stats_path.is_file():
         return str(run_dir)
     stats = json.loads(stats_path.read_text())
-    return f"{run_dir}  (model {stats.get('model', '?')}, {stats.get('n_series', '?')} series)"
+    rounded = ", forecasts rounded" if stats.get("round") else ""
+    return f"{run_dir}  (model {stats.get('model', '?')}, {stats.get('n_series', '?')} series{rounded})"
 
 
 def log_comparison(table: pd.DataFrame, run_a: Path, run_b: Path) -> None:
