@@ -9,6 +9,9 @@ Usage examples
 # Fit 50 top-volume series:
     python m5_run.py --n-demo 50 --sample-mode top
 
+# Quick loop: fit 3,000 random series at the validation origin only (about 20 s):
+    python m5_run.py --model ssp_dow --n-demo 3000 --origins validation
+
 # Fit all 30,490 series with a named model and generate a submission CSV:
     python m5_run.py --model ssp_dow --n-demo 0
 
@@ -16,20 +19,24 @@ Usage examples
 optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
 needs only a new entry there.
 
-Every run fits the selected series twice, once per forecast origin (see ``WINDOWS`` in
-``m5_score_submission``):
+``--origins`` picks the forecast origins to fit (see ``WINDOWS`` in ``m5_score_submission``), by default
+both:
 
     validation : fit on d_1-d_1913, forecast d_1914-d_1941  (``_validation`` submission rows)
     evaluation : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows)
 
-It scores each origin's forecasts with the 12-level hierarchical WRMSSE and writes the per-level tables
-to ``wrmsse_per_level.csv`` in the run directory, one ``window`` per origin. The evaluation window is
-scored only when the dataset carries its actuals (``m5_fetch.py`` + ``m5_preprocess.py``). A sampled
-run aggregates and weights only its own series, so its score is a smoke test that the pipeline runs
-end to end, not a number comparable to the full 30,490-series score.
+``submission.csv`` needs every series at both origins, so only a full run with both origins writes it.
+
+The run scores each origin's forecasts with the 12-level hierarchical WRMSSE and writes the per-level
+tables to ``wrmsse_per_level.csv`` in the run directory, one ``window`` per origin. The evaluation window
+is scored only when the dataset carries its actuals (``m5_fetch.py`` + ``m5_preprocess.py``). A sampled
+run aggregates and weights only its own series, so its score is comparable with other runs on the same
+sample (same ``--n-demo``, ``--sample-mode`` and ``--seed``; see ``m5_compare.py``), not with the full
+30,490-series score.
 
 Every run also writes the model name and settings, its wall-clock time and peak memory to ``run_stats.json``
-in the run directory.
+in the run directory, and appends one row to the run log ``runs.csv`` in ``--output-dir`` (see
+:func:`_append_run_log`).
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ import json
 import logging
 import math
 import resource
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -59,6 +67,16 @@ logger = logging.getLogger(__name__)
 
 HORIZON = 28
 _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
+
+#: ``--origins`` choice -> forecast origins to fit, in ``WINDOWS`` order.
+ORIGINS: dict[str, tuple[str, ...]] = {
+    "validation": ("validation",),
+    "evaluation": ("evaluation",),
+    "both": tuple(WINDOWS),
+}
+
+#: File name of the run log in ``--output-dir``, next to the run directories.
+RUN_LOG = "runs.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +116,13 @@ def _parse_args() -> argparse.Namespace:
         help="How to select demo series: random sample or top by total volume.",
     )
     p.add_argument("--seed", type=int, default=2026, help="RNG seed for reproducible random sampling.")
+    p.add_argument(
+        "--origins",
+        choices=tuple(ORIGINS),
+        default="both",
+        help="Forecast origins to fit: validation (d_1914-d_1941), evaluation (d_1942-d_1969) or both, by default "
+        "both. A quick loop fits validation only, so it never looks at the evaluation window.",
+    )
     p.add_argument(
         "--n-plot",
         type=int,
@@ -189,6 +214,48 @@ def _peak_rss_gib() -> float:
     return peak / 2**30 if sys.platform == "darwin" else peak / 2**20
 
 
+def _git_state() -> tuple[str | None, bool | None]:
+    """Commit and dirty flag of the checkout this script runs from.
+
+    Returns
+    -------
+    commit : str or None
+        Short hash of ``HEAD``, or None if git or the repository is unavailable.
+    dirty : bool or None
+        Whether tracked files have uncommitted changes (untracked files do not count, as in
+        ``git describe --dirty``), or None if git or the repository is unavailable.
+    """
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=Path(__file__).parent, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    try:
+        return git("rev-parse", "--short", "HEAD"), bool(git("status", "--porcelain", "--untracked-files=no"))
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+
+
+def _append_run_log(path: Path, row: dict[str, object]) -> None:
+    """Append one run's row to the run log, creating the log with a header if it does not exist yet.
+
+    The log is read back as text and rewritten, so values typed into it by hand (the Kaggle scores of a
+    submitted run) are kept verbatim, and a column new in ``row`` is added with blanks for earlier runs.
+
+    Parameters
+    ----------
+    path : Path
+        The run log CSV.
+    row : dict of str to object
+        Column name -> value for this run. None is written as a blank.
+    """
+    log = pd.DataFrame([{key: "" if value is None else str(value) for key, value in row.items()}])
+    if path.exists():
+        log = pd.concat([pd.read_csv(path, dtype=str, keep_default_na=False), log], ignore_index=True)
+    log.to_csv(path, index=False)
+
+
 def _make_submission(
     forecasts: dict[str, np.ndarray],
     base_ids: np.ndarray,
@@ -243,10 +310,13 @@ def _make_submission(
 def main() -> None:
     t_start = time.time()
     args = _parse_args()
+    windows = ORIGINS[args.origins]
+    # Read at the start: the run log should record the code this run fits, not edits made while it runs.
+    git_commit, git_dirty = _git_state()
 
     # Create timestamped output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir: Path = args.output_dir / timestamp
+    started = datetime.now()
+    run_dir: Path = args.output_dir / started.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Run directory: %s", run_dir)
 
@@ -286,15 +356,17 @@ def main() -> None:
         logger.info("  … (%d more)", n_fit - 10)
 
     # ------------------------------------------------------------------
-    # 4. Fit + predict, once per forecast origin
+    # 4. Fit + predict, once per forecast origin in --origins
     # ------------------------------------------------------------------
     model = MODELS[args.model]
     settings = asdict(model)
     fitted_by_window: dict[str, dict[str, np.ndarray]] = {}
     forecasts_by_window: dict[str, np.ndarray] = {}
     fit_seconds_by_window: dict[str, float] = {}
-    for window, (fit_splits, forecast_split, days) in WINDOWS.items():
-        fit_mask = np.isin(split, fit_splits)
+    fit_mask_by_window: dict[str, np.ndarray] = {}
+    for window in windows:
+        fit_splits, forecast_split, days = WINDOWS[window]
+        fit_mask = fit_mask_by_window[window] = np.isin(split, fit_splits)
         logger.info(
             "Origin %s: fit on %d days, forecast %s  (model %s: %s)",
             window,
@@ -317,14 +389,15 @@ def main() -> None:
             _peak_rss_gib(),
         )
     fit_seconds = sum(fit_seconds_by_window.values())
-    # The diagnostics and the forecast PDF show the validation origin, whose window has actuals in sales_matrix.
-    fitted, forecasts = fitted_by_window["validation"], forecasts_by_window["validation"]
+    # The diagnostics and the forecast PDF show the first origin fitted: validation, unless only evaluation is.
+    plot_window = windows[0]
+    fitted, forecasts = fitted_by_window[plot_window], forecasts_by_window[plot_window]
 
     # ------------------------------------------------------------------
     # 5. Diagnostics plot
     # ------------------------------------------------------------------
     _plot_fitted(
-        fitted, title=f"{args.model} fitted outputs — validation origin", output_path=run_dir / "diagnostics.png"
+        fitted, title=f"{args.model} fitted outputs — {plot_window} origin", output_path=run_dir / "diagnostics.png"
     )
 
     # ------------------------------------------------------------------
@@ -335,6 +408,8 @@ def main() -> None:
     n_pages = math.ceil(n_plot / per_page)
     tail = 90
     pdf_path = run_dir / "forecasts.pdf"
+    # Sales of the plotted series up to the plotted origin's cutoff day, so each forecast continues its history.
+    history = ds["sales"].values[fit_idx[:n_plot]][:, fit_mask_by_window[plot_window]]
 
     with PdfPages(pdf_path) as pdf:
         for page in range(n_pages):
@@ -348,9 +423,8 @@ def main() -> None:
 
             for ax, rank in zip(axes, page_ranks):
                 idx = fit_idx[rank]
-                actual = sales_matrix[idx]
                 forecast = forecasts[rank]
-                ax.plot(range(tail), actual[-tail:], label="Actual", alpha=0.7)
+                ax.plot(range(tail), history[rank, -tail:], label="Actual", alpha=0.7)
                 ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast", linestyle="--", color="tomato")
                 ax.axvline(tail, color="grey", linestyle=":", alpha=0.5)
                 ax.set_title(series_ids[idx], fontsize=9, loc="left")
@@ -359,7 +433,7 @@ def main() -> None:
 
             axes[-1].set_xlabel("Day")
             fig.suptitle(
-                f"{args.model} forecast — {label}  (page {page + 1}/{n_pages})",
+                f"{args.model} forecast, {plot_window} origin — {label}  (page {page + 1}/{n_pages})",
                 y=1.01,
             )
             plt.tight_layout()
@@ -369,35 +443,39 @@ def main() -> None:
     logger.info("Saved forecasts.pdf  (%d series, %d pages)", n_plot, n_pages)
 
     # ------------------------------------------------------------------
-    # 7. Save the model's fitted outputs
+    # 7. Save the model's fitted outputs: validation-origin arrays under their own names, evaluation-origin
+    #    arrays with an "_evaluation" suffix
     # ------------------------------------------------------------------
-    np.savez(
-        run_dir / "batch_params.npz",
-        **fitted,
-        forecasts=forecasts,
-        **{f"{key}_evaluation": value for key, value in fitted_by_window["evaluation"].items()},
-        forecasts_evaluation=forecasts_by_window["evaluation"],
-        fit_idx=fit_idx,
-    )
+    arrays: dict[str, np.ndarray] = {}
+    for window in windows:
+        suffix = "" if window == "validation" else f"_{window}"
+        arrays.update({f"{key}{suffix}": value for key, value in fitted_by_window[window].items()})
+        arrays[f"forecasts{suffix}"] = forecasts_by_window[window]
+    np.savez(run_dir / "batch_params.npz", **arrays, fit_idx=fit_idx)
     logger.info("Saved batch_params.npz")
 
     # ------------------------------------------------------------------
-    # 8. Submission CSV (only when all series are fitted)
+    # 8. Submission CSV (only when all series are fitted at both origins)
     # ------------------------------------------------------------------
     base_ids = ds["series_id"].values[fit_idx]
-    if n_fit == n_series_total:
+    if n_fit == n_series_total and windows == tuple(WINDOWS):
         sample_sub = pd.read_csv(args.data_dir / "sample_submission.csv")
         _make_submission(forecasts_by_window, base_ids, sample_sub, output_path=run_dir / "submission.csv")
     else:
         logger.info(
-            "Skipping submission — only %d / %d series fitted (use --n-demo 0 to fit all).", n_fit, n_series_total
+            "Skipping submission — it needs all %d series (--n-demo 0) at both origins (--origins both); this run "
+            "fitted %d series at %s.",
+            n_series_total,
+            n_fit,
+            " and ".join(windows),
         )
 
     # ------------------------------------------------------------------
-    # 9. WRMSSE of the fitted series, per window with actuals
+    # 9. WRMSSE of the fitted series, per fitted window with actuals
     # ------------------------------------------------------------------
     tables = []
-    for window, (_, score_split, days) in WINDOWS.items():
+    for window in windows:
+        _, score_split, days = WINDOWS[window]
         if not np.isfinite(ds["sales"].values[:, split == score_split]).all():
             logger.warning(
                 "Skipping the %s score: the dataset has no actuals for %s (run m5_fetch.py, then m5_preprocess.py).",
@@ -410,14 +488,17 @@ def main() -> None:
         )
         log_per_level(per_level, window=window)
         tables.append(per_level.assign(window=window)[["window", *per_level.columns]])
-    pd.concat(tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_level.csv", index=False)
-    logger.info(
-        "Saved wrmsse_per_level.csv  (%d series, windows: %s)", n_fit, ", ".join(t["window"][0] for t in tables)
-    )
-    if n_fit < n_series_total:
+    scores = {table["window"][0]: float(table["wrmsse"].mean()) for table in tables}
+    if tables:
+        pd.concat(tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_level.csv", index=False)
+        logger.info("Saved wrmsse_per_level.csv  (%d series, windows: %s)", n_fit, ", ".join(scores))
+    else:
+        logger.warning("No window was scored, so there is no wrmsse_per_level.csv.")
+    if tables and n_fit < n_series_total:
         logger.warning(
-            "Sampled WRMSSE: only %d / %d series are aggregated and weighted, so this score is a smoke test, "
-            "not comparable to the full-run score.",
+            "Sampled WRMSSE: only %d / %d series are aggregated and weighted, so this score is comparable with other "
+            "runs on the same sample (same --n-demo, --sample-mode and --seed; see m5_compare.py), not with a "
+            "full-run score.",
             n_fit,
             n_series_total,
         )
@@ -429,6 +510,7 @@ def main() -> None:
         "model": args.model,
         "settings": settings,
         "n_series": n_fit,
+        "origins": list(windows),
         "fit_seconds": round(fit_seconds, 1),
         "fit_seconds_by_origin": {window: round(sec, 1) for window, sec in fit_seconds_by_window.items()},
         "total_seconds": round(time.time() - t_start, 1),
@@ -441,6 +523,32 @@ def main() -> None:
         run_stats["total_seconds"],
         run_stats["peak_rss_gib"],
     )
+
+    # ------------------------------------------------------------------
+    # 11. Run log: one row per run, next to the run directories. The Kaggle columns are left blank, to be
+    #     filled in by hand once the run's submission is scored.
+    # ------------------------------------------------------------------
+    run_log_path = args.output_dir / RUN_LOG
+    _append_run_log(
+        run_log_path,
+        {
+            "timestamp": started.isoformat(timespec="seconds"),
+            "run_dir": run_dir.name,
+            "model": args.model,
+            "settings": json.dumps(settings),
+            "n_series": n_fit,
+            "sample_mode": args.sample_mode,
+            "seed": args.seed,
+            "origins": args.origins,
+            **{f"wrmsse_{window}": round(scores[window], 6) if window in scores else None for window in WINDOWS},
+            "fit_seconds": run_stats["fit_seconds"],
+            "git_commit": git_commit,
+            "git_dirty": git_dirty,
+            "kaggle_public": None,
+            "kaggle_private": None,
+        },
+    )
+    logger.info("Appended this run to %s", run_log_path)
 
     logger.info("Done. Outputs in %s", run_dir)
 
