@@ -25,6 +25,10 @@ from bunobee.regression import make_periodic_dummies
 
 logger = logging.getLogger(__name__)
 
+#: Optional key of a model's ``fitted`` output: its in-sample fit of every fit day, in units, of shape
+#: ``(len(series_idx), fit_mask.sum())``. ``m5_run.py`` draws it in ``forecasts.pdf`` instead of saving it.
+INSAMPLE_KEY = "insample"
+
 
 class Model(Protocol):
     """What ``m5_run.py`` needs from a registered model.
@@ -59,9 +63,43 @@ class Model(Protocol):
             with no NaNs.
         fitted : dict of str to np.ndarray
             Per-series outputs to save, each with leading dimension ``len(series_idx)``. ``m5_run.py``
-            writes them to ``batch_params.npz`` and plots their distributions in ``diagnostics.png``.
+            writes them to ``batch_params.npz`` and plots their distributions in ``diagnostics.png``, except
+            the optional :data:`INSAMPLE_KEY` entry, the in-sample fit, which it draws in ``forecasts.pdf``.
         """
         ...
+
+
+def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
+    """In-sample fit of a ``fit_batch_series_opt`` result: each fit day predicted from the days before it.
+
+    Day ``t`` is predicted from the filtered state of day ``t - 1`` (``a0`` and ``P0`` on the first day), the
+    states being random walks, and back-transformed as ``predict_batch_series_opt`` back-transforms a
+    forecast: ``exp(mu + var / 2) * response_norm``, with ``var`` the predicted variance of the log sales.
+    The forecast of the first day after the fit days is this prediction one day on.
+
+    Parameters
+    ----------
+    result : dict
+        Output of ``fit_batch_series_opt`` for B series.
+    Z : np.ndarray
+        ``(n_steps, n_states)`` design matrix the series were fitted with.
+
+    Returns
+    -------
+    np.ndarray
+        In-sample fit of shape ``(B, n_steps)``, in units.
+    """
+    Z = np.asarray(Z)
+    at, Pt = result["at"], result["Pt"]  # (B, n_steps, n_states) each
+    mu = np.empty(at.shape[:2], dtype=at.dtype)
+    var = np.empty_like(mu)
+    mu[:, 0] = np.asarray(result["a0"]) @ Z[0]
+    var[:, 0] = np.asarray(result["P0"]) @ Z[0] ** 2
+    # einsum, not a broadcast product, so no (B, n_steps, n_states) temporary is built.
+    mu[:, 1:] = np.einsum("bts,ts->bt", at[:, :-1], Z[1:])
+    var[:, 1:] = np.einsum("bts,ts->bt", Pt[:, :-1], Z[1:] ** 2)
+    var += np.asarray(result["sigma_h"])[:, None] ** 2
+    return np.exp(mu + 0.5 * var) * np.asarray(result["response_norm"])[:, None]
 
 
 @dataclass(frozen=True)
@@ -111,7 +149,8 @@ class SspDow:
         relative difference of up to ~4e-4 on a few series.
 
         See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds the
-        :attr:`FITTED_KEYS` outputs of ``fit_batch_series_opt``.
+        :attr:`FITTED_KEYS` outputs of ``fit_batch_series_opt`` and, under :data:`INSAMPLE_KEY`, the
+        one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`).
         """
         # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
         # each column a weekday from Tuesday to Sunday on every day, with Monday dropped.
@@ -124,7 +163,7 @@ class SspDow:
         n_series = sales.shape[0]
         step = self.fit_chunk or n_series
         n_runs = math.ceil(n_series / step)
-        fitted: dict[str, list[np.ndarray]] = {key: [] for key in self.FITTED_KEYS}
+        fitted: dict[str, list[np.ndarray]] = {key: [] for key in (*self.FITTED_KEYS, INSAMPLE_KEY)}
         forecasts = []
         for run, start in enumerate(range(0, n_series, step), start=1):
             end = min(start + step, n_series)
@@ -142,6 +181,7 @@ class SspDow:
             forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
             for key in self.FITTED_KEYS:
                 fitted[key].append(np.asarray(result[key]))
+            fitted[INSAMPLE_KEY].append(_one_step_ahead_fit(result, Z))
         return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
 
 

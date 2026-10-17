@@ -73,7 +73,8 @@ Each `m5_run.py` run writes to `output/<timestamp>/`:
 | `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per fitted origin |
 | `run_stats.json` | Model name and settings, origins, fit time (total and per origin), total time, peak memory |
 | `batch_params.npz` | `fit_idx` (the fitted series) and the model's fitted outputs and forecasts of each fitted origin; evaluation-origin arrays carry an `_evaluation` suffix |
-| `diagnostics.png`, `forecasts.pdf` | Histograms of the model's fitted outputs and forecast plots (validation origin, or evaluation if only it is fitted) |
+| `diagnostics.png` | Histograms of the model's fitted outputs (validation origin, or evaluation if only it is fitted) |
+| `forecasts.pdf` | Forecast review of each fitted origin: the total, store and department sums of the fitted series, then `--n-plot` series (default 50) picked by `--plot-select`: `random` (default), `worst` (highest RMSSE) or `top` (highest dollar-sales weight). Each panel shows the last 90 fit days, the actuals and the forecast over the forecast window, and the model's in-sample fit if it returns one; its title gives the RMSSE, bias and weight |
 
 and appends one row to the run log `output/runs.csv`: the timestamp, the run directory, the model and
 its settings, the number of series, sample mode and seed, the origins, the WRMSSE of each scored window,
@@ -97,8 +98,9 @@ on the same sample (same `--n-demo`, `--sample-mode` and `--seed`), not with a f
 `--model` picks an entry of `MODELS` in `m5_models.py`. An entry is a model plus its settings: a
 frozen dataclass whose `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` builds the model's
 inputs from the dataset, calls the model in `src/bunobee/models/m5/` and returns the forecasts
-(series × 28) and a dict of per-series arrays to save. To try another model, add an entry; `m5_run.py`
-needs no change.
+(series × 28) and a dict of per-series arrays to save. An optional `insample` array (series × fit days,
+`INSAMPLE_KEY`) is the model's in-sample fit, which `forecasts.pdf` draws instead of saving. To try another
+model, add an entry; `m5_run.py` needs no change.
 
 | Entry | Model | Settings |
 |---|---|---|

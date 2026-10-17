@@ -115,7 +115,7 @@ def _aggregate(matrix: np.ndarray, group_idx: np.ndarray, n_groups: int) -> np.n
     return out
 
 
-def _dollar_sales(sales: np.ndarray, prices: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
+def dollar_sales(sales: np.ndarray, prices: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
     """Per-series dollar sales over the last ``N_STEPS`` days of the training span.
 
     ``nansum``, not ``sum``: a day with no listed price drops out of the weight instead of zeroing the
@@ -137,7 +137,7 @@ def _dollar_sales(sales: np.ndarray, prices: np.ndarray, train_mask: np.ndarray)
     return np.nansum(sales[:, last_28_idx].astype(np.float64) * prices[:, last_28_idx].astype(np.float64), axis=1)
 
 
-def _rmsse_scale(y_train: np.ndarray) -> np.ndarray:
+def rmsse_scale(y_train: np.ndarray) -> np.ndarray:
     """Per-series RMSSE scale: the mean squared one-step difference from the first non-zero sale on.
 
     The M5 Competitors Guide starts each series' scale at its first non-zero observation, so the leading
@@ -169,7 +169,7 @@ def _level_stats(
     dollar_agg: np.ndarray,
 ) -> dict[str, float]:
     """Return WRMSSE plus bias diagnostics for one level."""
-    denom = np.sqrt(_rmsse_scale(y_train_agg))
+    denom = np.sqrt(rmsse_scale(y_train_agg))
 
     err = f_score_agg - y_score_agg
     mse = np.mean(err**2, axis=1)
@@ -270,7 +270,7 @@ def compute_hierarchical_wrmsse(
     if not np.isfinite(y_score).all():
         raise RuntimeError(f"The dataset has no {window} actuals ({days}); see m5_fetch.py for where they come from")
 
-    dollar_per_series = _dollar_sales(sales, prices, train_mask)
+    dollar_per_series = dollar_sales(sales, prices, train_mask)
 
     meta = {key: ds[key].values[idx] for key in ("state_id", "store_id", "cat_id", "dept_id", "item_id")}
 
@@ -314,7 +314,7 @@ def level_weights(ds: xr.Dataset, window: str = "validation") -> pd.DataFrame:
     if window not in WINDOWS:
         raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
     train_mask = np.isin(ds["split"].values, WINDOWS[window][0])
-    dollar = _dollar_sales(ds["sales"].values, ds["sell_price"].values, train_mask)
+    dollar = dollar_sales(ds["sales"].values, ds["sell_price"].values, train_mask)
 
     frames = []
     for level_no, _, keys in _LEVELS:
