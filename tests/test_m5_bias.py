@@ -3,7 +3,8 @@
 The script asks whether a model's forecast tracks the arithmetic or the geometric mean of ``max(sales, 0.1)``
 (issue #113). These tests check its per-series means, the volume terciles and zero-share bins, the group
 ratios and the two tracking measures (``position`` and ``slope``) on series small enough to work out by hand,
-and that it fits the same random sample as ``m5_run.py``. None needs the raw M5 data.
+the share of series with a fitted sigma on a prior bound (issue #115), and that it fits the same random sample
+as ``m5_run.py``. None needs the raw M5 data.
 
 The script is a playground script, not part of the package, so it is loaded by path as
 ``tests/test_m5_run.py`` loads the runner.
@@ -219,6 +220,41 @@ class TestTrackingSlope:
         )
 
         assert m5_bias.tracking_slope(stats, "fit") == pytest.approx(1.0)
+
+
+class TestPriorBoundShares:
+    def test_shares_of_series_on_each_bound(self):
+        # Priors: sigma_h ~ U(0.1, 0.5), within 0.004 of a bound; sigma_q ~ U(0.01, 0.1), within 0.0009.
+        # Series 0 has sigma_h and the first drift on their lower bounds, series 1 no sigma on a bound, series 2
+        # sigma_h on its upper bound and series 3 sigma_h past it and the shared drift on its upper bound.
+        fitted = {
+            "sigma_h": np.array([0.1, 0.3, 0.497, 0.503]),
+            "sigma_q": np.array([[0.0105, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.0995, 0.0995]]),
+        }
+
+        shares = m5_bias.prior_bound_shares(fitted)
+
+        assert shares == pytest.approx(
+            {
+                "sigma_h_low": 0.25,
+                "sigma_h_high": 0.5,
+                "sigma_q_first_low": 0.25,
+                "sigma_q_first_high": 0.0,
+                "sigma_q_rest_low": 0.0,
+                "sigma_q_rest_high": 0.25,
+                "any": 0.75,
+            }
+        )
+
+    def test_bounds_are_the_fitters_priors(self):
+        from bunobee.models.m5 import m5_ssp_optim
+
+        assert m5_bias.SIGMA_H_BOUNDS == m5_ssp_optim.SIGMA_H_BOUNDS == (0.1, 0.5)
+        assert m5_bias.SIGMA_Q_BOUNDS == m5_ssp_optim.SIGMA_Q_BOUNDS == (0.01, 0.1)
+
+    def test_empty_without_the_ssp_sigmas(self):
+        assert m5_bias.prior_bound_shares({"sigma_h": np.array([0.3])}) == {}
+        assert m5_bias.prior_bound_shares({}) == {}
 
 
 def test_sample_matches_the_runner():

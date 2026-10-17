@@ -7,7 +7,8 @@ ones, fitted in independent runs of at most ``fit_chunk`` series. ``ssp_level_do
 column of ones, so its Monday forecast is the fitted level rather than the series mean. Each model's
 in-sample fit, drawn in ``forecasts.pdf`` (issue #105), is checked against the Kalman filter's own
 one-step-ahead prediction. An entry picks its target transform with its ``transform`` field (issue #114),
-so a transform the fitter has never seen is tried without editing it.
+so a transform the fitter has never seen is tried without editing it. The power-transform entries (issue #115)
+are ``ssp_dow`` and ``ssp_level_dow`` with a Box-Cox or Yeo-Johnson transform; no entry forecasts negative sales.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -63,7 +64,7 @@ def _load_script(name: str) -> ModuleType:
 
 m5_models = _load_script("m5_models")
 
-from bunobee.models.m5.transforms import LogTransform  # noqa: E402
+from bunobee.models.m5.transforms import LogTransform, PowerTransform  # noqa: E402
 from bunobee.models.ssp.kalman_1d import kalman_filter_1d  # noqa: E402
 from bunobee.regression import make_periodic_dummies  # noqa: E402
 
@@ -131,6 +132,20 @@ def centred_log1p_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
 
 
+@pytest.fixture(scope="module")
+def yeojohnson_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The registered ``ssp_dow_yeojohnson`` entry's forecasts and fitted arrays of every synthetic series."""
+    model = replace(m5_models.MODELS["ssp_dow_yeojohnson"], n_iter=20)
+    return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+
+
+@pytest.fixture(scope="module")
+def level_yeojohnson_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The registered ``ssp_level_dow_yeojohnson`` entry's forecasts and fitted arrays of every synthetic series."""
+    model = replace(m5_models.MODELS["ssp_level_dow_yeojohnson"], n_iter=20)
+    return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+
+
 def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transform=LogTransform()) -> list[tuple]:
     """Rerun each synthetic series' Kalman filter on its fit days with the series' fitted parameters.
 
@@ -179,6 +194,20 @@ class TestRegistry:
     def test_ssp_entries_keep_the_log_transform(self, name):
         assert m5_models.MODELS[name].transform == LogTransform()
 
+    @pytest.mark.parametrize(
+        ("name", "method", "shift", "floor"),
+        [
+            ("boxcox_shift", "box-cox", 0.5, 0.0),
+            ("boxcox_floor", "box-cox", 0.0, 0.1),
+            ("yeojohnson", "yeo-johnson", 0.0, 0.0),
+        ],
+    )
+    @pytest.mark.parametrize("base", ["ssp_dow", "ssp_level_dow"])
+    def test_power_entries_are_the_ssp_entries_with_a_power_transform(self, base, name, method, shift, floor):
+        model = m5_models.MODELS[f"{base}_{name}"]
+        assert model.transform == PowerTransform(method, shift=shift, floor=floor)
+        assert replace(model, transform=LogTransform()) == m5_models.MODELS[base]
+
     @pytest.mark.parametrize("name", list(m5_models.MODELS))
     def test_settings_are_json_serialisable(self, name):
         model = m5_models.MODELS[name]
@@ -200,6 +229,12 @@ class TestContract:
         if m5_models.INSAMPLE_KEY in fitted:
             assert fitted[m5_models.INSAMPLE_KEY].shape == (series_idx.size, N_FIT)
             assert np.isfinite(fitted[m5_models.INSAMPLE_KEY]).all()
+
+    @pytest.mark.parametrize("name", list(m5_models.MODELS))
+    def test_forecasts_are_never_negative(self, ds, name):
+        forecasts, fitted = m5_models.MODELS[name].fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        assert (forecasts >= 0).all()
+        assert (fitted.get(m5_models.INSAMPLE_KEY, 0.0) >= 0).all()
 
 
 class TestSspDow:
@@ -293,4 +328,26 @@ class TestTransform:
         _, fitted = centred_log1p_fit
         for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, level=False, transform=CentredLog1p())):
             expected = np.expm1(y - np.asarray(vt)[:, 0] + fitted["centre"][i] + 0.5 * np.asarray(Ft)[:, 0])
+            np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
+
+    def test_power_entry_returns_the_transforms_parameters(self, yeojohnson_fit):
+        _, fitted = yeojohnson_fit
+        assert {"lmbda", "loc", "scale", "sales_max"} <= fitted.keys() and "response_norm" not in fitted
+        for key in ("lmbda", "loc", "scale", "sales_max"):
+            assert fitted[key].shape == (N_SERIES,)
+
+    def test_power_entry_monday_forecast_is_the_transforms_inverse(self, ds, yeojohnson_fit):
+        # As for CentredLog1p: mu = 0 and var = sigma_h^2 on Mondays, mapped back by the power transform's inverse.
+        forecasts, fitted = yeojohnson_fit
+        monday = ds["day_of_week"].values[FORECAST_MASK] == 0
+        sigma_h = fitted["sigma_h"][:, None]
+        expected = PowerTransform("yeo-johnson").inverse(np.zeros_like(sigma_h), sigma_h**2, fitted)
+        np.testing.assert_allclose(forecasts[:, monday], np.broadcast_to(expected, (N_SERIES, monday.sum())), rtol=1e-6)
+
+    def test_power_entry_insample_fit_is_inverted_by_the_transform(self, ds, level_yeojohnson_fit):
+        _, fitted = level_yeojohnson_fit
+        transform = PowerTransform("yeo-johnson")
+        for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, level=True, transform=transform)):
+            series = {key: value[i] for key, value in fitted.items()}
+            expected = transform.inverse(y - np.asarray(vt)[:, 0], np.asarray(Ft)[:, 0], series)
             np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)

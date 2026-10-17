@@ -5,17 +5,26 @@ The MAP fitters and predictors of ``m5_ssp_optim`` used to hard-code the log tar
 default ``LogTransform``. These tests check that ``LogTransform`` is that target bit for bit, and that the
 default fit and forecast reproduce the pre-refactor implementation, kept verbatim below as the reference,
 exactly on a fixed set of series.
+
+``PowerTransform`` (issue #115) fits a Box-Cox or Yeo-Johnson λ per series with scikit-learn's
+``PowerTransformer``. These tests check its forward map against scikit-learn's, its λ bounds against a bounded
+maximum-likelihood fit, and its inverse against the mean of the censored sales computed by adaptive quadrature;
+and that its forecasts are never negative.
 """
 
 from __future__ import annotations
+
+import importlib.util
+from dataclasses import replace
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import jit, value_and_grad
 from numpyro import distributions as dist
+from scipy import integrate, optimize, special, stats
 
-from bunobee.models.m5.transforms import LogTransform
+from bunobee.models.m5.transforms import LogTransform, PowerTransform
 from bunobee.regression import make_periodic_dummies
 
 try:
@@ -28,6 +37,11 @@ except ModuleNotFoundError:  # the optional 'm5' extra (optax, tqdm) is not inst
 requires_m5_extra = pytest.mark.skipif(
     m5_ssp_optim is None,
     reason="needs the optional 'm5' extra: pip install 'bunobee[m5]'",
+)
+
+requires_sklearn = pytest.mark.skipif(
+    importlib.util.find_spec("sklearn") is None,
+    reason="needs scikit-learn, part of the optional 'm5' extra: pip install 'bunobee[m5]'",
 )
 
 # Fixed series: Poisson sales from intermittent to dense, so the 0.1 floor bites on most days of the first.
@@ -292,3 +306,179 @@ class TestReproducesLegacy:
                 m5_ssp_optim.predict_one_series_opt(result, Z_future=Z_future),
                 _legacy_predict_one_series_opt(legacy, Z_future),
             )
+
+
+# The registered power transforms (m5_models.py): zero-sales days 0.5, 0.1 and 1 unit above zero before the power.
+POWER_TRANSFORMS = {
+    "boxcox_shift": PowerTransform("box-cox", shift=0.5),
+    "boxcox_floor": PowerTransform("box-cox", floor=0.1),
+    "yeojohnson": PowerTransform("yeo-johnson"),
+}
+
+
+def _censored_mean(transform: PowerTransform, mu: float, var: float, params: dict) -> float:
+    """Mean of the sales a Gaussian forecast implies, by adaptive quadrature of the Gaussian density.
+
+    An independent reference for ``PowerTransform.inverse``, which integrates the survival function instead: here the
+    Gaussian ``z`` on the original power scale is mapped back by the inverse power, censored to the admissible
+    sales from 0 to ``sales_max``, and averaged under its density.
+    """
+    offset = 1.0 if transform.method == "yeo-johnson" else 0.0
+    lmbda, loc, scale = (float(params[key]) for key in ("lmbda", "loc", "scale"))
+    w_low = transform.floor + transform.shift + offset
+    w_high = max(float(params["sales_max"]), transform.floor) + transform.shift + offset
+    z_low, z_high = special.boxcox(w_low, lmbda), special.boxcox(w_high, lmbda)
+    centre, spread = loc + scale * mu, scale * np.sqrt(var)
+    a, b = (z_low - centre) / spread, (z_high - centre) / spread
+    inside = integrate.quad(
+        lambda t: special.inv_boxcox(centre + spread * t, lmbda) * stats.norm.pdf(t),
+        a,
+        b,
+        epsabs=1e-13,
+        epsrel=1e-12,
+        limit=500,
+    )[0]
+    mean = w_low * stats.norm.cdf(a) + inside + w_high * stats.norm.sf(b)
+    return mean - offset - transform.shift
+
+
+@requires_sklearn
+class TestPowerTransform:
+    """``PowerTransform`` is scikit-learn's power transform, with λ bounds and a mean-preserving inverse."""
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_forward_is_sklearns_standardized_power(self, sales, name):
+        from sklearn.preprocessing import PowerTransformer
+
+        transform = replace(POWER_TRANSFORMS[name], lmbda_bounds=None)
+        # PowerTransform fits in float64; scikit-learn fits in its input's dtype.
+        x = np.maximum(sales.astype(np.float64), transform.floor) + transform.shift
+        reference = PowerTransformer(method=transform.method, standardize=True).fit(x.T)
+        params = transform.fit(sales)
+        np.testing.assert_allclose(params["lmbda"], reference.lambdas_, rtol=1e-9)
+        np.testing.assert_allclose(transform.forward(sales, params), reference.transform(x.T).T, rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(params["sales_max"], sales.max(axis=1))
+
+    def test_unstandardized_forward_is_the_power(self, sales):
+        transform = PowerTransform("box-cox", floor=0.1, standardize=False)
+        params = transform.fit(sales)
+        np.testing.assert_array_equal(params["loc"], 0.0)
+        np.testing.assert_array_equal(params["scale"], 1.0)
+        expected = special.boxcox(np.maximum(sales, 0.1).astype(np.float64), params["lmbda"][:, None])
+        np.testing.assert_allclose(transform.forward(sales, params), expected, rtol=1e-6)
+
+    def test_yeo_johnson_is_box_cox_of_sales_plus_one(self, sales):
+        # On sales >= 0 Yeo-Johnson is the Box-Cox power of sales + 1, with the same maximum-likelihood λ.
+        yeo_johnson, box_cox = PowerTransform("yeo-johnson"), PowerTransform("box-cox", shift=1.0)
+        params_yj, params_bc = yeo_johnson.fit(sales), box_cox.fit(sales)
+        np.testing.assert_allclose(params_yj["lmbda"], params_bc["lmbda"], rtol=1e-5)
+        np.testing.assert_allclose(yeo_johnson.forward(sales, params_yj), box_cox.forward(sales, params_bc), atol=1e-4)
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_bounded_lmbda_is_the_bounded_maximum_likelihood(self, sales, name):
+        # The intermittent first series has its unbounded λ below -1, so the bound binds there.
+        transform = POWER_TRANSFORMS[name]
+        offset = 1.0 if transform.method == "yeo-johnson" else 0.0
+        unbounded = replace(transform, lmbda_bounds=None).fit(sales)["lmbda"]
+        bounded = transform.fit(sales)["lmbda"]
+        assert unbounded[0] < -1 and bounded[0] == -1.0
+        for series, lmbda in zip(sales, bounded):
+            w = np.maximum(series, transform.floor).astype(np.float64) + transform.shift + offset
+            best = optimize.minimize_scalar(
+                lambda lm: -stats.boxcox_llf(lm, w), bounds=transform.lmbda_bounds, method="bounded"
+            )
+            assert lmbda == pytest.approx(best.x, abs=1e-4)
+
+    def test_constant_series_keeps_lmbda_one(self, sales):
+        # scipy's Box-Cox raises on a constant series; it keeps λ = 1 and is forecast as its constant sales.
+        transform = POWER_TRANSFORMS["boxcox_shift"]
+        with_constant = np.vstack([sales, np.zeros((1, sales.shape[1]), dtype=np.float32)])
+        params = transform.fit(with_constant)
+        assert params["lmbda"][-1] == 1.0 and params["scale"][-1] == 1.0
+        np.testing.assert_array_equal(transform.forward(with_constant, params)[-1], 0.0)
+        forecast = transform.inverse(np.zeros((6, 3)), np.ones((6, 3)), params)
+        np.testing.assert_array_equal(forecast[-1], 0.0)
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_inverse_is_the_mean_of_the_censored_sales(self, sales, name):
+        transform = POWER_TRANSFORMS[name]
+        params = transform.fit(sales)
+        mu = np.array([-2.0, -0.5, 0.0, 0.7, 2.5])
+        var = np.array([0.02, 0.25, 1.0, 0.4, 3.0])
+        forecast = transform.inverse(np.tile(mu, (LEVELS.size, 1)), np.tile(var, (LEVELS.size, 1)), params)
+        for i in range(LEVELS.size):
+            series = {key: value[i] for key, value in params.items()}
+            expected = [_censored_mean(transform, m, v, series) for m, v in zip(mu, var)]
+            np.testing.assert_allclose(forecast[i], expected, rtol=1e-6, atol=1e-12, err_msg=f"series {i}")
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_inverse_of_a_certain_forecast_is_the_inverse_power(self, sales, name):
+        # With no variance the forecast is its median, so forward then inverse returns the floored sales.
+        transform = POWER_TRANSFORMS[name]
+        params = transform.fit(sales)
+        y = transform.forward(sales, params).astype(np.float64)
+        np.testing.assert_allclose(
+            transform.inverse(y, np.zeros_like(y), params), np.maximum(sales, transform.floor), rtol=1e-5, atol=1e-6
+        )
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_forecasts_stay_within_the_admissible_sales(self, sales, name):
+        # However far the Gaussian forecast reaches, the forecast is finite, never negative nor below the floor,
+        # and never above the largest fit-day sales.
+        transform = POWER_TRANSFORMS[name]
+        params = transform.fit(sales)
+        mu, var = np.meshgrid([-1e3, -20.0, -3.0, 0.0, 3.0, 20.0, 1e3], [0.0, 1e-8, 0.3, 30.0, 1e4])
+        for i in range(LEVELS.size):
+            series = {key: value[i] for key, value in params.items()}
+            forecast = transform.inverse(mu, var, series)
+            assert np.isfinite(forecast).all()
+            assert (forecast >= transform.floor).all()
+            assert (forecast <= max(series["sales_max"], transform.floor) * (1 + 1e-9)).all()
+
+    def test_single_series_matches_its_batch_row(self, sales):
+        transform = POWER_TRANSFORMS["yeojohnson"]
+        batch, single = transform.fit(sales), transform.fit(sales[2])
+        for key, value in single.items():
+            assert np.shape(value) == ()
+            assert float(value) == pytest.approx(batch[key][2], rel=1e-9)
+        np.testing.assert_allclose(transform.forward(sales[2], single), transform.forward(sales, batch)[2], rtol=1e-6)
+        mu, var = np.linspace(-1, 1, HORIZON), np.full(HORIZON, 0.3)
+        np.testing.assert_allclose(
+            transform.inverse(mu, var, single),
+            transform.inverse(np.tile(mu, (LEVELS.size, 1)), np.tile(var, (LEVELS.size, 1)), batch)[2],
+            rtol=1e-9,
+        )
+
+    def test_inverse_keeps_float32(self, sales):
+        transform = POWER_TRANSFORMS["boxcox_floor"]
+        params = transform.fit(sales)
+        mu = np.zeros((LEVELS.size, HORIZON), dtype=np.float32)
+        assert transform.inverse(mu, np.ones_like(mu), params).dtype == np.float32
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"method": "log"}, {"method": "box-cox"}, {"method": "box-cox", "shift": -0.5, "floor": 1.0}],
+        ids=["unknown method", "box-cox of zero", "negative shift"],
+    )
+    def test_invalid_settings_raise(self, kwargs):
+        with pytest.raises(ValueError):
+            PowerTransform(**kwargs)
+
+
+@requires_m5_extra
+@requires_sklearn
+class TestPowerTransformFit:
+    """The MAP fitters fit a power transform as any other: they return its parameters and invert its forecasts."""
+
+    @pytest.mark.parametrize("name", list(POWER_TRANSFORMS))
+    def test_batch_fit_returns_its_parameters_and_nonnegative_forecasts(self, sales, name):
+        transform = POWER_TRANSFORMS[name]
+        Z, Z_future = _designs(intercept=False)
+        result = m5_ssp_optim.fit_batch_series_opt(sales[:, :N_FIT], n_iter=30, Z=Z, transform=transform)
+        assert result["transform"] == transform
+        expected = transform.fit(sales[:, :N_FIT])
+        for key, value in expected.items():
+            np.testing.assert_array_equal(result[key], value, err_msg=key)
+        forecasts = m5_ssp_optim.predict_batch_series_opt(result, Z_future=Z_future)
+        assert forecasts.shape == (LEVELS.size, HORIZON)
+        assert np.isfinite(forecasts).all() and (forecasts >= 0).all()

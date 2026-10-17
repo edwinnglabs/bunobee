@@ -36,8 +36,12 @@ forecast starts from, so on that window both columns sit near 1 whatever the for
 Volume terciles split the series into thirds by their mean sales over the fit days. Zero-share bins group
 them by the share of zero days from their first sale on, so days before an item was stocked do not count.
 
-The per-series statistics and the group tables are written to ``series.csv`` and ``groups.csv`` in
-``<--output-dir>/bias_<timestamp>/``. The evaluation window is never fitted or read.
+For a model that returns the SSP noise and drifts, it also logs the share of series with each of them on a
+bound of its uniform prior, and with any of them on one (see :func:`prior_bound_shares`): the bias correction
+of the back-transform grows with ``sigma_h``, so a ``sigma_h`` held at its upper bound caps it.
+
+The per-series statistics, the group tables and the bound shares are written to ``series.csv``, ``groups.csv``
+and ``bounds.csv`` in ``<--output-dir>/bias_<timestamp>/``. The evaluation window is never fitted or read.
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from bunobee.models.m5.m5_ssp_optim import SIGMA_H_BOUNDS, SIGMA_Q_BOUNDS
 
 from m5_common import DATA_DIR, load_m5_ds
 from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
@@ -73,6 +79,10 @@ ZERO_SHARE_EDGES = (0.25, 0.5, 0.75, 1.0)
 #: Groupings of :func:`group_table`, in output order: name -> ``series.csv`` column of each series' group,
 #: or None for one group of all series.
 GROUPINGS: dict[str, str | None] = {"total": None, "dept": "dept_id", "volume": "volume", "zero_share": "zero_bin"}
+
+#: Share of a prior's width within which a fitted sigma counts as on a bound of the prior. The fitters keep the
+#: parameters one Adam step past the best loss, so a sigma its bound holds can sit just past the bound.
+BOUND_TOL = 0.01
 
 
 def _parse_args() -> argparse.Namespace:
@@ -335,6 +345,68 @@ def log_group_table(table: pd.DataFrame, model: str, window: str, window_days: s
         )
 
 
+def prior_bound_shares(fitted: dict[str, np.ndarray], tol: float = BOUND_TOL) -> dict[str, float]:
+    """Share of series with each fitted sigma on a bound of its uniform prior, and with any of them on one.
+
+    Parameters
+    ----------
+    fitted : dict of str to np.ndarray
+        A model's ``fitted`` output. The SSP entries return ``sigma_h``, the noise, of shape ``(n_series,)`` and
+        ``sigma_q``, the drifts, of shape ``(n_series, n_states)``: the first state's drift, then the drift the
+        other states share.
+    tol : float
+        Share of a prior's width within which a sigma counts as on a bound, by default :data:`BOUND_TOL`. A
+        sigma past a bound counts as on it.
+
+    Returns
+    -------
+    dict of str to float
+        For ``sigma_h``, ``sigma_q_first`` (the first state's drift) and ``sigma_q_rest`` (the shared drift),
+        the share of series with it on the lower and on the upper bound of its prior, under the keys
+        ``<sigma>_low`` and ``<sigma>_high``. Last, ``any``: the share of series with any of them on a bound.
+        Empty if ``fitted`` has no ``sigma_h`` or no ``sigma_q``.
+    """
+    if "sigma_h" not in fitted or "sigma_q" not in fitted:
+        return {}
+    sigma_q = np.asarray(fitted["sigma_q"])
+    sigmas = {
+        "sigma_h": (np.asarray(fitted["sigma_h"]), SIGMA_H_BOUNDS),
+        "sigma_q_first": (sigma_q[:, 0], SIGMA_Q_BOUNDS),
+        "sigma_q_rest": (sigma_q[:, 1], SIGMA_Q_BOUNDS),
+    }
+    shares: dict[str, float] = {}
+    on_any = np.zeros(sigma_q.shape[0], dtype=bool)
+    for name, (values, (low, high)) in sigmas.items():
+        margin = tol * (high - low)
+        on_low, on_high = values <= low + margin, values >= high - margin
+        shares[f"{name}_low"], shares[f"{name}_high"] = float(on_low.mean()), float(on_high.mean())
+        on_any |= on_low | on_high
+    shares["any"] = float(on_any.mean())
+    return shares
+
+
+def log_bound_shares(shares: dict[str, float], model: str) -> None:
+    """Log one model's :func:`prior_bound_shares`.
+
+    Parameters
+    ----------
+    shares : dict of str to float
+        Output of :func:`prior_bound_shares`.
+    model : str
+        Registered model name.
+    """
+    sigmas = dict.fromkeys(key.rsplit("_", 1)[0] for key in shares if key != "any")
+    logger.info(
+        "%s: series with a sigma on a prior bound: %.1f%%  (%s)",
+        model,
+        100 * shares["any"],
+        ", ".join(
+            f"{sigma} {100 * shares[f'{sigma}_low']:.1f}% low / {100 * shares[f'{sigma}_high']:.1f}% high"
+            for sigma in sigmas
+        ),
+    )
+
+
 def log_model_comparison(groups: pd.DataFrame, window: str) -> None:
     """Log each group's bias, position and slope per model, and the change of its bias from the first model.
 
@@ -405,13 +477,18 @@ def main() -> None:
     coords = pd.DataFrame({key: ds[key].values[fit_idx] for key in ("series_id", "dept_id", "store_id")})
     windows = window_names(args.recent_days)
     window_days = {windows[0]: f"all {fit_mask.sum()} fit days", windows[1]: f"the last {args.recent_days} fit days"}
-    series_tables, group_tables = [], []
+    series_tables, group_tables, bound_rows = [], [], []
     for model in models:
         t0 = time.time()
         forecasts, fitted = MODELS[model].fit_forecast(ds, fit_idx, fit_mask, forecast_mask)
         logger.info("Fitted %s on %d series in %.1fs", model, fit_idx.size, time.time() - t0)
         fitted.pop(INSAMPLE_KEY, None)
-        # Per-series scalars the model returns (for ssp_dow: sigma_h, response_norm, final_loss), for follow-up.
+        bounds = prior_bound_shares(fitted)
+        if bounds:
+            log_bound_shares(bounds, model)
+            bound_rows.append({"model": model, **bounds})
+        # Per-series scalars the model returns (for ssp_dow: sigma_h, response_norm, final_loss; a power
+        # transform's lmbda, loc, scale and sales_max in place of response_norm), for follow-up.
         scalars = {key: np.asarray(value) for key, value in fitted.items() if np.ndim(value) == 1}
         stats = assign_groups(pd.concat([coords, series_stats(sales_fit, actual, forecasts, args.recent_days)], axis=1))
         series_tables.append(stats.assign(model=model, **scalars))
@@ -431,7 +508,11 @@ def main() -> None:
     series = series[["model", *series.columns.drop("model")]]
     series.to_csv(out_dir / "series.csv", index=False)
     groups.to_csv(out_dir / "groups.csv", index=False)
-    logger.info("Wrote series.csv and groups.csv to %s  (total %.1fs)", out_dir, time.time() - t_start)
+    written = ["series.csv", "groups.csv"]
+    if bound_rows:
+        pd.DataFrame(bound_rows).to_csv(out_dir / "bounds.csv", index=False)
+        written.append("bounds.csv")
+    logger.info("Wrote %s to %s  (total %.1fs)", ", ".join(written), out_dir, time.time() - t_start)
 
 
 if __name__ == "__main__":

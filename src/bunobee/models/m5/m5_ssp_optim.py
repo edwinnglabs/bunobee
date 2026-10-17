@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 #: Batched Kalman filter over independent series, built from the single-series filter.
 kalman_filter_1d_batch = make_kalman_batch(kalman_filter_1d)
 
+#: Bounds of the uniform priors of the MAP fitters: ``sigma_h``, the observation noise, and ``sigma_q``, the
+#: drifts of the states. They were set for the log target, whose noise is on the scale of log sales.
+SIGMA_H_BOUNDS = (0.1, 0.5)
+SIGMA_Q_BOUNDS = (0.01, 0.1)
+
 
 def _softplus(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.log1p(jnp.exp(x))
@@ -127,9 +132,9 @@ def fit_one_series_opt(
         )
 
         log_prior = (
-            dist.Uniform(0.1, 0.5).log_prob(sigma_h)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
+            dist.Uniform(*SIGMA_H_BOUNDS).log_prob(sigma_h)
+            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_level)
+            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_seas)
         )
         return -(lp + log_prior)
 
@@ -358,9 +363,9 @@ def fit_batch_series_opt(
         )
 
         log_prior = (
-            dist.Uniform(0.1, 0.5).log_prob(sigma_h)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_level)
-            + dist.Uniform(0.01, 0.1).log_prob(sigma_q_seas)
+            dist.Uniform(*SIGMA_H_BOUNDS).log_prob(sigma_h)
+            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_level)
+            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_seas)
         )  # (B,)
 
         per_series = -(log_p + log_prior)  # (B,)

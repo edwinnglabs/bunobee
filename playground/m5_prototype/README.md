@@ -12,7 +12,7 @@ the model, and what is still open.
 
 ## Prerequisites
 
-1. The `m5` extra: `pip install -e ".[m5]"` (adds `optax`, `tqdm`).
+1. The `m5` extra: `pip install -e ".[m5]"` (adds `optax`, `tqdm`, `scikit-learn`).
 2. The Kaggle CLI: `pip install kaggle`. It must be on `PATH` (with a venv, activate it or prefix
    `PATH="$PWD/.venv/bin:$PATH"`).
 3. Kaggle credentials: `kaggle auth login`, or a token from <https://www.kaggle.com/settings/api> saved
@@ -61,7 +61,8 @@ kaggle competitions submissions -c m5-forecasting-accuracy | head -3
 
 # 9. Optional: diagnose the level bias. Fits each model on the quick-loop sample at the validation origin
 #    and compares its forecasts with the arithmetic and geometric means of the sales, per department, volume
-#    tercile and zero-share bin. About 20 s per model; writes output/bias_<timestamp>/.
+#    tercile and zero-share bin, and logs the share of series with a sigma on a prior bound. About 20 s per
+#    model (30 s with a power transform); writes output/bias_<timestamp>/.
 python m5_bias.py --model ssp_dow ssp_level_dow
 ```
 
@@ -111,6 +112,9 @@ model, add an entry; `m5_run.py` needs no change.
 |---|---|---|
 | `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The default, and the model of the #93 and #94 Kaggle submissions | `level=False`, `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
 | `ssp_level_dow` | `ssp_dow` with a level state: a column of ones leads the weekday dummies, so 7 states (#106) | `level=True`, otherwise as `ssp_dow` |
+| `ssp_dow_boxcox_shift`, `ssp_level_dow_boxcox_shift` | `ssp_dow`, `ssp_level_dow` fitted to a Box-Cox power of `sales + 0.5`, λ fitted per series (#115) | `transform=PowerTransform("box-cox", shift=0.5)` |
+| `ssp_dow_boxcox_floor`, `ssp_level_dow_boxcox_floor` | The same with Box-Cox of `max(sales, 0.1)` | `transform=PowerTransform("box-cox", floor=0.1)` |
+| `ssp_dow_yeojohnson`, `ssp_level_dow_yeojohnson` | The same with Yeo-Johnson of `sales`, which on sales is Box-Cox of `sales + 1` | `transform=PowerTransform("yeo-johnson")` |
 
 ## Reference results
 

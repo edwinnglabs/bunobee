@@ -8,7 +8,8 @@ To add a model, write a frozen dataclass with a ``fit_forecast`` method (see :cl
 an instance of it in :data:`MODELS`. Its fields are its settings: ``m5_run.py`` records them in
 ``run_stats.json``, so two entries of one class with different settings are two models. An SSP entry picks
 its target transform (a ``bunobee.models.m5.transforms.Transform``) with its ``transform`` field, so trying a
-transform needs only a new entry, not an edit of the fitter.
+transform needs only a new entry, not an edit of the fitter: the ``*_boxcox_*`` and ``*_yeojohnson`` entries are
+``ssp_dow`` and ``ssp_level_dow`` with a power transform fitted per series (issue #115).
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import numpy as np
 import xarray as xr
 
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
-from bunobee.models.m5.transforms import LogTransform, Transform
+from bunobee.models.m5.transforms import LogTransform, PowerTransform, Transform
 from bunobee.regression import make_periodic_dummies
 
 logger = logging.getLogger(__name__)
@@ -205,10 +206,18 @@ class SspDow:
         return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
 
 
-#: Registered models by name, the choices of ``m5_run.py --model``.
+#: Registered models by name, the choices of ``m5_run.py --model``. The power-transform entries fit Box-Cox of
+#: ``sales + 0.5`` (``boxcox_shift``), Box-Cox of ``max(sales, 0.1)`` (``boxcox_floor``) and Yeo-Johnson, which on
+#: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state.
 MODELS: dict[str, Model] = {
     "ssp_dow": SspDow(),
     "ssp_level_dow": SspDow(level=True),
+    "ssp_dow_boxcox_shift": SspDow(transform=PowerTransform("box-cox", shift=0.5)),
+    "ssp_dow_boxcox_floor": SspDow(transform=PowerTransform("box-cox", floor=0.1)),
+    "ssp_dow_yeojohnson": SspDow(transform=PowerTransform("yeo-johnson")),
+    "ssp_level_dow_boxcox_shift": SspDow(level=True, transform=PowerTransform("box-cox", shift=0.5)),
+    "ssp_level_dow_boxcox_floor": SspDow(level=True, transform=PowerTransform("box-cox", floor=0.1)),
+    "ssp_level_dow_yeojohnson": SspDow(level=True, transform=PowerTransform("yeo-johnson")),
 }
 
 #: The baseline entry, ``m5_run.py``'s default ``--model``.
