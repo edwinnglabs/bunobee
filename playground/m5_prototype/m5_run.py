@@ -49,8 +49,9 @@ import numpy as np
 import pandas as pd
 
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+from bunobee.regression import make_periodic_dummies
 
-from m5_common import DATA_DIR, dow_dummies, load_m5_ds
+from m5_common import DATA_DIR, load_m5_ds
 from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, log_per_level
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -312,8 +313,12 @@ def main() -> None:
     fit_seconds_by_window: dict[str, float] = {}
     for window, (fit_splits, forecast_split, days) in WINDOWS.items():
         fit_mask = np.isin(split, fit_splits)
-        Z = jnp.asarray(dow_dummies(dow[fit_mask]))  # (n_fit_steps, 6)
-        Z_future = jnp.asarray(dow_dummies(dow[split == forecast_split]))  # (horizon, 6)
+        n_fit_steps = int(fit_mask.sum())
+        # The forecast days follow the fit days, so one matrix covers both. Phasing step 0 at the first fit day's
+        # weekday (Mon=0) makes each column a weekday from Tuesday to Sunday, with Monday dropped.
+        weekly = make_periodic_dummies(n_fit_steps + HORIZON, period=7, phase=int(dow[fit_mask][0]))
+        Z = jnp.asarray(weekly[:n_fit_steps])  # (n_fit_steps, 6)
+        Z_future = jnp.asarray(weekly[n_fit_steps:])  # (horizon, 6)
         logger.info(
             "Origin %s: fit on %d days, forecast %s  (n_iter=%d  lr=%g  chunk_size=%s  fit_chunk=%s)",
             window,

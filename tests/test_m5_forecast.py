@@ -19,6 +19,7 @@ import pytest
 
 from bunobee.models.m5 import m5_ssp_mcmc
 from bunobee.models.m5.m5_ssp_mcmc import predict_one_series
+from bunobee.regression import make_periodic_dummies
 
 try:
     from bunobee.models.m5 import m5_ssp_optim
@@ -43,10 +44,7 @@ def _make_fit_result(seed: int = 0) -> dict:
     """Build a synthetic ``fit_one_series`` result with the sites the predictor reads."""
     rng = np.random.default_rng(seed)
     n_steps_total = N_STEPS
-    weekly = np.zeros((n_steps_total, N_STATES - 1))
-    weekly[np.arange(n_steps_total), np.arange(n_steps_total) % 7 - 1] = 1.0
-    weekly[np.arange(n_steps_total) % 7 == 0] = 0.0
-    Z = np.concatenate([np.ones((n_steps_total, 1)), weekly], axis=1)
+    Z = np.asarray(make_periodic_dummies(n_steps_total, period=7, intercept=True), dtype=float)
 
     # A concentrated posterior: draws scatter around a common state path, as NUTS output does.
     a_center = rng.normal(0.0, 0.3, size=(n_steps_total, N_STATES))
@@ -62,18 +60,9 @@ def _make_fit_result(seed: int = 0) -> dict:
     }
 
 
-def _make_z_future(seed: int = 1) -> np.ndarray:
+def _make_z_future() -> np.ndarray:
     """A ``(horizon, n_states)`` future design matrix — intercept plus weekly dummies."""
-    rng = np.random.default_rng(seed)
-    Z_future = np.zeros((HORIZON, N_STATES))
-    Z_future[:, 0] = 1.0
-    for h in range(HORIZON):
-        col = (h % 7) - 1
-        if col >= 0:
-            Z_future[h, 1 + col] = 1.0
-    # keep an unused rng draw so the helper is stable if the layout changes
-    _ = rng.random()
-    return Z_future
+    return np.asarray(make_periodic_dummies(HORIZON, period=7, intercept=True), dtype=float)
 
 
 def _legacy_predict_one_series(fit_result: dict, Z_future: np.ndarray) -> np.ndarray:

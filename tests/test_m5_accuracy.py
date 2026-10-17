@@ -60,7 +60,7 @@ import xarray as xr
 
 from bunobee.datasets import M5_AGGREGATE_PATH, load_m5_aggregate
 from bunobee.models.ssp import build_forecast_design, forecast_ssp, transform_to_ekf_st
-from bunobee.regression import RegressionScheme, make_peridoic_dummies
+from bunobee.regression import RegressionScheme, make_periodic_dummies
 
 logger = logging.getLogger(__name__)
 
@@ -376,10 +376,8 @@ def _build_design(n_all: int) -> np.ndarray:
         Design matrix. The weekly block is positional, which is why the fixture's contiguous daily
         grid is asserted in :class:`TestFixtureProvenance`.
     """
-    dummies = np.asarray(make_peridoic_dummies(n_all, period=PERIOD, drop_first=True), dtype=float)
-    intercept = np.ones((n_all, N_SERIES, 1))
-    dummies_b = np.broadcast_to(dummies[:, None, :], (n_all, N_SERIES, N_DUMMIES))
-    return np.concatenate([intercept, dummies_b], axis=-1)
+    design = np.asarray(make_periodic_dummies(n_all, period=PERIOD, drop_first=True, intercept=True), dtype=float)
+    return np.broadcast_to(design[:, None, :], (n_all, N_SERIES, N_STATES)).copy()
 
 
 def _ekf_prior() -> xr.Dataset:
@@ -989,7 +987,7 @@ def _dlt_weekday_covariates(n_all: int) -> pd.DataFrame:
         Columns :data:`DLT_WEEKDAY_COLS`, one 0/1 dummy per weekday with the reference day dropped.
         Positional, so ``iloc[N_STEPS:]`` gives the correctly phased future dummies.
     """
-    dummies = np.asarray(make_peridoic_dummies(n_all, period=PERIOD, drop_first=True), dtype=float)
+    dummies = np.asarray(make_periodic_dummies(n_all, period=PERIOD, drop_first=True), dtype=float)
     return pd.DataFrame(dummies, columns=DLT_WEEKDAY_COLS)
 
 

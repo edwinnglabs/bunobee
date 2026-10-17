@@ -18,7 +18,7 @@ from numpyro.infer import MCMC, NUTS
 
 from bunobee.models.ssp.forecast import build_forecast_design, forecast_ssp
 from bunobee.models.ssp.kalman_1d import kalman_filter_1d
-from bunobee.regression import make_peridoic_dummies
+from bunobee.regression import make_periodic_dummies
 
 #: Default forecast horizon for the M5 competition (28 days).
 HORIZON = 28
@@ -64,8 +64,7 @@ def fit_one_series(
     n_steps = len(y)
 
     if Z is None:
-        weekly_dummies = make_peridoic_dummies(n_steps, period=7, drop_first=True)
-        Z = jnp.concatenate([jnp.ones((n_steps, 1)), weekly_dummies], axis=1)
+        Z = jnp.asarray(make_periodic_dummies(n_steps, period=7, drop_first=True, intercept=True))
     n_states = Z.shape[1]
 
     a0 = jnp.zeros(n_states)

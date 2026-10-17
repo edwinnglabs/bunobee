@@ -1,3 +1,4 @@
+import warnings
 from copy import deepcopy
 import pandas as pd
 import numpy as np
@@ -197,16 +198,19 @@ def make_fourier_series(
     return np.concatenate([sins, coss], axis=1)
 
 
-def make_peridoic_dummies(
+def make_periodic_dummies(
     n_steps: int,
     period: int,
     drop_first: bool = True,
+    phase: int = 0,
+    intercept: bool = False,
 ) -> np.ndarray:
-    """Build periodic dummy design matrix of shape (n_steps, period - int(drop_first)).
+    """Build a periodic dummy design matrix, optionally led by an intercept column.
 
-    Tiles an identity matrix of size (period, period) to cover n_steps, encoding
-    cyclic effects (e.g. day-of-week). The phase is anchored to step 0 = day 0 of
-    the cycle, so slicing [n_train:] on a longer array gives the correct future dummies.
+    Encodes cyclic effects (e.g. day-of-week): step ``t`` sits at cycle position
+    ``(phase + t) % period`` and gets a one in that position's column. The phase is
+    anchored to step 0, so slicing ``[n_train:]`` on a longer array gives the correctly
+    phased future dummies.
 
     Parameters
     ----------
@@ -215,18 +219,57 @@ def make_peridoic_dummies(
     period : int
         Cycle length (e.g. 7 for weekly dummies).
     drop_first : bool
-        If True, drop the first dummy column to avoid perfect multicollinearity
+        If True, drop the column of cycle position 0 to avoid perfect multicollinearity
         with an intercept term. Default True.
+    phase : int
+        Cycle position of step 0. E.g. with daily data, ``period=7`` and ``phase`` set to
+        the first day's weekday (Monday = 0), the columns are weekdays and Monday is the
+        dropped reference. Taken modulo ``period``. Default 0.
+    intercept : bool
+        If True, prepend a column of ones. Default False.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 design matrix of shape ``(n_steps, int(intercept) + period - int(drop_first))``.
+    """
+    positions = (np.arange(n_steps) + phase) % period
+    dummies = np.eye(period, dtype=np.float32)[positions]
+    if drop_first:
+        dummies = dummies[:, 1:]
+    if intercept:
+        dummies = np.concatenate([np.ones((n_steps, 1), dtype=np.float32), dummies], axis=1)
+    return dummies
+
+
+def make_peridoic_dummies(
+    n_steps: int,
+    period: int,
+    drop_first: bool = True,
+) -> np.ndarray:
+    """Build a periodic dummy design matrix of shape (n_steps, period - int(drop_first)).
+
+    .. deprecated::
+        Misspelled alias of :func:`make_periodic_dummies`, kept for backward
+        compatibility. Use :func:`make_periodic_dummies` instead.
+
+    Parameters
+    ----------
+    n_steps : int
+        Number of time steps.
+    period : int
+        Cycle length (e.g. 7 for weekly dummies).
+    drop_first : bool
+        If True, drop the first dummy column. Default True.
 
     Returns
     -------
     np.ndarray
         Float32 design matrix of shape (n_steps, period - int(drop_first)).
     """
-    import math
-
-    n_repeats = math.ceil(n_steps / period)
-    dummies = np.tile(np.eye(period, dtype=np.float32), (n_repeats, 1))[:n_steps]
-    if drop_first:
-        dummies = dummies[:, 1:]
-    return dummies
+    warnings.warn(
+        "make_peridoic_dummies is deprecated; use make_periodic_dummies instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return make_periodic_dummies(n_steps, period, drop_first=drop_first)

@@ -37,7 +37,7 @@ import pytest
 import xarray as xr
 
 from bunobee.models.ssp import build_forecast_design, forecast_ssp, transform_to_ekf_st
-from bunobee.regression import make_peridoic_dummies
+from bunobee.regression import make_periodic_dummies
 
 SPARSE_PANEL = Path(__file__).resolve().parent / "fixtures" / "sparse_panel.csv"
 SPARSE_SOURCE = Path(__file__).resolve().parents[1] / "playground" / "resource" / "sparse" / "sparse_df.csv"
@@ -98,10 +98,9 @@ def _to_panels(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 def _build_design(media: np.ndarray) -> np.ndarray:
     """Assemble ``[intercept | weekly dummies | media]`` over the full date range."""
     n_all = media.shape[0]
-    dummies = np.asarray(make_peridoic_dummies(n_all, period=PERIOD, drop_first=True), dtype=float)
-    intercept = np.ones((n_all, N_SERIES, 1))
-    dummies_b = np.broadcast_to(dummies[:, None, :], (n_all, N_SERIES, N_DUMMIES))
-    return np.concatenate([intercept, dummies_b, media], axis=-1)
+    weekly = np.asarray(make_periodic_dummies(n_all, period=PERIOD, drop_first=True, intercept=True), dtype=float)
+    weekly_b = np.broadcast_to(weekly[:, None, :], (n_all, N_SERIES, 1 + N_DUMMIES))
+    return np.concatenate([weekly_b, media], axis=-1)
 
 
 def _ekf_prior(sigma_q_scale: np.ndarray, positivity: np.ndarray) -> xr.Dataset:
