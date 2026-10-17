@@ -22,9 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `LogTransform`, the previously hard-coded `log(max(sales, 0.1) / mean)` target. `fit_one_series_opt`
   and `fit_batch_series_opt` take a `transform` argument (default `LogTransform()`) and return its
   parameters and the transform; the MAP predictors invert the fit's transform. Forecasts are unchanged.
+- `PowerTransform` in `bunobee.models.m5.transforms` — a Box-Cox or Yeo-Johnson target with λ fitted per
+  series by scikit-learn's `PowerTransformer` on `max(sales, floor) + shift`, bounded to [−1, 2] by default,
+  and standardised. Its inverse is the mean of the sales a Gaussian forecast implies, censored to the series'
+  range from 0 to its largest fit-day sales, so forecasts are never negative.
+- `SIGMA_H_BOUNDS` and `SIGMA_Q_BOUNDS` in `bunobee.models.m5.m5_ssp_optim` — the bounds of the uniform
+  priors on the noise and the drifts of the MAP fitters, which use them. Their values are unchanged.
 
 ### Changed
 
+- The `m5` extra installs `scikit-learn`, which `PowerTransform` fits with. It used to arrive only through
+  `scikit-optimize`.
 - `hyper_tuning_dlt_with_wbic` takes `y` plus optional `regression_scheme`, `covariates_df` and
   `mcmc_run_args` instead of a `data` dict, so models with regressors can be tuned. It returns a dict of
   the tuned `lev_sm`, `slp_sm` and `theta`, with the raw `skopt` result under `result`, and logs through

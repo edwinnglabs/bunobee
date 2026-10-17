@@ -35,6 +35,7 @@ tune = [
 m5 = [
     "optax",
     "tqdm",
+    "scikit-learn",
 ]
 notebook = [
     "ipywidgets",

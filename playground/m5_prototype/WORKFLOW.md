@@ -19,7 +19,7 @@ prerequisites, every command and the reference results, see [README.md](README.m
 | `m5_check_weights.py` | Nothing; prints a comparison | You change how the scorer computes weights |
 | `m5_run.py` | `output/<timestamp>/` and a row of `output/runs.csv` | Every experiment |
 | `m5_compare.py` | Nothing; prints the deltas | You want to compare a run with a baseline run on the same series |
-| `m5_bias.py` | `output/bias_<timestamp>/` | You change the transform or the back-transform and want to see which mean of the sales the forecast tracks |
+| `m5_bias.py` | `output/bias_<timestamp>/` | You change the transform or the back-transform and want to see which mean of the sales the forecast tracks, or how many fitted sigmas sit on a prior bound |
 | `m5_score_submission.py` | Nothing; prints the score | You want to re-score a saved `submission.csv`, e.g. after changing the scorer |
 | `kaggle competitions submit` | A late submission on Kaggle | You want the official score |
 
@@ -174,6 +174,107 @@ over the fit days.
 So the log transform is the main cause of the low totals and the missing level a minor one; the transform
 work (#114, #115) and the `sigma_h` cap (#116) are where the bias can be closed.
 
+### Power transforms (#115)
+
+`PowerTransform` (`transforms.py`) fits each series to a Box-Cox or Yeo-Johnson power of its sales, with λ
+fitted per series on the fit days by scikit-learn's `PowerTransformer` and the powered sales standardised, as
+`PowerTransformer` does by default. Three variants are registered, each on `ssp_dow` and on `ssp_level_dow`
+(`ssp_dow_yeojohnson`, `ssp_level_dow_yeojohnson`, ...):
+
+| Suffix | Transform | A zero-sales day before the power |
+|---|---|---|
+| `boxcox_shift` | Box-Cox of `sales + 0.5` | 0.5 |
+| `boxcox_floor` | Box-Cox of `max(sales, 0.1)`, the floor of the log target | 0.1 |
+| `yeojohnson` | Yeo-Johnson of `sales`. On sales ≥ 0 it is Box-Cox of `sales + 1`, with the same λ | 1 |
+
+The M5 sales forced two choices:
+
+- **λ is bounded to [−1, 2]**, the range of R's `forecast::BoxCox.lambda`. The zero days make the unbounded
+  maximum-likelihood λ of most series strongly negative: median −1.2 for the floor and −3.3 for Yeo-Johnson,
+  down to −134. Such a power maps every day with sales to almost one value, and its inverse returns NaN.
+  Bounded, λ sits on −1 for 54% (floor), 67% (shift) and 75% (Yeo-Johnson) of the 3,000 series.
+- **The inverse is the mean of the censored sales.** The inverse power of the forecast mean is a median. With
+  λ < 0 the power is bounded above, so a Gaussian forecast puts mass on infinite sales. The inverse censors
+  each day's sales to the series' range, 0 to its largest fit-day sales, and takes their mean by quadrature,
+  within 2e-5 of adaptive quadrature on the forecasts of 600 sample series (Gauss-Hermite nodes were up to
+  35% off).
+  Forecasts are never negative.
+
+Results on the 3,000-series sample (seed 2026) at the validation origin, against `ssp_dow`; a negative delta
+is better. Bias is the forecast total over the actual total, minus one. Position and slope are `m5_bias.py`'s
+over the last 28 fit days (#113): 0 if the forecast follows the geometric mean of `max(sales, 0.1)`, 1 if it
+follows the arithmetic mean.
+
+| Entry | WRMSSE | Delta | Bias | Position | Slope | Fit |
+|---|---|---|---|---|---|---|
+| `ssp_dow` | 0.93487 | | −9.6% | 0.71 | 0.24 | 17 s |
+| `ssp_dow_boxcox_shift` | 1.19569 | +0.26081 | −5.8% | 0.80 | 0.90 | 31 s |
+| `ssp_dow_boxcox_floor` | 1.27161 | +0.33674 | +1.0% | 0.96 | 0.35 | 32 s |
+| `ssp_dow_yeojohnson` | 1.12406 | +0.18919 | −6.8% | 0.78 | 0.78 | 26 s |
+| `ssp_level_dow` | 0.94145 | +0.00657 | −7.6% | 0.76 | 0.25 | 20 s |
+| `ssp_level_dow_boxcox_shift` | 0.89975 | −0.03512 | +2.3% | 0.99 | 1.00 | 35 s |
+| `ssp_level_dow_boxcox_floor` | 1.09899 | +0.16412 | +11.4% | 1.18 | 0.48 | 35 s |
+| `ssp_level_dow_yeojohnson` | **0.83171** | **−0.10316** | −0.4% | 0.93 | 0.85 | 29 s |
+
+Per level (`m5_compare.py`):
+
+| Level | `ssp_dow` | `_boxcox_shift` | `_boxcox_floor` | `_yeojohnson` | `ssp_level_dow` | `_boxcox_shift` | `_boxcox_floor` | `_yeojohnson` |
+|---|---|---|---|---|---|---|---|---|
+| 1 Total | 0.8926 | 1.3043 | 1.4416 | 1.2066 | 0.8946 | 0.7672 | 1.1732 | 0.6690 |
+| 2 State | 0.9021 | 1.2254 | 1.3399 | 1.1438 | 0.8910 | 0.7845 | 1.1135 | 0.7066 |
+| 3 Store | 0.9468 | 1.2366 | 1.3178 | 1.1640 | 0.9572 | 0.9083 | 1.1139 | 0.8413 |
+| 4 Category | 0.8945 | 1.2963 | 1.3825 | 1.1960 | 0.8879 | 0.7797 | 1.1158 | 0.6881 |
+| 5 Department | 0.9834 | 1.3639 | 1.4309 | 1.2546 | 1.0025 | 0.9160 | 1.1544 | 0.8138 |
+| 6 State × category | 0.9056 | 1.2121 | 1.2946 | 1.1296 | 0.9114 | 0.8376 | 1.0855 | 0.7660 |
+| 7 State × department | 0.9494 | 1.2632 | 1.3330 | 1.1734 | 0.9719 | 0.9470 | 1.1230 | 0.8681 |
+| 8 Store × category | 0.9311 | 1.1743 | 1.2430 | 1.1084 | 0.9546 | 0.9331 | 1.0816 | 0.8760 |
+| 9 Store × department | 0.9676 | 1.1764 | 1.2345 | 1.1126 | 0.9820 | 0.9892 | 1.1043 | 0.9302 |
+| 10 Item | 0.9534 | 1.0448 | 1.0968 | 1.0105 | 0.9499 | 0.9791 | 1.0473 | 0.9399 |
+| 11 Item × state | 0.9456 | 1.0274 | 1.0747 | 0.9963 | 0.9466 | 0.9757 | 1.0361 | 0.9390 |
+| 12 Item × store | 0.9466 | 1.0235 | 1.0700 | 0.9930 | 0.9477 | 0.9796 | 1.0394 | 0.9425 |
+| Bias, levels 1–9 | −9.6 to −10.6% | −5.8 to −7.3% | −0.2 to +1.0% | −6.8 to −8.1% | −7.6 to −8.5% | +1.3 to +2.3% | +10.8 to +11.6% | −0.3 to −1.1% |
+| Bias, levels 10–12 | +3.8 to +6.6% | +5.6 to +8.8% | +14.3 to +16.9% | +5.7 to +9.3% | +2.8 to +5.2% | +12.3 to +14.2% | +24.1 to +26.1% | +10.5 to +12.2% |
+
+The bias of levels 10–12 is the dollar-weighted mean of each series' relative bias, so it is not the total's.
+
+Share of series with a fitted sigma within 1% of its prior's width of a bound, or past it (`m5_bias.py`,
+`bounds.csv`; the priors are `sigma_h` ~ U(0.1, 0.5) and each drift ~ U(0.01, 0.1)). No `sigma_h` and at
+most 5% of the drifts sit on a lower bound.
+
+| Entry | Any sigma | `sigma_h` on 0.5 | First drift on 0.1 | Shared drift on 0.1 |
+|---|---|---|---|---|
+| `ssp_dow` | 99.2% | 95.6% | 65.4% | 68.6% |
+| `ssp_dow_boxcox_shift` | 99.9% | 99.9% | 62.2% | 74.8% |
+| `ssp_dow_boxcox_floor` | 99.9% | 99.9% | 63.7% | 74.3% |
+| `ssp_dow_yeojohnson` | 99.9% | 99.9% | 60.6% | 75.1% |
+| `ssp_level_dow` | 99.5% | 92.2% | 71.0% | 57.2% |
+| `ssp_level_dow_boxcox_shift` | 99.8% | 92.5% | 83.9% | 46.6% |
+| `ssp_level_dow_boxcox_floor` | 99.8% | 92.3% | 84.2% | 46.5% |
+| `ssp_level_dow_yeojohnson` | 99.9% | 92.7% | 84.2% | 46.9% |
+
+- **Without the level state every power is worse, because of Monday.** `ssp_dow`'s Monday rows of `Z` are all
+  zero, so its Monday forecast is the inverse of `mu = 0`, the centre of the transformed fit days. For the log
+  target that is the arithmetic mean over all fit days. For a standardised power with λ = −1 its median is the
+  harmonic mean of the shifted sales over all fit days, less the shift, which the zero days before an item
+  was stocked pull far down: the Monday totals are 0.51–0.56 of the actuals. Tuesday to Sunday, `ssp_dow_boxcox_shift` and `ssp_dow_yeojohnson`
+  forecast 0.95–1.03 of the actuals, against 0.84–0.92 for `ssp_dow`.
+- **With the level state, Yeo-Johnson is better than `ssp_dow` at every level**: −0.103 overall, −0.224 on the
+  total and −0.170 on departments. The totals are 0.4% low instead of 9.6%. Box-Cox of `sales + 0.5` improves
+  levels 1–7 and worsens 8–12. Box-Cox of `max(sales, 0.1)` forecasts 11% high and is worse at every level.
+- **The forecast now follows the arithmetic mean** (#113's question): the slope rises from 0.24 to 0.85 with
+  `ssp_level_dow_yeojohnson` and to 1.00 with `ssp_level_dow_boxcox_shift`. The bias does not vanish but
+  moves: `ssp_level_dow_yeojohnson` forecasts the low-volume tercile 29% low (`ssp_dow`: 17%) and the
+  high-volume tercile 6% high (`ssp_dow`: 5% low), and the series with zeros on 75% or more of their days
+  since their first sale 25% low.
+- **The sigma priors don't fit the standardised scale.** They were set for log sales; the standardised
+  powered sales have unit variance, so `sigma_h` sits on its 0.5 cap for 92–100% of series. The inverse
+  takes the capped variance, which understates the spread and so the correction. #116 is about that cap.
+- **Fitting takes longer:** 26–35 s against 17–20 s on the sample, for scikit-learn's λ fit (slowest for
+  Box-Cox) and the quadrature over the in-sample fit.
+
+**Decision:** `ssp_dow` stays the default `--model` until `ssp_level_dow_yeojohnson` passes a full run and the
+evaluation window, which this issue did not run. The sample misled once before (see "Open items").
+
 ## Working on the model
 
 ### Where the code is
@@ -181,7 +282,7 @@ work (#114, #115) and the `sigma_h` cap (#116) are where the bias can be closed.
 | File | What to change there |
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
-| `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction) and `LogTransform`, the default. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
+| `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction), `LogTransform`, the default, and `PowerTransform`, a Box-Cox or Yeo-Johnson power fitted per series. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
 | `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `transform`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
 | `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
@@ -224,6 +325,8 @@ drift.
   totals by 2.4 points on validation and 5.6 on evaluation. The main cause is the log transform: the
   forecast tracks the geometric mean of `max(sales, 0.1)`, and the lognormal correction, with `sigma_h`
   capped, lifts it only part of the way to the arithmetic mean (see "Level bias diagnosis (#113)").
+  `ssp_level_dow_yeojohnson` follows the arithmetic mean and forecasts the sample's totals 0.4% low, but
+  not yet on a full run (see "Power transforms (#115)").
 - **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
   New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
   after the first the shared drift.
