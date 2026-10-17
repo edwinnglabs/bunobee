@@ -3,8 +3,10 @@
 ``m5_run.py --model NAME`` fits ``MODELS[NAME]``, so adding a model needs only a new entry there (issue #103).
 These tests hold every entry to the contract the runner relies on, and check that the baseline entry
 ``ssp_dow`` keeps the model of the #94 submission: weekday dummies from Tuesday to Sunday with no column of
-ones, fitted in independent runs of at most ``fit_chunk`` series. Its in-sample fit, drawn in
-``forecasts.pdf`` (issue #105), is checked against the Kalman filter's own one-step-ahead prediction.
+ones, fitted in independent runs of at most ``fit_chunk`` series. ``ssp_level_dow`` (issue #106) adds the
+column of ones, so its Monday forecast is the fitted level rather than the series mean. Each model's
+in-sample fit, drawn in ``forecasts.pdf`` (issue #105), is checked against the Kalman filter's own
+one-step-ahead prediction.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -16,7 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from types import ModuleType
 
@@ -96,6 +98,48 @@ def ssp_dow_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     return m5_models.SspDow(n_iter=20).fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
 
 
+@pytest.fixture(scope="module")
+def ssp_level_dow_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The registered ``ssp_level_dow`` entry's forecasts and fitted arrays of every synthetic series."""
+    model = replace(m5_models.MODELS["ssp_level_dow"], n_iter=20)
+    return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+
+
+def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool) -> list[tuple]:
+    """Rerun each synthetic series' Kalman filter on its fit days with the series' fitted parameters.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The synthetic dataset.
+    fitted : dict of str to np.ndarray
+        ``fitted`` output of an ``SspDow`` fit of every synthetic series, in series order.
+    level : bool
+        Whether the fit's design matrix was led by a column of ones (``SspDow.level``).
+
+    Returns
+    -------
+    list of tuple
+        Per series, the log of its normalised sales ``y`` followed by the six outputs of
+        ``kalman_filter_1d``: ``(y, log_p, at, Pt, vt, Ft, Kt)``.
+    """
+    Z = jnp.asarray(make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW, intercept=level)[FIT_MASK])
+    sales = np.clip(ds["sales"].values[:, FIT_MASK], 1e-1, None)
+    runs = []
+    for i in range(N_SERIES):
+        y = np.log(sales[i] / fitted["response_norm"][i]).astype(np.float32)
+        outputs = kalman_filter_1d(
+            a0=jnp.zeros(Z.shape[1]),
+            P0=jnp.ones(Z.shape[1]),
+            Z=Z,
+            sigma_h=fitted["sigma_h"][i],
+            sigma_q=fitted["sigma_q"][i],
+            y=jnp.asarray(y),
+        )
+        runs.append((y, *outputs))
+    return runs
+
+
 class TestRegistry:
     """The registry names the baseline, and every entry's settings can be written to ``run_stats.json``."""
 
@@ -150,21 +194,42 @@ class TestSspDow:
             fitted[m5_models.INSAMPLE_KEY], ssp_dow_fit[1][m5_models.INSAMPLE_KEY][order], rtol=1e-3
         )
 
-    def test_insample_fit_is_the_filters_one_step_ahead_prediction(self, ds, ssp_dow_fit):
+
+class TestSspLevelDow:
+    """``ssp_level_dow`` leads the weekday dummies with a level state, so Monday sales update the states."""
+
+    def test_level_state_has_its_own_drift(self, ssp_level_dow_fit):
+        # Seven states, the level first: fit_batch_series_opt gives the first state its own drift and the six
+        # weekday states a shared one.
+        _, fitted = ssp_level_dow_fit
+        assert m5_models.MODELS["ssp_level_dow"].level
+        assert fitted["sigma_q"].shape == (N_SERIES, 7)
+        np.testing.assert_array_equal(fitted["sigma_q"][:, 1:], fitted["sigma_q"][:, [1]].repeat(6, axis=1))
+
+    def test_monday_forecast_is_the_fitted_level(self, ds, ssp_level_dow_fit):
+        # A Monday row of the design is the column of ones alone, so a Monday forecast is the last filtered
+        # level back-transformed, exp(a + (P + sigma_h^2) / 2) * mean, not ssp_dow's mean * exp(sigma_h^2 / 2).
+        forecasts, fitted = ssp_level_dow_fit
+        monday = ds["day_of_week"].values[FORECAST_MASK] == 0
+        runs = _refilter(ds, fitted, level=True)
+        a_last = np.array([np.asarray(at)[-1, 0] for _, _, at, _, _, _, _ in runs])
+        P_last = np.array([np.asarray(Pt)[-1, 0] for _, _, _, Pt, _, _, _ in runs])
+        level = np.exp(a_last + 0.5 * (P_last + fitted["sigma_h"] ** 2)) * fitted["response_norm"]
+        np.testing.assert_allclose(
+            forecasts[:, monday], np.broadcast_to(level[:, None], (N_SERIES, monday.sum())), rtol=1e-4
+        )
+        series_mean = fitted["response_norm"] * np.exp(fitted["sigma_h"] ** 2 / 2)
+        assert not np.allclose(forecasts[:, monday], series_mean[:, None], rtol=1e-2)
+
+
+class TestInsample:
+    """Each SSP entry's in-sample fit is the Kalman filter's one-step-ahead prediction of every fit day."""
+
+    @pytest.mark.parametrize(("fit", "level"), [("ssp_dow_fit", False), ("ssp_level_dow_fit", True)])
+    def test_insample_fit_is_the_filters_one_step_ahead_prediction(self, request, ds, fit, level):
         # Rerun the filter with each series' fitted parameters: its innovation v_t = y_t - yhat_t and variance
         # F_t give the one-step-ahead prediction of the log sales, back-transformed as the forecast is.
-        _, fitted = ssp_dow_fit
-        Z = jnp.asarray(make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW)[FIT_MASK])
-        sales = np.clip(ds["sales"].values[:, FIT_MASK], 1e-1, None)
-        for i in range(N_SERIES):
-            y = np.log(sales[i] / fitted["response_norm"][i]).astype(np.float32)
-            _, _, _, vt, Ft, _ = kalman_filter_1d(
-                a0=jnp.zeros(Z.shape[1]),
-                P0=jnp.ones(Z.shape[1]),
-                Z=Z,
-                sigma_h=fitted["sigma_h"][i],
-                sigma_q=fitted["sigma_q"][i],
-                y=jnp.asarray(y),
-            )
+        _, fitted = request.getfixturevalue(fit)
+        for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, level)):
             expected = np.exp(y - np.asarray(vt)[:, 0] + 0.5 * np.asarray(Ft)[:, 0]) * fitted["response_norm"][i]
             np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)

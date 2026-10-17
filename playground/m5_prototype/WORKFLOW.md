@@ -101,6 +101,38 @@ Baseline, the current model (`ssp_dow`):
 | Local | 1.08136 | 0.97573 |
 | Kaggle | 1.08127 | 0.97572 |
 
+### `ssp_level_dow` (#106)
+
+`ssp_dow` with the missing level state, run through the loop against `ssp_dow` on the same series: the
+3,000-series sample (seed 2026) and a full run, both origins. A negative delta means `ssp_level_dow` scores
+better.
+
+| WRMSSE | `ssp_dow` | `ssp_level_dow` | Delta |
+|---|---|---|---|
+| Sample, validation | 0.93487 | 0.94145 | +0.00657 |
+| Sample, evaluation | 0.88578 | 0.90137 | +0.01559 |
+| Full, validation | 1.08136 | 1.05052 | −0.03084 |
+| Full, evaluation | 0.97573 | 0.98431 | +0.00858 |
+| Kaggle public | 1.08127 | 1.05043 | −0.03084 |
+| Kaggle private | 0.97572 | 0.98431 | +0.00859 |
+
+Per level (`m5_compare.py`):
+
+- **Full run, validation:** levels 1–11 improve by 0.009–0.047 and level 12 (item × store) worsens by
+  0.019. Total sales are forecast 10.3% low instead of 12.7%.
+- **Full run, evaluation:** only levels 3 (store) and 8 (store × category) improve. The item levels worsen
+  most (10–12: +0.005, +0.027, +0.039). Total sales are 3.8% low instead of 9.3%.
+- **Sample:** worse on both windows at most levels, with the same lift in the totals (bias −9.6% → −7.6%
+  on validation, −9.2% → −3.7% on evaluation).
+
+The full run fits in 361 s against 334 s for `ssp_dow` and peaks at 24.8 GiB against 22.3 GiB.
+
+**Decision:** `ssp_dow` stays the default `--model`. The full run's validation gain does not hold on the
+evaluation window, and the sample scores `ssp_level_dow` worse on both windows, so the gain is not robust.
+The level lifts the totals, but only by 2.4 points of the 12.7% shortfall on validation, so it is not the
+main cause of the low totals. `ssp_level_dow` stays registered as the starting point for the next
+experiments.
+
 ## Working on the model
 
 ### Where the code is
@@ -109,7 +141,7 @@ Baseline, the current model (`ssp_dow`):
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the transform, parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast and back-transform |
 | `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `n_iter`, `lr` and `fit_chunk` are the entry's fields |
-| `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies, the model's only input today |
+| `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
 An entry's `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` gets the whole dataset, the series to
@@ -131,17 +163,23 @@ so adding a model needs only a new entry.
 - **Forecast:** the last filtered state times the future `Z`, back-transformed as a lognormal mean and
   rescaled by `mean`.
 
+`ssp_level_dow` is the same model with `level=True`: a column of ones leads `Z`, so it has 7 states. The
+first is the level, with its own drift; the six weekday states are offsets from Monday and share the other
+drift.
+
 ### Known problems
 
-- **There is no level state.** The docstrings call the model "local level + weekly seasonality", but `Z`
-  has no column of ones. Monday rows of `Z` are all zero, so Monday sales never update the states and every
-  Monday forecast is `mean · exp(σ_h² / 2)`: the series' average over all fit days, whatever its recent
-  sales. In the baseline run, all four Monday forecasts of every series equal that value. The "level"
-  drift actually applies to the Tuesday state.
+- **`ssp_dow` has no level state.** The docstrings call the model "local level + weekly seasonality", but
+  its `Z` has no column of ones. Monday rows of `Z` are all zero, so Monday sales never update the states
+  and every Monday forecast is `mean · exp(σ_h² / 2)`: the series' average over all fit days, whatever its
+  recent sales. In the baseline run, all four Monday forecasts of every series equal that value. The
+  "level" drift actually applies to the Tuesday state. `ssp_level_dow` adds the level (see its results
+  above), but is not the default.
 - **Totals are forecast too low.** In the baseline run, total sales are 12.7% low on the validation window
   and 9.3% low on the evaluation window, and every level from 1 to 9 is low by a similar amount. The item
-  levels (10–12) are not. Untested candidates: the missing level state (an all-time average sits below
-  recent sales if sales grew), the 0.1 clip on zero days, and the back-transform.
+  levels (10–12) are not. The missing level state explains only part of it: `ssp_level_dow` lifts the
+  totals by 2.4 points on validation and 5.6 on evaluation. Untested candidates: the 0.1 clip on zero
+  days, and the back-transform.
 - **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
   New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
   after the first the shared drift.
@@ -150,6 +188,9 @@ so adding a model needs only a new entry.
 
 ### Open items
 
+- **The sample did not predict the full run:** for `ssp_level_dow`, the 3,000-series sample scored the
+  validation window +0.0066 worse while the full run scored it −0.0308 better. Enlarge the sample or
+  stratify it by store × department before steering the next model by it.
 - **Hierarchical parameter sharing:** share the weekday drift within department × store groups (70 groups),
   either outright or through a prior that pulls each series toward its group. Most useful for sparse
   series.

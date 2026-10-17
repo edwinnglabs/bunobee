@@ -106,11 +106,16 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
 class SspDow:
     """Weekday-dummy SSP fitted by MAP: ``fit_batch_series_opt`` with ``predict_batch_series_opt``.
 
-    The design matrix has one column per weekday from Tuesday to Sunday, with Monday dropped and no column
-    of ones, so Monday rows are all zero (see ``WORKFLOW.md``, "Known problems").
+    The design matrix has one column per weekday from Tuesday to Sunday, with Monday dropped. Without
+    ``level`` there is no column of ones, so Monday rows are all zero and every Monday forecast is the
+    series' fit-window mean (see ``WORKFLOW.md``, "Known problems"). With ``level`` a column of ones leads
+    the matrix: its state is the local level, which ``fit_batch_series_opt`` gives its own drift, and the
+    weekday states are offsets from Monday that share the other drift.
 
     Parameters
     ----------
+    level : bool
+        Lead the design matrix with a column of ones, the level state, by default False.
     n_iter : int
         Adam optimisation steps per fit run, by default 100.
     lr : float
@@ -123,6 +128,7 @@ class SspDow:
         series. ``None`` = one run over all series. Default None.
     """
 
+    level: bool = False
     n_iter: int = 100
     lr: float = 3e-2
     chunk_size: int | None = 4096
@@ -153,11 +159,11 @@ class SspDow:
         one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`).
         """
         # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
-        # each column a weekday from Tuesday to Sunday on every day, with Monday dropped.
+        # each dummy column a weekday from Tuesday to Sunday on every day, with Monday dropped.
         dow = ds["day_of_week"].values
-        weekly = make_periodic_dummies(dow.size, period=7, phase=int(dow[0]))
-        Z = jnp.asarray(weekly[fit_mask])  # (n_fit_steps, 6)
-        Z_future = jnp.asarray(weekly[forecast_mask])  # (horizon, 6)
+        weekly = make_periodic_dummies(dow.size, period=7, phase=int(dow[0]), intercept=self.level)
+        Z = jnp.asarray(weekly[fit_mask])  # (n_fit_steps, n_states): 6 states, or 7 with the level
+        Z_future = jnp.asarray(weekly[forecast_mask])  # (horizon, n_states)
         sales = ds["sales"].values[series_idx][:, fit_mask]  # (n_series, n_fit_steps)
 
         n_series = sales.shape[0]
@@ -188,6 +194,7 @@ class SspDow:
 #: Registered models by name, the choices of ``m5_run.py --model``.
 MODELS: dict[str, Model] = {
     "ssp_dow": SspDow(),
+    "ssp_level_dow": SspDow(level=True),
 }
 
 #: The baseline entry, ``m5_run.py``'s default ``--model``.
