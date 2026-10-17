@@ -6,7 +6,8 @@ These tests hold every entry to the contract the runner relies on, and check tha
 ones, fitted in independent runs of at most ``fit_chunk`` series. ``ssp_level_dow`` (issue #106) adds the
 column of ones, so its Monday forecast is the fitted level rather than the series mean. Each model's
 in-sample fit, drawn in ``forecasts.pdf`` (issue #105), is checked against the Kalman filter's own
-one-step-ahead prediction.
+one-step-ahead prediction. An entry picks its target transform with its ``transform`` field (issue #114),
+so a transform the fitter has never seen is tried without editing it.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -18,7 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from types import ModuleType
 
@@ -62,6 +63,7 @@ def _load_script(name: str) -> ModuleType:
 
 m5_models = _load_script("m5_models")
 
+from bunobee.models.m5.transforms import LogTransform  # noqa: E402
 from bunobee.models.ssp.kalman_1d import kalman_filter_1d  # noqa: E402
 from bunobee.regression import make_periodic_dummies  # noqa: E402
 
@@ -73,6 +75,23 @@ N_DATES = N_FIT + HORIZON
 FIRST_DOW = 5
 FIT_MASK = np.arange(N_DATES) < N_FIT
 FORECAST_MASK = ~FIT_MASK
+
+
+@dataclass(frozen=True)
+class CentredLog1p:
+    """``log1p(sales)`` less its mean over the fit days: a transform the fitter has never seen, with its own parameter.
+
+    The inverse is the mean of ``expm1`` of a Gaussian, ``expm1(mu + centre + var / 2)``.
+    """
+
+    def fit(self, sales: np.ndarray) -> dict[str, np.ndarray]:
+        return {"centre": np.log1p(sales).mean(axis=-1).astype(np.float32)}
+
+    def forward(self, sales: np.ndarray, params) -> np.ndarray:
+        return (np.log1p(sales) - np.asarray(params["centre"])[..., None]).astype(np.float32)
+
+    def inverse(self, mu: np.ndarray, var: np.ndarray, params) -> np.ndarray:
+        return np.expm1(mu + np.asarray(params["centre"])[..., None] + 0.5 * var)
 
 
 @pytest.fixture(scope="module")
@@ -105,7 +124,14 @@ def ssp_level_dow_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
 
 
-def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool) -> list[tuple]:
+@pytest.fixture(scope="module")
+def centred_log1p_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The ``ssp_dow`` entry with the ``CentredLog1p`` transform: forecasts and fitted arrays of every series."""
+    model = replace(m5_models.MODELS["ssp_dow"], n_iter=20, transform=CentredLog1p())
+    return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+
+
+def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transform=LogTransform()) -> list[tuple]:
     """Rerun each synthetic series' Kalman filter on its fit days with the series' fitted parameters.
 
     Parameters
@@ -116,18 +142,20 @@ def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool) -> lis
         ``fitted`` output of an ``SspDow`` fit of every synthetic series, in series order.
     level : bool
         Whether the fit's design matrix was led by a column of ones (``SspDow.level``).
+    transform : Transform
+        The fit's target transform (``SspDow.transform``), by default the log transform.
 
     Returns
     -------
     list of tuple
-        Per series, the log of its normalised sales ``y`` followed by the six outputs of
-        ``kalman_filter_1d``: ``(y, log_p, at, Pt, vt, Ft, Kt)``.
+        Per series, its transformed sales ``y`` followed by the six outputs of ``kalman_filter_1d``:
+        ``(y, log_p, at, Pt, vt, Ft, Kt)``.
     """
     Z = jnp.asarray(make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW, intercept=level)[FIT_MASK])
-    sales = np.clip(ds["sales"].values[:, FIT_MASK], 1e-1, None)
+    sales = ds["sales"].values[:, FIT_MASK]
     runs = []
     for i in range(N_SERIES):
-        y = np.log(sales[i] / fitted["response_norm"][i]).astype(np.float32)
+        y = transform.forward(sales[i], {key: value[i] for key, value in fitted.items()})
         outputs = kalman_filter_1d(
             a0=jnp.zeros(Z.shape[1]),
             P0=jnp.ones(Z.shape[1]),
@@ -146,6 +174,10 @@ class TestRegistry:
     def test_default_model_is_registered(self):
         assert m5_models.DEFAULT_MODEL == "ssp_dow"
         assert m5_models.DEFAULT_MODEL in m5_models.MODELS
+
+    @pytest.mark.parametrize("name", ["ssp_dow", "ssp_level_dow"])
+    def test_ssp_entries_keep_the_log_transform(self, name):
+        assert m5_models.MODELS[name].transform == LogTransform()
 
     @pytest.mark.parametrize("name", list(m5_models.MODELS))
     def test_settings_are_json_serialisable(self, name):
@@ -188,7 +220,7 @@ class TestSspDow:
         chunked, fitted = m5_models.SspDow(n_iter=20, fit_chunk=3).fit_forecast(ds, order, FIT_MASK, FORECAST_MASK)
         np.testing.assert_allclose(chunked, forecasts[order], rtol=1e-3)
         assert {key: value.shape[0] for key, value in fitted.items()} == dict.fromkeys(
-            (*m5_models.SspDow.FITTED_KEYS, m5_models.INSAMPLE_KEY), N_SERIES
+            ("sigma_h", "sigma_q", "response_norm", "final_loss", m5_models.INSAMPLE_KEY), N_SERIES
         )
         np.testing.assert_allclose(
             fitted[m5_models.INSAMPLE_KEY], ssp_dow_fit[1][m5_models.INSAMPLE_KEY][order], rtol=1e-3
@@ -232,4 +264,33 @@ class TestInsample:
         _, fitted = request.getfixturevalue(fit)
         for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, level)):
             expected = np.exp(y - np.asarray(vt)[:, 0] + 0.5 * np.asarray(Ft)[:, 0]) * fitted["response_norm"][i]
+            np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
+
+
+class TestTransform:
+    """A registry entry picks its target transform with ``SspDow.transform``; the fitter is not edited."""
+
+    def test_settings_record_the_transform(self):
+        model = replace(m5_models.MODELS["ssp_dow"], transform=LogTransform(floor=1.0))
+        assert json.loads(json.dumps(asdict(model)))["transform"] == {"floor": 1.0}
+
+    def test_fitted_holds_the_transforms_parameters(self, centred_log1p_fit):
+        _, fitted = centred_log1p_fit
+        assert "centre" in fitted and "response_norm" not in fitted
+        assert fitted["centre"].shape == (N_SERIES,)
+
+    def test_monday_forecast_is_the_transforms_inverse(self, ds, centred_log1p_fit):
+        # ssp_dow's Monday rows of the design are all zero, so mu = 0 and var = sigma_h^2: the Monday forecast
+        # is CentredLog1p's inverse of them, expm1(centre + sigma_h^2 / 2), not the log transform's.
+        forecasts, fitted = centred_log1p_fit
+        monday = ds["day_of_week"].values[FORECAST_MASK] == 0
+        expected = np.expm1(fitted["centre"] + 0.5 * fitted["sigma_h"] ** 2)
+        np.testing.assert_allclose(
+            forecasts[:, monday], np.broadcast_to(expected[:, None], (N_SERIES, monday.sum())), rtol=1e-6
+        )
+
+    def test_insample_fit_is_inverted_by_the_transform(self, ds, centred_log1p_fit):
+        _, fitted = centred_log1p_fit
+        for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, level=False, transform=CentredLog1p())):
+            expected = np.expm1(y - np.asarray(vt)[:, 0] + fitted["centre"][i] + 0.5 * np.asarray(Ft)[:, 0])
             np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
