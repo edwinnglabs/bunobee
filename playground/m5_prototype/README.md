@@ -35,13 +35,15 @@ python playground/m5_prototype/m5_check_weights.py
 
 cd playground/m5_prototype
 
-# 4. Sampled run: fit 50 random series at both origins and score them. Takes seconds.
-python m5_run.py --n-demo 50
+# 4. Sampled run: fit 50 random series at both origins with a registered model (see Models below)
+#    and score them. Takes seconds. --model defaults to ssp_dow, the baseline.
+python m5_run.py --model ssp_dow --n-demo 50
 
 # 5. Full run: fit all 30,490 series at both origins, write submission.csv and score it.
-python m5_run.py --n-demo 0
-#    About 5.5 minutes and a ~22 GiB peak (see below). With less RAM, cap memory with e.g.
-#    --fit-chunk 8192.
+python m5_run.py --model ssp_dow --n-demo 0
+#    About 5.5 minutes and a ~22 GiB peak (see below). With less RAM, register an entry that fits
+#    in runs of fewer series, e.g. "ssp_dow_8k": SspDow(fit_chunk=8192) in m5_models.py, and pass
+#    --model ssp_dow_8k.
 
 # 6. Optional: re-score a submission file on either window.
 python m5_score_submission.py --submission output/<timestamp>/submission.csv --window validation
@@ -60,9 +62,9 @@ Each `m5_run.py` run writes to `output/<timestamp>/`:
 |---|---|
 | `submission.csv` | 60,980 rows: `_validation` rows from the fit through d_1913, `_evaluation` rows from the fit through d_1941 (full runs only) |
 | `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per origin |
-| `run_stats.json` | Fit time (total and per origin), total time, peak memory |
-| `batch_params.npz` | Fitted parameters and forecasts of both origins |
-| `diagnostics.png`, `forecasts.pdf` | Loss / parameter histograms and forecast plots (validation origin) |
+| `run_stats.json` | Model name and settings, fit time (total and per origin), total time, peak memory |
+| `batch_params.npz` | The model's fitted outputs and forecasts of both origins |
+| `diagnostics.png`, `forecasts.pdf` | Histograms of the model's fitted outputs and forecast plots (validation origin) |
 
 A sampled run aggregates and weights only its own series, so its WRMSSE is a smoke test, not
 comparable to a full-run score.
@@ -74,9 +76,21 @@ comparable to a full-run score.
 | validation | d_1–d_1913 | d_1914–d_1941 | `_validation` | public |
 | evaluation | d_1–d_1941 | d_1942–d_1969 | `_evaluation` | private |
 
+### Models
+
+`--model` picks an entry of `MODELS` in `m5_models.py`. An entry is a model plus its settings: a
+frozen dataclass whose `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` builds the model's
+inputs from the dataset, calls the model in `src/bunobee/models/m5/` and returns the forecasts
+(series × 28) and a dict of per-series arrays to save. To try another model, add an entry; `m5_run.py`
+needs no change.
+
+| Entry | Model | Settings |
+|---|---|---|
+| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The model of both Kaggle submissions | `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
+
 ## Reference results
 
-Full run on an 18-core, 128 GB Mac, JAX on CPU, 100 Adam steps, no `--fit-chunk`:
+Full run of `ssp_dow` with its default settings on an 18-core, 128 GB Mac, JAX on CPU:
 
 | | Value |
 |---|---|
@@ -99,10 +113,11 @@ How well the local scorer matches the official one:
 
 | Script | Purpose |
 |---|---|
-| `m5_common.py` | Shared data directory, `load_m5_ds()`, day-of-week dummies |
+| `m5_common.py` | Shared data directory and `load_m5_ds()` |
 | `m5_fetch.py` | Download the Kaggle files and the reference files |
 | `m5_preprocess.py` | Build and cache `m5_ds.nc` |
-| `m5_run.py` | Fit, forecast, score and write the submission |
+| `m5_models.py` | Model registry: each entry is a model plus its settings, picked with `--model` |
+| `m5_run.py` | Fit a registered model, forecast, score and write the submission |
 | `m5_score_submission.py` | 12-level WRMSSE of a submission for one window |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |
 | `m5_submission_diff.py` | Diagnostic diff of two submissions |

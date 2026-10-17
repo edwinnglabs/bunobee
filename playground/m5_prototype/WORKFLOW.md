@@ -52,9 +52,10 @@ d_1 ─────────────────────────�
                                          Kaggle public       Kaggle private
 ```
 
-For each cutoff day it takes all sales up to that day, builds the model inputs, fits all 30,490 series at
-once and forecasts the next 28 days. It then writes `submission.csv` (60,980 rows, half from each cutoff
-day), scores both halves against the true sales and saves everything to `output/<timestamp>/`.
+For each cutoff day it hands the model picked with `--model` (by default `ssp_dow`) all sales up to that
+day. The model builds its own inputs, fits all 30,490 series at once and forecasts the next 28 days. It
+then writes `submission.csv` (60,980 rows, half from each cutoff day), scores both halves against the true
+sales and saves everything to `output/<timestamp>/`.
 
 `--n-demo 50` fits 50 random series in seconds. It only proves the pipeline runs: a sampled run
 aggregates and weights its own series, so its score can't be compared with a full run's.
@@ -78,9 +79,9 @@ against actual for 50 series.
 
 ## The experiment loop
 
-1. Change the model or its inputs (see below).
-2. `python m5_run.py --n-demo 50` to check nothing crashes.
-3. `python m5_run.py --n-demo 0` for the real score: about 5.5 minutes, ~22 GiB peak.
+1. Add or edit a model entry in `m5_models.py` (see below).
+2. `python m5_run.py --model NAME --n-demo 50` to check nothing crashes.
+3. `python m5_run.py --model NAME --n-demo 0` for the real score: about 5.5 minutes, ~22 GiB peak.
 4. Compare `wrmsse_per_level.csv` with the baseline run's.
 5. Submit only when you want the official number: the local scorer matches Kaggle to within 0.0001.
 
@@ -88,7 +89,7 @@ Make decisions on the validation score only, and keep the evaluation score as th
 windows' actuals are on disk, so it is easy to tune to both without noticing, and then the private score
 stops telling you anything.
 
-Baseline, the current model:
+Baseline, the current model (`ssp_dow`):
 
 | | Validation (public) | Evaluation (private) |
 |---|---|---|
@@ -102,15 +103,17 @@ Baseline, the current model:
 | File | What to change there |
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the transform, parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast and back-transform |
-| `playground/m5_prototype/m5_run.py` | `_fit_and_forecast` calls the model. `main` builds its inputs for each cutoff day (the `make_periodic_dummies` call) |
+| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `n_iter`, `lr` and `fit_chunk` are the entry's fields |
 | `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies, the model's only input today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
-A model takes the sales of the fit days (series × days) and per-day inputs for the fit days and the 28
-forecast days, and returns forecasts (series × 28) with no NaNs. Everything after that (both cutoff days,
-the submission, the scoring) works with any model.
+An entry's `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` gets the whole dataset, the series to
+fit and the fit and forecast days. It returns forecasts (series × 28) with no NaNs and a dict of per-series
+arrays, which `m5_run.py` saves to `batch_params.npz` and plots in `diagnostics.png`. Everything else
+(data loading, both cutoff days, the submission, the scoring) lives in `m5_run.py` and works with any model,
+so adding a model needs only a new entry.
 
-### The current model
+### The current model (`ssp_dow`)
 
 - **Transform:** it models `log(max(sales, 0.1) / mean)` with Gaussian noise, where `mean` is the series'
   mean of `max(sales, 0.1)` over the fit days. Every zero-sales day becomes `log(0.1 / mean)`.
@@ -147,7 +150,7 @@ the submission, the scoring) works with any model.
   single-series `fit_one_series_opt` on the same series.
 - **float32 log-likelihood:** the loss sums 1,913 steps in float32. Summing in float64 has not been tried.
 - **Memory:** the second fit does not release the first one's memory, so a full run peaks at 22.3 GiB
-  instead of about 14.4 GiB. `--fit-chunk` caps it meanwhile.
+  instead of about 14.4 GiB. The `fit_chunk` setting of `SspDow` caps it meanwhile.
 - **Optimizer loop:** a Python loop over a compiled step, not `lax.scan`. A cutoff day already fits in
   about 159 s, so this only matters for speed.
 - **Multiple devices:** no `pmap`; only useful with several GPUs.
