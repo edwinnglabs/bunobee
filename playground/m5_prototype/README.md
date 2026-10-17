@@ -35,24 +35,33 @@ python playground/m5_prototype/m5_check_weights.py
 
 cd playground/m5_prototype
 
-# 4. Sampled run: fit 50 random series at both origins with a registered model (see Models below)
-#    and score them. Takes seconds. --model defaults to ssp_dow, the baseline.
-python m5_run.py --model ssp_dow --n-demo 50
+# 4. Quick loop: fit 3,000 random series (seed 2026) at the validation origin only, with a
+#    registered model (see Models below), and score them. About 20 s and a ~3.3 GiB peak. --model
+#    defaults to ssp_dow, the baseline; run it once as the sample baseline to compare against.
+python m5_run.py --model ssp_dow --n-demo 3000 --origins validation
 
-# 5. Full run: fit all 30,490 series at both origins, write submission.csv and score it.
+# 5. Compare a run with the sample baseline: overall and per-level WRMSSE and bias deltas for each
+#    window both runs scored. Refuses runs fitted on different series.
+python m5_compare.py output/<baseline timestamp> output/<timestamp>
+
+# 6. Full run: fit all 30,490 series at both origins, write submission.csv and score it.
 python m5_run.py --model ssp_dow --n-demo 0
 #    About 5.5 minutes and a ~22 GiB peak (see below). With less RAM, register an entry that fits
 #    in runs of fewer series, e.g. "ssp_dow_8k": SspDow(fit_chunk=8192) in m5_models.py, and pass
 #    --model ssp_dow_8k.
 
-# 6. Optional: re-score a submission file on either window.
+# 7. Optional: re-score a submission file on either window.
 python m5_score_submission.py --submission output/<timestamp>/submission.csv --window validation
 python m5_score_submission.py --submission output/<timestamp>/submission.csv --window evaluation
 
-# 7. Optional: submit to Kaggle (public leaderboard = _validation rows, private = _evaluation rows).
+# 8. Optional: submit to Kaggle (public leaderboard = _validation rows, private = _evaluation rows),
+#    then type the two scores into the run's row of output/runs.csv.
 kaggle competitions submit -c m5-forecasting-accuracy -f output/<timestamp>/submission.csv -m "<message>"
 kaggle competitions submissions -c m5-forecasting-accuracy | head -3
 ```
+
+`--origins validation|evaluation|both` (default `both`) picks the forecast origins to fit. The quick
+loop fits only the validation origin, so it never looks at the evaluation window, the holdout.
 
 ### What a run writes
 
@@ -60,14 +69,21 @@ Each `m5_run.py` run writes to `output/<timestamp>/`:
 
 | File | Contents |
 |---|---|
-| `submission.csv` | 60,980 rows: `_validation` rows from the fit through d_1913, `_evaluation` rows from the fit through d_1941 (full runs only) |
-| `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per origin |
-| `run_stats.json` | Model name and settings, fit time (total and per origin), total time, peak memory |
-| `batch_params.npz` | The model's fitted outputs and forecasts of both origins |
-| `diagnostics.png`, `forecasts.pdf` | Histograms of the model's fitted outputs and forecast plots (validation origin) |
+| `submission.csv` | 60,980 rows: `_validation` rows from the fit through d_1913, `_evaluation` rows from the fit through d_1941 (full runs with both origins only) |
+| `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per fitted origin |
+| `run_stats.json` | Model name and settings, origins, fit time (total and per origin), total time, peak memory |
+| `batch_params.npz` | `fit_idx` (the fitted series) and the model's fitted outputs and forecasts of each fitted origin; evaluation-origin arrays carry an `_evaluation` suffix |
+| `diagnostics.png`, `forecasts.pdf` | Histograms of the model's fitted outputs and forecast plots (validation origin, or evaluation if only it is fitted) |
 
-A sampled run aggregates and weights only its own series, so its WRMSSE is a smoke test, not
-comparable to a full-run score.
+and appends one row to the run log `output/runs.csv`: the timestamp, the run directory, the model and
+its settings, the number of series, sample mode and seed, the origins, the WRMSSE of each scored window,
+the fit time, the git commit and whether tracked files had uncommitted changes (`git_dirty`). After a
+Kaggle submission, type its scores into the run's `kaggle_public` and `kaggle_private` columns; later
+runs keep them.
+
+A sampled run aggregates and weights only its own series, so its WRMSSE is comparable with other runs
+on the same sample (same `--n-demo`, `--sample-mode` and `--seed`), not with a full-run score.
+`m5_compare.py` checks that two runs fitted the same series before it compares them.
 
 ### Forecast origins
 
@@ -89,6 +105,17 @@ needs no change.
 | `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The model of both Kaggle submissions | `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
 
 ## Reference results
+
+Sample baseline: `ssp_dow` with its default settings on 3,000 random series (seed 2026), on the same
+Mac as below:
+
+| | Value |
+|---|---|
+| Fit time | 16.9 s (validation origin) + 17.2 s (evaluation origin) |
+| Whole run | about 20 s with `--origins validation`, 37 s with both origins |
+| Peak memory | 3.3 GiB with `--origins validation`, 3.5 GiB with both origins |
+| Local WRMSSE, validation window | 0.93487 |
+| Local WRMSSE, evaluation window | 0.88578 |
 
 Full run of `ssp_dow` with its default settings on an 18-core, 128 GB Mac, JAX on CPU:
 
@@ -117,7 +144,8 @@ How well the local scorer matches the official one:
 | `m5_fetch.py` | Download the Kaggle files and the reference files |
 | `m5_preprocess.py` | Build and cache `m5_ds.nc` |
 | `m5_models.py` | Model registry: each entry is a model plus its settings, picked with `--model` |
-| `m5_run.py` | Fit a registered model, forecast, score and write the submission |
+| `m5_run.py` | Fit a registered model, forecast, score, write the submission and append to the run log |
+| `m5_compare.py` | Per-level WRMSSE and bias deltas of two runs on the same series |
 | `m5_score_submission.py` | 12-level WRMSSE of a submission for one window |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |
 | `m5_submission_diff.py` | Diagnostic diff of two submissions |

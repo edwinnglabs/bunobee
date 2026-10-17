@@ -17,7 +17,8 @@ prerequisites, every command and the reference results, see [README.md](README.m
 | `m5_fetch.py` | 9 CSVs in `playground/resource/m5-forecasting-accuracy/` | A file is missing (it skips files already there) or corrupted (`--force`) |
 | `m5_preprocess.py` | `m5_ds.nc` in the same directory | You change `m5_preprocess.py`, e.g. to add a variable. Pass `--force`: on its own the script rebuilds only when the cache lacks the test-window actuals |
 | `m5_check_weights.py` | Nothing; prints a comparison | You change how the scorer computes weights |
-| `m5_run.py` | `output/<timestamp>/` | Every experiment |
+| `m5_run.py` | `output/<timestamp>/` and a row of `output/runs.csv` | Every experiment |
+| `m5_compare.py` | Nothing; prints the deltas | You want to compare a run with a baseline run on the same series |
 | `m5_score_submission.py` | Nothing; prints the score | You want to re-score a saved `submission.csv`, e.g. after changing the scorer |
 | `kaggle competitions submit` | A late submission on Kaggle | You want the official score |
 
@@ -42,7 +43,8 @@ the next `m5_run.py` without a reinstall.
 
 ## A run
 
-Kaggle wants two 28-day forecasts, so `m5_run.py` fits the model twice, once per cutoff day:
+Kaggle wants two 28-day forecasts, so by default (`--origins both`) `m5_run.py` fits the model twice,
+once per cutoff day:
 
 ```
 d_1 ─────────────────────────── d_1913 │ d_1914 ── d_1941 │ d_1942 ── d_1969
@@ -57,8 +59,9 @@ day. The model builds its own inputs, fits all 30,490 series at once and forecas
 then writes `submission.csv` (60,980 rows, half from each cutoff day), scores both halves against the true
 sales and saves everything to `output/<timestamp>/`.
 
-`--n-demo 50` fits 50 random series in seconds. It only proves the pipeline runs: a sampled run
-aggregates and weights its own series, so its score can't be compared with a full run's.
+`--n-demo 3000 --origins validation` fits 3,000 random series at the first cutoff day only, in about
+20 s. A sampled run aggregates and weights its own series, so its score can be compared with another run
+on the same sample (`m5_compare.py` checks that), not with a full run's.
 
 ## The score
 
@@ -82,7 +85,7 @@ against actual for 50 series.
 1. Add or edit a model entry in `m5_models.py` (see below).
 2. `python m5_run.py --model NAME --n-demo 50` to check nothing crashes.
 3. `python m5_run.py --model NAME --n-demo 0` for the real score: about 5.5 minutes, ~22 GiB peak.
-4. Compare `wrmsse_per_level.csv` with the baseline run's.
+4. Compare with the baseline run: `python m5_compare.py output/<baseline> output/<run>`.
 5. Submit only when you want the official number: the local scorer matches Kaggle to within 0.0001.
 
 Make decisions on the validation score only, and keep the evaluation score as the final check. Both
