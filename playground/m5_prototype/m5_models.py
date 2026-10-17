@@ -6,7 +6,9 @@ from the dataset and calls the model functions in ``bunobee.models.m5``, so the 
 
 To add a model, write a frozen dataclass with a ``fit_forecast`` method (see :class:`Model`) and register
 an instance of it in :data:`MODELS`. Its fields are its settings: ``m5_run.py`` records them in
-``run_stats.json``, so two entries of one class with different settings are two models.
+``run_stats.json``, so two entries of one class with different settings are two models. An SSP entry picks
+its target transform (a ``bunobee.models.m5.transforms.Transform``) with its ``transform`` field, so trying a
+transform needs only a new entry, not an edit of the fitter.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import numpy as np
 import xarray as xr
 
 from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+from bunobee.models.m5.transforms import LogTransform, Transform
 from bunobee.regression import make_periodic_dummies
 
 logger = logging.getLogger(__name__)
@@ -74,8 +77,9 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
 
     Day ``t`` is predicted from the filtered state of day ``t - 1`` (``a0`` and ``P0`` on the first day), the
     states being random walks, and back-transformed as ``predict_batch_series_opt`` back-transforms a
-    forecast: ``exp(mu + var / 2) * response_norm``, with ``var`` the predicted variance of the log sales.
-    The forecast of the first day after the fit days is this prediction one day on.
+    forecast: by the fit's ``transform.inverse`` of ``mu`` and ``var``, the predicted mean and variance of the
+    transformed sales. For the log transform that is ``exp(mu + var / 2) * response_norm``. The forecast of
+    the first day after the fit days is this prediction one day on.
 
     Parameters
     ----------
@@ -99,12 +103,14 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
     mu[:, 1:] = np.einsum("bts,ts->bt", at[:, :-1], Z[1:])
     var[:, 1:] = np.einsum("bts,ts->bt", Pt[:, :-1], Z[1:] ** 2)
     var += np.asarray(result["sigma_h"])[:, None] ** 2
-    return np.exp(mu + 0.5 * var) * np.asarray(result["response_norm"])[:, None]
+    return result["transform"].inverse(mu, var, result)
 
 
 @dataclass(frozen=True)
 class SspDow:
     """Weekday-dummy SSP fitted by MAP: ``fit_batch_series_opt`` with ``predict_batch_series_opt``.
+
+    Each series is fitted to ``transform`` of its sales, by default the log of its sales over their mean.
 
     The design matrix has one column per weekday from Tuesday to Sunday, with Monday dropped. Without
     ``level`` there is no column of ones, so Monday rows are all zero and every Monday forecast is the
@@ -116,6 +122,9 @@ class SspDow:
     ----------
     level : bool
         Lead the design matrix with a column of ones, the level state, by default False.
+    transform : Transform
+        Target transform of ``fit_batch_series_opt``, by default ``LogTransform()``: each series is fitted to
+        ``log(max(sales, 0.1) / mean)`` and its forecasts are inverted as lognormal means.
     n_iter : int
         Adam optimisation steps per fit run, by default 100.
     lr : float
@@ -129,14 +138,17 @@ class SspDow:
     """
 
     level: bool = False
+    transform: Transform = LogTransform()
     n_iter: int = 100
     lr: float = 3e-2
     chunk_size: int | None = 4096
     fit_chunk: int | None = None
 
-    #: Per-series outputs of ``fit_batch_series_opt`` returned as ``fitted``. The filtered states ``at`` and
-    #: ``Pt`` (n_series x n_steps x n_states each) are only needed to forecast, so they are dropped per run.
-    FITTED_KEYS = ("sigma_h", "sigma_q", "response_norm", "final_loss")
+    #: Outputs of ``fit_batch_series_opt`` not returned as ``fitted``: the filtered states ``at`` and ``Pt``
+    #: (n_series x n_steps x n_states each), only needed to forecast, and the inputs shared by every series.
+    #: The rest are per series (``sigma_h``, ``sigma_q``, ``final_loss`` and the transform's parameters, e.g.
+    #: ``response_norm``), so the parameters of any transform are returned.
+    DROPPED_KEYS = ("at", "Pt", "Z", "a0", "P0", "transform")
 
     def fit_forecast(
         self,
@@ -154,8 +166,8 @@ class SspDow:
         rounding: a different batch shape vectorises differently, and 100 Adam steps can amplify that to a
         relative difference of up to ~4e-4 on a few series.
 
-        See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds the
-        :attr:`FITTED_KEYS` outputs of ``fit_batch_series_opt`` and, under :data:`INSAMPLE_KEY`, the
+        See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds the outputs of
+        ``fit_batch_series_opt`` but the :attr:`DROPPED_KEYS` and, under :data:`INSAMPLE_KEY`, the
         one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`).
         """
         # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
@@ -169,7 +181,7 @@ class SspDow:
         n_series = sales.shape[0]
         step = self.fit_chunk or n_series
         n_runs = math.ceil(n_series / step)
-        fitted: dict[str, list[np.ndarray]] = {key: [] for key in (*self.FITTED_KEYS, INSAMPLE_KEY)}
+        fitted: dict[str, list[np.ndarray]] = {}
         forecasts = []
         for run, start in enumerate(range(0, n_series, step), start=1):
             end = min(start + step, n_series)
@@ -183,11 +195,13 @@ class SspDow:
                 chunk_size=self.chunk_size,
                 log_every=100,
                 show_progress=True,
+                transform=self.transform,
             )
             forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
-            for key in self.FITTED_KEYS:
-                fitted[key].append(np.asarray(result[key]))
-            fitted[INSAMPLE_KEY].append(_one_step_ahead_fit(result, Z))
+            for key, value in result.items():
+                if key not in self.DROPPED_KEYS:
+                    fitted.setdefault(key, []).append(np.asarray(value))
+            fitted.setdefault(INSAMPLE_KEY, []).append(_one_step_ahead_fit(result, Z))
         return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
 
 

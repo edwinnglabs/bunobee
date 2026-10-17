@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the cycle position of step 0, e.g. the first day's weekday) and an `intercept` flag that prepends a
   column of ones. `build_forecast_design`, the M5 NUTS fit and the M5 run script all build their weekly
   dummies with it.
+- `bunobee.models.m5.transforms` — a `Transform` protocol for the target of the M5 MAP fitters (`fit`
+  per-series parameters on the fit days, `forward`, and `inverse` with the back-transform bias correction)
+  and `LogTransform`, the previously hard-coded `log(max(sales, 0.1) / mean)` target. `fit_one_series_opt`
+  and `fit_batch_series_opt` take a `transform` argument (default `LogTransform()`) and return its
+  parameters and the transform; the MAP predictors invert the fit's transform. Forecasts are unchanged.
 
 ### Changed
 

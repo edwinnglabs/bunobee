@@ -180,8 +180,9 @@ work (#114, #115) and the `sigma_h` cap (#116) are where the bias can be closed.
 
 | File | What to change there |
 |---|---|
-| `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the transform, parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast and back-transform |
-| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `n_iter`, `lr` and `fit_chunk` are the entry's fields |
+| `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
+| `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction) and `LogTransform`, the default. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
+| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `transform`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
 | `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
@@ -196,7 +197,8 @@ so adding a model needs only a new entry.
 ### The current model (`ssp_dow`)
 
 - **Transform:** it models `log(max(sales, 0.1) / mean)` with Gaussian noise, where `mean` is the series'
-  mean of `max(sales, 0.1)` over the fit days. Every zero-sales day becomes `log(0.1 / mean)`.
+  mean of `max(sales, 0.1)` over the fit days. Every zero-sales day becomes `log(0.1 / mean)`. This is
+  `LogTransform()`, the default `transform` of `SspDow`.
 - **Structure:** `y_t = Σ_i Z[t, i] · a[t, i] + noise`. The columns of `Z` are weekday indicators for
   Tuesday to Sunday (Monday is dropped), and each state `a_i` drifts as a random walk.
 - **Parameters:** 3 per series: the noise level, the drift of the first state and a drift shared by the

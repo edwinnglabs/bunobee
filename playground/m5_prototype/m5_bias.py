@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
-#: Floor applied to the sales before the means, as ``fit_batch_series_opt`` clips them before its log.
+#: Floor applied to the sales before the means, as the SSP models' ``LogTransform`` clips them before its log.
 SALES_FLOOR = 0.1
 
 #: Volume tercile labels, from the lowest mean sales over the fit days to the highest.

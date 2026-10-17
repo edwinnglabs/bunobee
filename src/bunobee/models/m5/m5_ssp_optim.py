@@ -5,6 +5,9 @@ The ``predict_*_opt`` helpers here are deprecated in favor of
 closed-form lognormal-mean correction has no posterior-replay equivalent. See each
 function's deprecation note for the migration path.
 
+The fitters take the target transform as an argument (see :mod:`bunobee.models.m5.transforms`), by default
+:class:`~bunobee.models.m5.transforms.LogTransform`, and the predictors invert the transform a fit used.
+
 This module drives the optimization-mode demo and is the only part of ``bunobee`` that
 needs ``optax`` and ``tqdm``. Those live behind the optional ``m5`` extra, so importing
 this module requires ``pip install 'bunobee[m5]'``.
@@ -30,6 +33,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the m5
 
 from ..ssp.kalman_1d import kalman_filter_1d
 from ..ssp.vfactory import make_kalman_batch
+from .transforms import LogTransform, Transform
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +58,14 @@ def fit_one_series_opt(
     patience: int | None = 50,
     tol: float = 1e-5,
     log_every: int | None = None,
+    transform: Transform = LogTransform(),
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model via MAP (Adam optimiser).
 
     Uses the same Kalman filter and prior specification as ``fit_one_series`` but
     replaces NUTS with gradient-based MAP estimation — much faster, no posterior
-    uncertainty.
+    uncertainty. The model is fitted to ``transform.forward(sales)``, with the
+    transform's parameters fitted on ``sales`` first.
 
     Parameters
     ----------
@@ -79,17 +85,20 @@ def fit_one_series_opt(
         Minimum loss improvement to reset the patience counter, by default 1e-5.
     log_every : int | None
         Log loss at this step interval via DEBUG. ``None`` disables logging.
+    transform : Transform
+        Target transform, by default :class:`LogTransform`: the model is fitted to
+        ``log(max(sales, 0.1) / mean)``.
 
     Returns
     -------
     dict
         Keys: ``at`` (n_steps, n_states), ``sigma_h`` (float), ``sigma_q``
-        (n_states,), ``response_norm`` (float), ``Z``, ``a0``, ``P0``,
-        ``losses`` (list[float]), ``n_iter_run`` (int).
+        (n_states,), the transform's parameters (``response_norm`` for the log
+        transform), ``transform``, ``Z``, ``a0``, ``P0``, ``losses``
+        (list[float]), ``n_iter_run`` (int).
     """
-    sales_clipped = np.clip(sales, 1e-1, None).astype(np.float32)
-    response_norm = float(sales_clipped.mean())
-    y = jnp.array(np.log(sales_clipped / response_norm))
+    transform_params = transform.fit(sales)
+    y = jnp.array(transform.forward(sales, transform_params))
 
     n_states = Z.shape[1]
 
@@ -188,7 +197,8 @@ def fit_one_series_opt(
         "Pt": np.array(Pt),  # (n_steps, n_states) filtered diagonal covariances
         "sigma_h": sigma_h,
         "sigma_q": np.array(sigma_q),
-        "response_norm": response_norm,
+        **transform_params,
+        "transform": transform,
         "Z": Z,
         "a0": a0,
         "P0": P0,
@@ -201,9 +211,11 @@ def predict_one_series_opt(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Generate lognormal-mean forecasts from a MAP-fitted single-series model.
+    """Generate point forecasts from a MAP-fitted single-series model.
 
-    Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
+    The forecast mean and variance on the transformed scale are mapped back to
+    units by ``transform.inverse`` of the fit's transform. The default log transform
+    applies the Jensen / lognormal correction (+0.5·Var) so that the back-
     transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
 
     .. deprecated::
@@ -220,7 +232,8 @@ def predict_one_series_opt(
     Parameters
     ----------
     fit_result : dict
-        Output of ``fit_one_series_opt()``.
+        Output of ``fit_one_series_opt()``. Without a ``transform`` key the
+        forecast is inverted as :class:`LogTransform` inverts it.
     Z_future : np.ndarray | None
         (horizon, n_states) pre-built future design matrix.
 
@@ -232,7 +245,7 @@ def predict_one_series_opt(
     at = fit_result["at"]
     Pt = fit_result["Pt"]  # (n_steps, n_states) diagonal covariances
     sigma_h = float(fit_result["sigma_h"])
-    response_norm = fit_result["response_norm"]
+    transform = fit_result.get("transform", LogTransform())
 
     Z_future = np.asarray(Z_future)  # (horizon, n_states)
     a_last = at[-1]  # (n_states,)
@@ -248,7 +261,7 @@ def predict_one_series_opt(
     Z_sq = Z_future**2  # (horizon, n_states)
     var_future = Z_sq @ P_last + sigma_h**2
 
-    return np.exp(mu_future + 0.5 * var_future) * response_norm
+    return transform.inverse(mu_future, var_future, fit_result)
 
 
 def fit_batch_series_opt(
@@ -259,12 +272,14 @@ def fit_batch_series_opt(
     chunk_size: int | None = 4096,
     log_every: int | None = None,
     show_progress: bool = False,
+    transform: Transform = LogTransform(),
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model for B series in parallel.
 
     Uses ``jax.vmap`` to batch the Kalman filter across series and runs Adam
     optimisation for a fixed number of steps, tracking the best parameters
-    per series.
+    per series. Each series is fitted to ``transform.forward`` of its sales,
+    with its transform parameters fitted on its sales first.
 
     Parameters
     ----------
@@ -283,19 +298,22 @@ def fit_batch_series_opt(
         Log mean loss at this step interval via DEBUG. ``None`` disables.
     show_progress : bool
         Display a ``tqdm`` progress bar over optimisation steps, by default False.
+    transform : Transform
+        Target transform, by default :class:`LogTransform`: each series is fitted
+        to ``log(max(sales, 0.1) / mean)``.
 
     Returns
     -------
     dict
         Keys: ``at`` (B, n_steps, n_states), ``sigma_h`` (B,),
-        ``sigma_q`` (B, n_states), ``response_norm`` (B,), ``Z``,
+        ``sigma_q`` (B, n_states), the transform's parameters (B,) each
+        (``response_norm`` for the log transform), ``transform``, ``Z``,
         ``a0``, ``P0``, ``final_loss`` (B,).
     """
     B = sales_matrix.shape[0]
 
-    sales_clipped = np.clip(sales_matrix, 1e-1, None).astype(np.float32)
-    response_norm = sales_clipped.mean(axis=1)  # (B,)
-    y = jnp.array(np.log(sales_clipped / response_norm[:, None]))  # (B, n_steps)
+    transform_params = transform.fit(sales_matrix)  # (B,) each
+    y = jnp.array(transform.forward(sales_matrix, transform_params))  # (B, n_steps)
 
     n_states = Z.shape[1]
     a0 = jnp.zeros(n_states)
@@ -406,7 +424,8 @@ def fit_batch_series_opt(
         "Pt": np.array(Pt),  # (B, n_steps, n_states) filtered diagonal covariances
         "sigma_h": np.array(sigma_h),  # (B,)
         "sigma_q": np.array(sigma_q),  # (B, n_states)
-        "response_norm": response_norm,  # (B,)
+        **transform_params,  # (B,) each
+        "transform": transform,
         "Z": Z,
         "a0": a0,
         "P0": P0,
@@ -418,9 +437,11 @@ def predict_batch_series_opt(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Generate lognormal-mean forecasts for B series from a batch-fitted model.
+    """Generate point forecasts for B series from a batch-fitted model.
 
-    Applies the Jensen / lognormal correction (+0.5·Var) so that the back-
+    The forecast means and variances on the transformed scale are mapped back to
+    units by ``transform.inverse`` of the fit's transform. The default log transform
+    applies the Jensen / lognormal correction (+0.5·Var) so that the back-
     transformed forecast is an unbiased estimate of E[Y] rather than exp(E[log Y]).
 
     .. deprecated::
@@ -435,7 +456,8 @@ def predict_batch_series_opt(
     Parameters
     ----------
     fit_result : dict
-        Output of ``fit_batch_series_opt()``.
+        Output of ``fit_batch_series_opt()``. Without a ``transform`` key the
+        forecasts are inverted as :class:`LogTransform` inverts them.
     Z_future : np.ndarray | None
         (horizon, n_states) future design matrix, shared across all series.
 
@@ -447,7 +469,7 @@ def predict_batch_series_opt(
     at = fit_result["at"]  # (B, n_steps, n_states)
     Pt = fit_result["Pt"]  # (B, n_steps, n_states) diagonal covariances
     sigma_h = np.asarray(fit_result["sigma_h"])  # (B,)
-    response_norm = fit_result["response_norm"]  # (B,)
+    transform = fit_result.get("transform", LogTransform())
 
     Z_future = np.asarray(Z_future)  # (horizon, n_states)
     a_last = at[:, -1, :]  # (B, n_states)
@@ -463,4 +485,4 @@ def predict_batch_series_opt(
     Z_sq = Z_future**2  # (horizon, n_states)
     var_future = P_last @ Z_sq.T + (sigma_h**2)[:, None]  # (B, horizon)
 
-    return np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
+    return transform.inverse(mu_future, var_future, fit_result)
