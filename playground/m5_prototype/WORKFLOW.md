@@ -77,8 +77,10 @@ WRMSSE, the competition metric, as computed by `m5_score_submission.py`:
 Every level counts equally, so the store and department totals matter as much as the 30,490 items.
 
 In `output/<timestamp>/`, `wrmsse_per_level.csv` gives the score of each level and a bias column showing
-whether forecasts run high or low. That's where to look for what to fix. `forecasts.pdf` plots forecast
-against actual for 50 series.
+whether forecasts run high or low. That's where to look for what to fix. `forecasts.pdf` shows where: for
+each cutoff day, the total, store and department sums of the fitted series, then 50 series picked at random,
+by worst RMSSE or by top weight (`--plot-select random|worst|top`). Each panel draws the actuals, the
+model's in-sample fit and the forecast, with the RMSSE, bias and weight in its title.
 
 ## The experiment loop
 
@@ -112,7 +114,9 @@ Baseline, the current model (`ssp_dow`):
 
 An entry's `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` gets the whole dataset, the series to
 fit and the fit and forecast days. It returns forecasts (series × 28) with no NaNs and a dict of per-series
-arrays, which `m5_run.py` saves to `batch_params.npz` and plots in `diagnostics.png`. Everything else
+arrays, which `m5_run.py` saves to `batch_params.npz` and plots in `diagnostics.png`. The dict can also hold
+the model's in-sample fit (series × fit days) under `insample`, which `forecasts.pdf` draws; `ssp_dow`
+returns each fit day's one-step-ahead prediction, back-transformed as its forecast is. Everything else
 (data loading, both cutoff days, the submission, the scoring) lives in `m5_run.py` and works with any model,
 so adding a model needs only a new entry.
 

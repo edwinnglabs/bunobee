@@ -15,6 +15,9 @@ Usage examples
 # Fit all 30,490 series with a named model and generate a submission CSV:
     python m5_run.py --model ssp_dow --n-demo 0
 
+# Review the 20 worst-forecast series of a quick loop in forecasts.pdf:
+    python m5_run.py --n-demo 3000 --origins validation --plot-select worst --n-plot 20
+
 ``--model`` picks an entry of ``MODELS`` in ``m5_models``: a model plus its settings (for ``ssp_dow``, the
 optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
 needs only a new entry there.
@@ -26,6 +29,11 @@ both:
     evaluation : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows)
 
 ``submission.csv`` needs every series at both origins, so only a full run with both origins writes it.
+
+``forecasts.pdf`` reviews each fitted origin: first the total, store and department sums of the fitted
+series, then ``--n-plot`` series picked by ``--plot-select`` (at random, by worst RMSSE or by top dollar-sales
+weight). Every panel shows the last ``PLOT_HISTORY`` fit days, the actuals and the forecast over the forecast
+window, and the model's in-sample fit when the model returns one (``m5_models.INSAMPLE_KEY``).
 
 The run scores each origin's forecasts with the 12-level hierarchical WRMSSE and writes the per-level
 tables to ``wrmsse_per_level.csv`` in the run directory, one ``window`` per origin. The evaluation window
@@ -49,7 +57,7 @@ import resource
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -57,10 +65,11 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from m5_common import DATA_DIR, load_m5_ds
-from m5_models import DEFAULT_MODEL, MODELS
-from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, log_per_level
+from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
+from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, dollar_sales, log_per_level, rmsse_scale
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -77,6 +86,19 @@ ORIGINS: dict[str, tuple[str, ...]] = {
 
 #: File name of the run log in ``--output-dir``, next to the run directories.
 RUN_LOG = "runs.csv"
+
+#: ``--plot-select`` choice -> how ``forecasts.pdf`` orders the fitted series before taking ``--n-plot``.
+PLOT_SELECT: dict[str, str] = {"random": "picked at random", "worst": "worst RMSSE first", "top": "top weight first"}
+
+#: Fit days ``forecasts.pdf`` shows before each forecast origin.
+PLOT_HISTORY = 90
+
+#: Sums of the fitted series ``forecasts.pdf`` draws after the total: panel name prefix -> the ``series_id``
+#: coordinate they group by.
+PLOT_SUMS: dict[str, str] = {"store": "store_id", "dept": "dept_id"}
+
+#: Line colours of ``forecasts.pdf``: the first three slots of a colourblind-checked categorical palette.
+_PLOT_COLORS = {"actual": "#2a78d6", "forecast": "#eb6834", "insample": "#1baf7a"}
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +150,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         metavar="N",
-        help="Number of series to include in forecasts.pdf. 0 = all fitted series.",
+        help="Number of series to include in forecasts.pdf per origin, after the total, store and department "
+        "sums. 0 = all fitted series.",
+    )
+    p.add_argument(
+        "--plot-select",
+        choices=tuple(PLOT_SELECT),
+        default="random",
+        help="How to pick the --n-plot series at each origin: random, worst (highest RMSSE over the forecast "
+        "window) or top (highest dollar-sales weight), by default random.",
     )
     p.add_argument(
         "--plots-per-page", type=int, default=5, metavar="N", help="Forecast subplots per PDF page, by default 5."
@@ -141,7 +171,9 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _check_model_output(model_name: str, forecasts: np.ndarray, fitted: dict[str, np.ndarray], n_series: int) -> None:
+def _check_model_output(
+    model_name: str, forecasts: np.ndarray, fitted: dict[str, np.ndarray], n_series: int, n_fit_days: int
+) -> None:
     """Raise if a model's ``fit_forecast`` output breaks the contract of ``m5_models.Model``.
 
     Parameters
@@ -151,9 +183,12 @@ def _check_model_output(model_name: str, forecasts: np.ndarray, fitted: dict[str
     forecasts : np.ndarray
         The model's forecasts; must have shape ``(n_series, HORIZON)`` and no NaN or infinite values.
     fitted : dict of str to np.ndarray
-        The model's per-series outputs; each must have leading dimension ``n_series``.
+        The model's per-series outputs; each must have leading dimension ``n_series``, and the in-sample
+        fit (``INSAMPLE_KEY``), if there is one, shape ``(n_series, n_fit_days)``.
     n_series : int
         Number of series the model was asked to fit.
+    n_fit_days : int
+        Number of days the model was asked to fit on.
 
     Raises
     ------
@@ -168,6 +203,11 @@ def _check_model_output(model_name: str, forecasts: np.ndarray, fitted: dict[str
     bad_keys = [key for key, value in fitted.items() if np.shape(value)[:1] != (n_series,)]
     if bad_keys:
         raise ValueError(f"{model_name}: fitted arrays {bad_keys} do not have leading dimension {n_series}")
+    if INSAMPLE_KEY in fitted and np.shape(fitted[INSAMPLE_KEY]) != (n_series, n_fit_days):
+        raise ValueError(
+            f"{model_name}: the in-sample fit {INSAMPLE_KEY!r} has shape {np.shape(fitted[INSAMPLE_KEY])}, expected "
+            f"{(n_series, n_fit_days)}"
+        )
 
 
 def _plot_fitted(fitted: dict[str, np.ndarray], title: str, output_path: Path) -> None:
@@ -205,6 +245,249 @@ def _plot_fitted(fitted: dict[str, np.ndarray], title: str, output_path: Path) -
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", output_path.name)
+
+
+@dataclass(frozen=True)
+class _Panels:
+    """The ``forecasts.pdf`` panels of one forecast origin: one row per series, or per sum of series.
+
+    Attributes
+    ----------
+    names : list of str
+        Panel name of each row: a ``series_id`` or the sum it is (``"Total"``, ``"store CA_1"``, ...).
+    dates : np.ndarray
+        The fit days, ``(n_fit_days,)``.
+    forecast_dates : np.ndarray
+        The forecast days, ``(HORIZON,)``.
+    history : np.ndarray
+        Sales over the fit days, ``(n_rows, n_fit_days)``. The panels show the last ``PLOT_HISTORY``; the
+        RMSSE scale uses all of them.
+    insample : np.ndarray or None
+        The model's in-sample fit over the last ``PLOT_HISTORY`` fit days, ``(n_rows, PLOT_HISTORY)``, or
+        None if the model returns none.
+    actual : np.ndarray
+        Sales over the forecast days, ``(n_rows, HORIZON)``; NaN where the dataset has no actuals.
+    forecast : np.ndarray
+        Forecasts over the forecast days, ``(n_rows, HORIZON)``.
+    weight : np.ndarray
+        Share of the fitted series' dollar sales over the last 28 fit days, ``(n_rows,)``: the WRMSSE
+        weight of the row at its level, among the fitted series.
+    """
+
+    names: list[str]
+    dates: np.ndarray
+    forecast_dates: np.ndarray
+    history: np.ndarray
+    insample: np.ndarray | None
+    actual: np.ndarray
+    forecast: np.ndarray
+    weight: np.ndarray
+
+    def rmsse(self) -> np.ndarray:
+        """RMSSE of each row's forecast over the forecast days, NaN for rows without actuals."""
+        return np.sqrt(np.mean((self.forecast - self.actual) ** 2, axis=1) / rmsse_scale(self.history))
+
+    def bias(self) -> np.ndarray:
+        """Each row's forecast total over its actual total, minus one; NaN without actuals or sales."""
+        actual = self.actual.sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(actual > 0, self.forecast.sum(axis=1) / actual - 1.0, np.nan)
+
+    def take(self, rows: np.ndarray) -> _Panels:
+        """The given rows, in the given order."""
+        return _Panels(
+            names=[self.names[row] for row in rows],
+            dates=self.dates,
+            forecast_dates=self.forecast_dates,
+            history=self.history[rows],
+            insample=None if self.insample is None else self.insample[rows],
+            actual=self.actual[rows],
+            forecast=self.forecast[rows],
+            weight=self.weight[rows],
+        )
+
+    def summed(self, names: list[str], members: np.ndarray) -> _Panels:
+        """Sums of rows: row ``i`` of the result sums the rows where ``members[i]`` is True.
+
+        Parameters
+        ----------
+        names : list of str
+            Panel name of each sum.
+        members : np.ndarray
+            Boolean ``(len(names), n_rows)`` membership of each sum.
+        """
+
+        def total(values: np.ndarray) -> np.ndarray:
+            return np.stack([values[row].sum(axis=0, dtype=np.float64) for row in members])
+
+        return _Panels(
+            names=names,
+            dates=self.dates,
+            forecast_dates=self.forecast_dates,
+            history=total(self.history),
+            insample=None if self.insample is None else total(self.insample),
+            actual=total(self.actual),
+            forecast=total(self.forecast),
+            weight=total(self.weight),
+        )
+
+
+def _origin_panels(
+    ds: xr.Dataset, fit_idx: np.ndarray, window: str, forecasts: np.ndarray, insample: np.ndarray | None
+) -> _Panels:
+    """Panels of the fitted series at one forecast origin, in fit order.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The M5 dataset.
+    fit_idx : np.ndarray
+        Positions along ``series_id`` of the fitted series.
+    window : str
+        Forecast origin, a key of ``WINDOWS``.
+    forecasts : np.ndarray
+        The origin's forecasts, ``(len(fit_idx), HORIZON)``.
+    insample : np.ndarray or None
+        The model's in-sample fit over the last ``PLOT_HISTORY`` fit days, or None.
+    """
+    split = ds["split"].values
+    fit_splits, forecast_split, _ = WINDOWS[window]
+    fit_mask, forecast_mask = np.isin(split, fit_splits), split == forecast_split
+    sales = ds["sales"].values[fit_idx]
+    dollars = dollar_sales(sales, ds["sell_price"].values[fit_idx], fit_mask)
+    dates = ds["date"].values
+    return _Panels(
+        names=list(ds["series_id"].values[fit_idx]),
+        dates=dates[fit_mask],
+        forecast_dates=dates[forecast_mask],
+        history=sales[:, fit_mask],
+        insample=insample,
+        actual=sales[:, forecast_mask],
+        forecast=forecasts,
+        weight=dollars / dollars.sum() if dollars.sum() > 0 else np.full(dollars.size, 1.0 / dollars.size),
+    )
+
+
+def _sum_panels(panels: _Panels, ds: xr.Dataset, fit_idx: np.ndarray) -> _Panels:
+    """The total of the fitted series, then their sum per group of each ``PLOT_SUMS`` coordinate.
+
+    Parameters
+    ----------
+    panels : _Panels
+        Panels of the fitted series, in fit order (:func:`_origin_panels`).
+    ds : xr.Dataset
+        The M5 dataset.
+    fit_idx : np.ndarray
+        Positions along ``series_id`` of the fitted series.
+    """
+    names, members = ["Total"], [np.ones(fit_idx.size, dtype=bool)]
+    for prefix, key in PLOT_SUMS.items():
+        labels = ds[key].values[fit_idx]
+        for group in np.unique(labels):
+            names.append(f"{prefix} {group}")
+            members.append(labels == group)
+    return panels.summed(names, np.stack(members))
+
+
+def _select_series(select: str, panels: _Panels, random_order: np.ndarray, n_plot: int) -> np.ndarray:
+    """Rows of the series ``forecasts.pdf`` draws, in drawing order.
+
+    Parameters
+    ----------
+    select : str
+        A ``PLOT_SELECT`` choice: ``"random"`` takes ``random_order``, ``"worst"`` the highest RMSSE first
+        (rows without actuals last) and ``"top"`` the highest weight first.
+    panels : _Panels
+        Panels of the fitted series.
+    random_order : np.ndarray
+        A random permutation of the rows of ``panels``.
+    n_plot : int
+        Number of rows to return.
+
+    Returns
+    -------
+    np.ndarray
+        ``n_plot`` row positions.
+    """
+    if select == "worst":
+        order = np.argsort(-panels.rmsse(), kind="stable")  # -NaN is NaN, which argsort puts last
+    elif select == "top":
+        order = np.argsort(-panels.weight, kind="stable")
+    else:
+        order = random_order
+    return order[:n_plot]
+
+
+def _panel_title(name: str, rmsse: float, bias: float, weight: float) -> str:
+    """Panel title: the name, then the RMSSE and bias when there are actuals, then the weight."""
+    parts = [name]
+    if np.isfinite(rmsse):
+        parts.append(f"RMSSE {rmsse:.2f}")
+    if np.isfinite(bias):
+        parts.append(f"bias {bias:+.1%}")
+    parts.append(f"weight {100 * weight:.3g}%")
+    return "   ".join(parts)
+
+
+def _draw_pages(pdf: PdfPages, panels: _Panels, title: str, per_page: int) -> int:
+    """Draw one panel per row of ``panels``, ``per_page`` panels to a page.
+
+    Each panel shows the last ``PLOT_HISTORY`` fit days and the forecast days: the sales (actuals included,
+    when the dataset has them), the in-sample fit when there is one, and the forecast.
+
+    Parameters
+    ----------
+    pdf : PdfPages
+        The PDF to append the pages to.
+    panels : _Panels
+        Rows to draw, in order.
+    title : str
+        Title of every page, before its page number.
+    per_page : int
+        Panels per page.
+
+    Returns
+    -------
+    int
+        Number of pages drawn.
+    """
+    rmsse, bias = panels.rmsse(), panels.bias()
+    dates = panels.dates[-PLOT_HISTORY:]
+    sales_dates = np.concatenate([dates, panels.forecast_dates])
+    sales = np.concatenate([panels.history[:, -PLOT_HISTORY:], panels.actual], axis=1)
+    # Halfway between the last fit day and the first forecast day.
+    origin = dates[-1] + (panels.forecast_dates[0] - dates[-1]) / 2
+    n_rows = len(panels.names)
+    n_pages = math.ceil(n_rows / per_page)
+    for page in range(n_pages):
+        rows = range(page * per_page, min((page + 1) * per_page, n_rows))
+        fig, axes = plt.subplots(len(rows), 1, figsize=(12, 3 * len(rows)), sharex=True, squeeze=False)
+        axes = axes[:, 0]
+        for ax, row in zip(axes, rows):
+            ax.plot(sales_dates, sales[row], color=_PLOT_COLORS["actual"], linewidth=1.2, label="Actual")
+            if panels.insample is not None:
+                ax.plot(
+                    dates, panels.insample[row], color=_PLOT_COLORS["insample"], linewidth=1.2, label="In-sample fit"
+                )
+            ax.plot(
+                panels.forecast_dates,
+                panels.forecast[row],
+                color=_PLOT_COLORS["forecast"],
+                linewidth=1.5,
+                linestyle="--",
+                label="Forecast",
+            )
+            ax.axvline(origin, color="grey", linestyle=":", alpha=0.5)
+            ax.set_title(
+                _panel_title(panels.names[row], rmsse[row], bias[row], panels.weight[row]), fontsize=9, loc="left"
+            )
+            ax.set_ylabel("Units")
+        axes[0].legend(fontsize=8, loc="upper left")
+        fig.suptitle(f"{title}  (page {page + 1}/{n_pages})", y=1.01)
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+    return n_pages
 
 
 def _peak_rss_gib() -> float:
@@ -363,10 +646,10 @@ def main() -> None:
     fitted_by_window: dict[str, dict[str, np.ndarray]] = {}
     forecasts_by_window: dict[str, np.ndarray] = {}
     fit_seconds_by_window: dict[str, float] = {}
-    fit_mask_by_window: dict[str, np.ndarray] = {}
+    insample_by_window: dict[str, np.ndarray | None] = {}
     for window in windows:
         fit_splits, forecast_split, days = WINDOWS[window]
-        fit_mask = fit_mask_by_window[window] = np.isin(split, fit_splits)
+        fit_mask = np.isin(split, fit_splits)
         logger.info(
             "Origin %s: fit on %d days, forecast %s  (model %s: %s)",
             window,
@@ -380,7 +663,13 @@ def main() -> None:
             ds, fit_idx, fit_mask, split == forecast_split
         )
         fit_seconds_by_window[window] = time.time() - t0
-        _check_model_output(args.model, forecasts_by_window[window], fitted_by_window[window], n_fit)
+        _check_model_output(
+            args.model, forecasts_by_window[window], fitted_by_window[window], n_fit, int(fit_mask.sum())
+        )
+        # The in-sample fit is as large as the sales it fits, so only the days forecasts.pdf shows are kept, and
+        # it is neither histogrammed nor saved with the other fitted arrays.
+        insample = fitted_by_window[window].pop(INSAMPLE_KEY, None)
+        insample_by_window[window] = None if insample is None else np.asarray(insample)[:, -PLOT_HISTORY:]
         logger.info(
             "Fitted %d series in %.1fs  (%.1f ms/series, peak RSS so far %.1f GiB)",
             n_fit,
@@ -389,58 +678,59 @@ def main() -> None:
             _peak_rss_gib(),
         )
     fit_seconds = sum(fit_seconds_by_window.values())
-    # The diagnostics and the forecast PDF show the first origin fitted: validation, unless only evaluation is.
-    plot_window = windows[0]
-    fitted, forecasts = fitted_by_window[plot_window], forecasts_by_window[plot_window]
 
     # ------------------------------------------------------------------
-    # 5. Diagnostics plot
+    # 5. Diagnostics plot of the first origin fitted: validation, unless only evaluation is
     # ------------------------------------------------------------------
+    plot_window = windows[0]
     _plot_fitted(
-        fitted, title=f"{args.model} fitted outputs — {plot_window} origin", output_path=run_dir / "diagnostics.png"
+        fitted_by_window[plot_window],
+        title=f"{args.model} fitted outputs — {plot_window} origin",
+        output_path=run_dir / "diagnostics.png",
     )
 
     # ------------------------------------------------------------------
-    # 6. Forecast PDF (paginated, --plots-per-page series per page)
+    # 6. Forecast PDF: at each origin, the total, store and department sums of the fitted series, then
+    #    --n-plot series picked by --plot-select (paginated, --plots-per-page panels per page)
     # ------------------------------------------------------------------
     n_plot = n_fit if args.n_plot == 0 else min(args.n_plot, n_fit)
-    per_page = args.plots_per_page
-    n_pages = math.ceil(n_plot / per_page)
-    tail = 90
-    pdf_path = run_dir / "forecasts.pdf"
-    # Sales of the plotted series up to the plotted origin's cutoff day, so each forecast continues its history.
-    history = ds["sales"].values[fit_idx[:n_plot]][:, fit_mask_by_window[plot_window]]
-
-    with PdfPages(pdf_path) as pdf:
-        for page in range(n_pages):
-            start = page * per_page
-            end = min(start + per_page, n_plot)
-            page_ranks = range(start, end)
-            n_rows = end - start
-
-            fig, axes = plt.subplots(n_rows, 1, figsize=(12, 3 * n_rows), sharex=True, squeeze=False)
-            axes = axes[:, 0]
-
-            for ax, rank in zip(axes, page_ranks):
-                idx = fit_idx[rank]
-                forecast = forecasts[rank]
-                ax.plot(range(tail), history[rank, -tail:], label="Actual", alpha=0.7)
-                ax.plot(range(tail, tail + HORIZON), forecast, label="Forecast", linestyle="--", color="tomato")
-                ax.axvline(tail, color="grey", linestyle=":", alpha=0.5)
-                ax.set_title(series_ids[idx], fontsize=9, loc="left")
-                ax.set_ylabel("Units")
-                ax.legend(fontsize=8)
-
-            axes[-1].set_xlabel("Day")
-            fig.suptitle(
-                f"{args.model} forecast, {plot_window} origin — {label}  (page {page + 1}/{n_pages})",
-                y=1.01,
+    # One random order for every origin, so --plot-select random draws the same series at each.
+    random_order = rng.permutation(n_fit)
+    n_pages = 0
+    with PdfPages(run_dir / "forecasts.pdf") as pdf:
+        for window in windows:
+            panels = _origin_panels(ds, fit_idx, window, forecasts_by_window[window], insample_by_window[window])
+            heading = f"{args.model} forecast, {window} origin"
+            n_pages += _draw_pages(
+                pdf,
+                _sum_panels(panels, ds, fit_idx),
+                f"{heading} — total, store and department sums of the {n_fit} series [{label}]",
+                args.plots_per_page,
             )
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
+            select = args.plot_select
+            if select == "worst" and not np.isfinite(panels.actual).any():
+                logger.warning(
+                    "forecasts.pdf picks the %s-origin series at random: the dataset has no actuals for %s, so "
+                    "there is no RMSSE to pick the worst by.",
+                    window,
+                    WINDOWS[window][2],
+                )
+                select = "random"
+            rows = _select_series(select, panels, random_order, n_plot)
+            n_pages += _draw_pages(
+                pdf,
+                panels.take(rows),
+                f"{heading} — {n_plot} of the {n_fit} series [{label}], {PLOT_SELECT[select]}",
+                args.plots_per_page,
+            )
 
-    logger.info("Saved forecasts.pdf  (%d series, %d pages)", n_plot, n_pages)
+    logger.info(
+        "Saved forecasts.pdf  (%s; sums and %d series each, %s; %d pages)",
+        " and ".join(windows),
+        n_plot,
+        PLOT_SELECT[args.plot_select],
+        n_pages,
+    )
 
     # ------------------------------------------------------------------
     # 7. Save the model's fitted outputs: validation-origin arrays under their own names, evaluation-origin

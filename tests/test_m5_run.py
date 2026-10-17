@@ -1,8 +1,12 @@
-"""Unit tests for the run log of ``playground/m5_prototype/m5_run.py``.
+"""Unit tests for the run log and the forecast review of ``playground/m5_prototype/m5_run.py``.
 
 Every run appends one row to ``output/runs.csv`` (issue #104), and the Kaggle scores of a submitted run are
 typed into its row by hand. These tests check that appending keeps such hand-typed values verbatim and that
 a column added to the row later does not break an existing log.
+
+``forecasts.pdf`` (issue #105) draws the total, store and department sums of the fitted series, then series
+picked at random, by worst RMSSE or by top dollar-sales weight. These tests check the sums, the RMSSE, bias
+and weight in the panel titles against the scorer, and the picking, on a tiny synthetic dataset.
 
 The runner is a playground script, not part of the package, so it is loaded by path as
 ``tests/test_m5_models.py`` loads the model registry.
@@ -10,13 +14,19 @@ The runner is a playground script, not part of the package, so it is loaded by p
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
 
+import matplotlib
+import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
+
+matplotlib.use("Agg")  # headless backend; must precede m5_run's pyplot import
 
 pytest.importorskip("optax", reason="needs the optional 'm5' extra: pip install 'bunobee[m5]'")
 
@@ -112,3 +122,101 @@ class TestRunLog:
 
         log = pd.read_csv(path, dtype=str, keep_default_na=False)
         assert list(log["peak_rss_gib"]) == ["", "3.5"]
+
+
+# Review dataset: 4 series in 2 stores x 2 departments, N_FIT_DAYS fit days, then the 28 validation days.
+N_FIT_DAYS = 35
+HORIZON = 28
+LEVELS = np.array([1.0, 3.0, 6.0, 10.0])
+PRICES = np.array([1.0, 2.0, 0.5, 4.0])
+# Forecast = actual + OFFSETS. Every series alternates level, level + 1, so its RMSSE scale is 1 and its RMSSE
+# is its offset: worst first is 2, 0, 3, 1.
+OFFSETS = np.array([2.0, 0.0, 5.0, 1.0])
+# Dollar sales over the last 28 fit days: (28 x level + 14) x price = 42, 196, 91, 1176; top first is 3, 1, 2, 0.
+DOLLARS = (28 * LEVELS + 14) * PRICES
+
+
+@pytest.fixture(scope="module")
+def review_ds() -> xr.Dataset:
+    """M5-shaped dataset whose RMSSE, weights and sums are worked out by hand above."""
+    n_dates = N_FIT_DAYS + HORIZON
+    sales = (LEVELS[:, None] + np.arange(n_dates) % 2).astype(np.float32)
+    return xr.Dataset(
+        {
+            "sales": (("series_id", "date"), sales),
+            "sell_price": (("series_id", "date"), np.repeat(PRICES[:, None], n_dates, axis=1).astype(np.float32)),
+        },
+        coords={
+            "series_id": ["F_1_CA_1", "H_1_CA_1", "F_1_CA_2", "H_1_CA_2"],
+            "item_id": ["F_1", "H_1", "F_1", "H_1"],
+            "dept_id": ["FOODS_1", "HOBBIES_1", "FOODS_1", "HOBBIES_1"],
+            "cat_id": ["FOODS", "HOBBIES", "FOODS", "HOBBIES"],
+            "store_id": ["CA_1", "CA_1", "CA_2", "CA_2"],
+            "state_id": ["CA"] * 4,
+            "date": pd.date_range("2016-01-01", periods=n_dates),
+            "split": ("date", np.array(["train"] * N_FIT_DAYS + ["validation"] * HORIZON)),
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def panels(review_ds) -> "m5_run._Panels":
+    """Validation-origin panels of all four series, fitted in dataset order, with forecast = actual + OFFSETS."""
+    fit_idx = np.arange(4)
+    forecasts = review_ds["sales"].values[:, N_FIT_DAYS:] + OFFSETS[:, None]
+    insample = np.arange(4 * N_FIT_DAYS, dtype=np.float64).reshape(4, N_FIT_DAYS)
+    return m5_run._origin_panels(review_ds, fit_idx, "validation", forecasts, insample)
+
+
+class TestForecastReview:
+    def test_series_panels_carry_rmsse_and_weight(self, panels):
+        np.testing.assert_allclose(panels.rmsse(), OFFSETS)
+        np.testing.assert_allclose(panels.weight, DOLLARS / DOLLARS.sum())
+        assert panels.history.shape == (4, N_FIT_DAYS)
+        assert panels.actual.shape == panels.forecast.shape == (4, HORIZON)
+
+    def test_sums_are_the_total_then_each_store_and_department(self, review_ds, panels):
+        sums = m5_run._sum_panels(panels, review_ds, np.arange(4))
+
+        assert sums.names == ["Total", "store CA_1", "store CA_2", "dept FOODS_1", "dept HOBBIES_1"]
+        members = np.array([[1, 1, 1, 1], [1, 1, 0, 0], [0, 0, 1, 1], [1, 0, 1, 0], [0, 1, 0, 1]], dtype=float)
+        for field in ("history", "insample", "actual", "forecast", "weight"):
+            np.testing.assert_allclose(getattr(sums, field), members @ getattr(panels, field), err_msg=field)
+
+    def test_total_panel_matches_the_level_1_score(self, review_ds, panels):
+        # The Total panel's RMSSE and bias are the scorer's level-1 WRMSSE and bias of the same forecasts.
+        sums = m5_run._sum_panels(panels, review_ds, np.arange(4))
+        level_1 = m5_run.compute_hierarchical_wrmsse(
+            review_ds, panels.forecast.astype(np.float64), review_ds["series_id"].values, window="validation"
+        ).iloc[0]
+
+        assert sums.rmsse()[0] == pytest.approx(level_1["wrmsse"])
+        assert sums.bias()[0] == pytest.approx(level_1["bias_pct"] / 100)
+
+    @pytest.mark.parametrize("select, expected", [("worst", [2, 0, 3]), ("top", [3, 1, 2]), ("random", [1, 3, 0])])
+    def test_select_series(self, panels, select, expected):
+        rows = m5_run._select_series(select, panels, random_order=np.array([1, 3, 0, 2]), n_plot=3)
+
+        assert list(rows) == expected
+
+    def test_without_actuals_there_is_no_rmsse_or_bias_in_the_title(self, panels):
+        no_actuals = dataclasses.replace(panels, actual=np.full_like(panels.actual, np.nan))
+
+        assert np.isnan(no_actuals.rmsse()).all() and np.isnan(no_actuals.bias()).all()
+        assert m5_run._panel_title("F_1_CA_1", np.nan, np.nan, 0.25) == "F_1_CA_1   weight 25%"
+        assert m5_run._panel_title("Total", 0.804, -0.1013, 1.0) == "Total   RMSSE 0.80   bias -10.1%   weight 100%"
+
+    def test_pages_hold_per_page_panels(self, tmp_path, review_ds, panels):
+        sums = m5_run._sum_panels(panels, review_ds, np.arange(4))
+        with m5_run.PdfPages(tmp_path / "forecasts.pdf") as pdf:
+            assert m5_run._draw_pages(pdf, sums, "sums", per_page=2) == 3
+            assert m5_run._draw_pages(pdf, dataclasses.replace(panels, insample=None), "series", per_page=5) == 1
+            assert pdf.get_pagecount() == 4
+
+    def test_a_misshapen_insample_fit_is_rejected(self):
+        forecasts = np.zeros((4, m5_run.HORIZON))
+        m5_run._check_model_output("m", forecasts, {m5_run.INSAMPLE_KEY: np.zeros((4, N_FIT_DAYS))}, 4, N_FIT_DAYS)
+        with pytest.raises(ValueError, match="in-sample fit"):
+            m5_run._check_model_output(
+                "m", forecasts, {m5_run.INSAMPLE_KEY: np.zeros((4, N_FIT_DAYS - 1))}, 4, N_FIT_DAYS
+            )

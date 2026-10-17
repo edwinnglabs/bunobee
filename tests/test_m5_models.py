@@ -3,7 +3,8 @@
 ``m5_run.py --model NAME`` fits ``MODELS[NAME]``, so adding a model needs only a new entry there (issue #103).
 These tests hold every entry to the contract the runner relies on, and check that the baseline entry
 ``ssp_dow`` keeps the model of the #94 submission: weekday dummies from Tuesday to Sunday with no column of
-ones, fitted in independent runs of at most ``fit_chunk`` series.
+ones, fitted in independent runs of at most ``fit_chunk`` series. Its in-sample fit, drawn in
+``forecasts.pdf`` (issue #105), is checked against the Kalman filter's own one-step-ahead prediction.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -19,6 +20,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from types import ModuleType
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import xarray as xr
@@ -57,6 +59,9 @@ def _load_script(name: str) -> ModuleType:
 
 
 m5_models = _load_script("m5_models")
+
+from bunobee.models.ssp.kalman_1d import kalman_filter_1d  # noqa: E402
+from bunobee.regression import make_periodic_dummies  # noqa: E402
 
 # Calendar: 8 fit weeks, then one 28-day forecast window. Day 0 is a Saturday (Mon=0), as d_1 is in M5.
 N_SERIES = 4
@@ -116,6 +121,9 @@ class TestContract:
         assert np.isfinite(forecasts).all()
         for key, value in fitted.items():
             assert np.shape(value)[0] == series_idx.size, key
+        if m5_models.INSAMPLE_KEY in fitted:
+            assert fitted[m5_models.INSAMPLE_KEY].shape == (series_idx.size, N_FIT)
+            assert np.isfinite(fitted[m5_models.INSAMPLE_KEY]).all()
 
 
 class TestSspDow:
@@ -136,5 +144,27 @@ class TestSspDow:
         chunked, fitted = m5_models.SspDow(n_iter=20, fit_chunk=3).fit_forecast(ds, order, FIT_MASK, FORECAST_MASK)
         np.testing.assert_allclose(chunked, forecasts[order], rtol=1e-3)
         assert {key: value.shape[0] for key, value in fitted.items()} == dict.fromkeys(
-            m5_models.SspDow.FITTED_KEYS, N_SERIES
+            (*m5_models.SspDow.FITTED_KEYS, m5_models.INSAMPLE_KEY), N_SERIES
         )
+        np.testing.assert_allclose(
+            fitted[m5_models.INSAMPLE_KEY], ssp_dow_fit[1][m5_models.INSAMPLE_KEY][order], rtol=1e-3
+        )
+
+    def test_insample_fit_is_the_filters_one_step_ahead_prediction(self, ds, ssp_dow_fit):
+        # Rerun the filter with each series' fitted parameters: its innovation v_t = y_t - yhat_t and variance
+        # F_t give the one-step-ahead prediction of the log sales, back-transformed as the forecast is.
+        _, fitted = ssp_dow_fit
+        Z = jnp.asarray(make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW)[FIT_MASK])
+        sales = np.clip(ds["sales"].values[:, FIT_MASK], 1e-1, None)
+        for i in range(N_SERIES):
+            y = np.log(sales[i] / fitted["response_norm"][i]).astype(np.float32)
+            _, _, _, vt, Ft, _ = kalman_filter_1d(
+                a0=jnp.zeros(Z.shape[1]),
+                P0=jnp.ones(Z.shape[1]),
+                Z=Z,
+                sigma_h=fitted["sigma_h"][i],
+                sigma_q=fitted["sigma_q"][i],
+                y=jnp.asarray(y),
+            )
+            expected = np.exp(y - np.asarray(vt)[:, 0] + 0.5 * np.asarray(Ft)[:, 0]) * fitted["response_norm"][i]
+            np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)

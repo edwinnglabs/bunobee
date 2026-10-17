@@ -200,7 +200,7 @@ class TestRmsseScale:
             ]
         )
 
-        np.testing.assert_allclose(scorer._rmsse_scale(y), [2.5, 7.25, 1.0, 1.0])
+        np.testing.assert_allclose(scorer.rmsse_scale(y), [2.5, 7.25, 1.0, 1.0])
 
     def test_launch_zeros_do_not_shrink_the_hierarchy_scale(self):
         # Every series, and so every aggregate, launches on day 7. The trimmed level-1 scale is 16 (4^2),
