@@ -104,7 +104,8 @@ model, add an entry; `m5_run.py` needs no change.
 
 | Entry | Model | Settings |
 |---|---|---|
-| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The model of both Kaggle submissions | `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
+| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The default, and the model of the #93 and #94 Kaggle submissions | `level=False`, `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
+| `ssp_level_dow` | `ssp_dow` with a level state: a column of ones leads the weekday dummies, so 7 states (#106) | `level=True`, otherwise as `ssp_dow` |
 
 ## Reference results
 
