@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""M5 SSP forecasting script — batch MAP estimation.
+"""M5 forecasting script — fit a registered model, forecast, score and write the submission.
 
 Usage examples
 --------------
-# Fit 10 random series (demo mode):
+# Fit 10 random series (demo mode) with the baseline model, ssp_dow:
     python m5_run.py
 
 # Fit 50 top-volume series:
     python m5_run.py --n-demo 50 --sample-mode top
 
-# Fit all 30,490 series and generate a submission CSV:
-    python m5_run.py --n-demo 0
+# Fit all 30,490 series with a named model and generate a submission CSV:
+    python m5_run.py --model ssp_dow --n-demo 0
 
-# Same, fitting 8,192 series at a time to cap peak memory:
-    python m5_run.py --n-demo 0 --fit-chunk 8192
+``--model`` picks an entry of ``MODELS`` in ``m5_models``: a model plus its settings (for ``ssp_dow``, the
+optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
+needs only a new entry there.
 
 Every run fits the selected series twice, once per forecast origin (see ``WINDOWS`` in
 ``m5_score_submission``):
@@ -27,7 +28,8 @@ scored only when the dataset carries its actuals (``m5_fetch.py`` + ``m5_preproc
 run aggregates and weights only its own series, so its score is a smoke test that the pipeline runs
 end to end, not a number comparable to the full 30,490-series score.
 
-Every run also writes its wall-clock time and peak memory to ``run_stats.json`` in the run directory.
+Every run also writes the model name and settings, its wall-clock time and peak memory to ``run_stats.json``
+in the run directory.
 """
 
 from __future__ import annotations
@@ -39,19 +41,17 @@ import math
 import resource
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 
-from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
-from bunobee.regression import make_periodic_dummies
-
 from m5_common import DATA_DIR, load_m5_ds
+from m5_models import DEFAULT_MODEL, MODELS
 from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, log_per_level
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -67,7 +67,13 @@ _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fit M5 SSP model and generate forecasts.")
+    p = argparse.ArgumentParser(description="Fit a registered M5 model and generate forecasts.")
+    p.add_argument(
+        "--model",
+        choices=tuple(MODELS),
+        default=DEFAULT_MODEL,
+        help=f"Registered model to fit (see MODELS in m5_models.py), by default {DEFAULT_MODEL}.",
+    )
     p.add_argument(
         "--data-dir",
         type=Path,
@@ -92,24 +98,6 @@ def _parse_args() -> argparse.Namespace:
         help="How to select demo series: random sample or top by total volume.",
     )
     p.add_argument("--seed", type=int, default=2026, help="RNG seed for reproducible random sampling.")
-    p.add_argument("--n-iter", type=int, default=100, help="Adam optimisation steps per series.")
-    p.add_argument("--lr", type=float, default=3e-2, help="Adam learning rate.")
-    p.add_argument(
-        "--chunk-size",
-        type=int,
-        default=4096,
-        metavar="N",
-        help="Max series per Kalman-filter vmap call. 0 = no chunking. All chunks share one gradient pass, "
-        "so this does not cap peak memory while fitting; use --fit-chunk for that.",
-    )
-    p.add_argument(
-        "--fit-chunk",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Fit at most N series per optimiser run, so peak memory scales with N rather than with the "
-        "number of series. 0 = one run over all series.",
-    )
     p.add_argument(
         "--n-plot",
         type=int,
@@ -127,75 +115,71 @@ def _parse_args() -> argparse.Namespace:
 # Helpers
 # ---------------------------------------------------------------------------
 
-#: Per-series outputs of ``fit_batch_series_opt`` kept after forecasting. The filtered states ``at`` and
-#: ``Pt`` (n_series x n_steps x n_states each) are only needed to forecast, so they are dropped per chunk.
-_FIT_KEYS = ("sigma_h", "sigma_q", "response_norm", "final_loss")
 
-
-def _fit_and_forecast(
-    sales: np.ndarray,
-    Z: jnp.ndarray,
-    Z_future: jnp.ndarray,
-    n_iter: int,
-    lr: float,
-    chunk_size: int | None,
-    fit_chunk: int | None,
-) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """Fit and forecast the series in independent runs of at most ``fit_chunk`` series.
-
-    ``fit_batch_series_opt`` chunks only its Kalman filter, inside one jitted ``value_and_grad``, so the
-    backward pass keeps every chunk's intermediates alive at once. Calling it once per ``fit_chunk``
-    series bounds that memory instead. The series are independent — the loss is a sum over series and
-    Adam updates each parameter on its own — so ``fit_chunk`` changes the forecasts only by float32
-    rounding: a different batch shape vectorises differently, and 100 Adam steps can amplify that to a
-    relative difference of up to ~4e-4 on a few series.
+def _check_model_output(model_name: str, forecasts: np.ndarray, fitted: dict[str, np.ndarray], n_series: int) -> None:
+    """Raise if a model's ``fit_forecast`` output breaks the contract of ``m5_models.Model``.
 
     Parameters
     ----------
-    sales : np.ndarray
-        Daily unit sales, shape ``(n_series, n_steps)``.
-    Z : jnp.ndarray
-        Design matrix over the fit window, shape ``(n_steps, n_states)``.
-    Z_future : jnp.ndarray
-        Design matrix over the forecast window, shape ``(horizon, n_states)``.
-    n_iter : int
-        Adam optimisation steps per run.
-    lr : float
-        Adam learning rate.
-    chunk_size : int | None
-        Max series per Kalman-filter ``vmap`` call within a run. ``None`` = no chunking.
-    fit_chunk : int | None
-        Max series per run. ``None`` = one run over all series.
-
-    Returns
-    -------
-    fit_params : dict of str to np.ndarray
-        The :data:`_FIT_KEYS` outputs of ``fit_batch_series_opt``, concatenated over runs in series order.
+    model_name : str
+        Registered name of the model, for the error message.
     forecasts : np.ndarray
-        Lognormal-mean forecasts, shape ``(n_series, horizon)``.
+        The model's forecasts; must have shape ``(n_series, HORIZON)`` and no NaN or infinite values.
+    fitted : dict of str to np.ndarray
+        The model's per-series outputs; each must have leading dimension ``n_series``.
+    n_series : int
+        Number of series the model was asked to fit.
+
+    Raises
+    ------
+    ValueError
+        If any of the above does not hold.
     """
-    n_series = sales.shape[0]
-    step = fit_chunk or n_series
-    n_runs = math.ceil(n_series / step)
-    fit_params: dict[str, list[np.ndarray]] = {key: [] for key in _FIT_KEYS}
-    forecasts = []
-    for run, start in enumerate(range(0, n_series, step), start=1):
-        end = min(start + step, n_series)
-        if n_runs > 1:
-            logger.info("Fit run %d/%d: series %d-%d", run, n_runs, start, end - 1)
-        result = fit_batch_series_opt(
-            sales[start:end],
-            n_iter=n_iter,
-            lr=lr,
-            Z=Z,
-            chunk_size=chunk_size,
-            log_every=100,
-            show_progress=True,
-        )
-        forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
-        for key in _FIT_KEYS:
-            fit_params[key].append(np.asarray(result[key]))
-    return {key: np.concatenate(parts) for key, parts in fit_params.items()}, np.concatenate(forecasts)
+    if np.shape(forecasts) != (n_series, HORIZON):
+        raise ValueError(f"{model_name}: forecasts have shape {np.shape(forecasts)}, expected {(n_series, HORIZON)}")
+    n_bad = int((~np.isfinite(forecasts)).any(axis=1).sum())
+    if n_bad:
+        raise ValueError(f"{model_name}: forecasts of {n_bad} / {n_series} series have NaN or infinite values")
+    bad_keys = [key for key, value in fitted.items() if np.shape(value)[:1] != (n_series,)]
+    if bad_keys:
+        raise ValueError(f"{model_name}: fitted arrays {bad_keys} do not have leading dimension {n_series}")
+
+
+def _plot_fitted(fitted: dict[str, np.ndarray], title: str, output_path: Path) -> None:
+    """Save one histogram per fitted array, with one series of bars per column of a 2-D array.
+
+    Parameters
+    ----------
+    fitted : dict of str to np.ndarray
+        Per-series outputs of a model, each with leading dimension ``n_series``.
+    title : str
+        Figure title.
+    output_path : Path
+        Where to save the figure.
+    """
+    if not fitted:
+        logger.info("Skipping diagnostics.png — the model returned no fitted arrays.")
+        return
+    n_cols = min(len(fitted), 3)
+    n_rows = math.ceil(len(fitted) / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows), squeeze=False)
+    for ax, (key, value) in zip(axes.flat, fitted.items()):
+        columns = np.asarray(value).reshape(len(value), -1)
+        for col in range(columns.shape[1]):
+            label = f"[:, {col}]" if columns.shape[1] > 1 else None
+            ax.hist(columns[:, col], bins=100, edgecolor="none", alpha=0.7, label=label)
+        if columns.shape[1] > 1:
+            ax.legend(fontsize=8)
+        ax.set_title(key)
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Count")
+    for ax in axes.flat[len(fitted) :]:
+        ax.set_visible(False)
+    fig.suptitle(title)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", output_path.name)
 
 
 def _peak_rss_gib() -> float:
@@ -304,42 +288,27 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Fit + predict, once per forecast origin
     # ------------------------------------------------------------------
-    chunk_size = args.chunk_size if args.chunk_size > 0 else None
-    fit_chunk = args.fit_chunk if args.fit_chunk > 0 else None
-    dow = ds["day_of_week"].values
-    sales_fit = ds["sales"].values[fit_idx]  # (n_fit, n_dates)
-    fit_params_by_window: dict[str, dict[str, np.ndarray]] = {}
+    model = MODELS[args.model]
+    settings = asdict(model)
+    fitted_by_window: dict[str, dict[str, np.ndarray]] = {}
     forecasts_by_window: dict[str, np.ndarray] = {}
     fit_seconds_by_window: dict[str, float] = {}
     for window, (fit_splits, forecast_split, days) in WINDOWS.items():
         fit_mask = np.isin(split, fit_splits)
-        n_fit_steps = int(fit_mask.sum())
-        # The forecast days follow the fit days, so one matrix covers both. Phasing step 0 at the first fit day's
-        # weekday (Mon=0) makes each column a weekday from Tuesday to Sunday, with Monday dropped.
-        weekly = make_periodic_dummies(n_fit_steps + HORIZON, period=7, phase=int(dow[fit_mask][0]))
-        Z = jnp.asarray(weekly[:n_fit_steps])  # (n_fit_steps, 6)
-        Z_future = jnp.asarray(weekly[n_fit_steps:])  # (horizon, 6)
         logger.info(
-            "Origin %s: fit on %d days, forecast %s  (n_iter=%d  lr=%g  chunk_size=%s  fit_chunk=%s)",
+            "Origin %s: fit on %d days, forecast %s  (model %s: %s)",
             window,
-            Z.shape[0],
+            fit_mask.sum(),
             days,
-            args.n_iter,
-            args.lr,
-            chunk_size,
-            fit_chunk,
+            args.model,
+            "  ".join(f"{key}={value}" for key, value in settings.items()),
         )
         t0 = time.time()
-        fit_params_by_window[window], forecasts_by_window[window] = _fit_and_forecast(
-            sales_fit[:, fit_mask],
-            Z=Z,
-            Z_future=Z_future,
-            n_iter=args.n_iter,
-            lr=args.lr,
-            chunk_size=chunk_size,
-            fit_chunk=fit_chunk,
+        forecasts_by_window[window], fitted_by_window[window] = model.fit_forecast(
+            ds, fit_idx, fit_mask, split == forecast_split
         )
         fit_seconds_by_window[window] = time.time() - t0
+        _check_model_output(args.model, forecasts_by_window[window], fitted_by_window[window], n_fit)
         logger.info(
             "Fitted %d series in %.1fs  (%.1f ms/series, peak RSS so far %.1f GiB)",
             n_fit,
@@ -349,30 +318,14 @@ def main() -> None:
         )
     fit_seconds = sum(fit_seconds_by_window.values())
     # The diagnostics and the forecast PDF show the validation origin, whose window has actuals in sales_matrix.
-    fit_params, forecasts = fit_params_by_window["validation"], forecasts_by_window["validation"]
+    fitted, forecasts = fitted_by_window["validation"], forecasts_by_window["validation"]
 
     # ------------------------------------------------------------------
     # 5. Diagnostics plot
     # ------------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3))
-
-    axes[0].hist(fit_params["final_loss"], bins=100, edgecolor="none")
-    axes[0].set_xlabel("Final neg-log-posterior")
-    axes[0].set_ylabel("Count")
-    axes[0].set_title("Loss distribution")
-
-    axes[1].hist(fit_params["sigma_h"], bins=100, edgecolor="none", alpha=0.7, label="σ_h")
-    axes[1].hist(fit_params["sigma_q"][:, 0], bins=100, edgecolor="none", alpha=0.7, label="σ_q level")
-    axes[1].hist(fit_params["sigma_q"][:, 1], bins=100, edgecolor="none", alpha=0.7, label="σ_q seas")
-    axes[1].set_xlabel("Value")
-    axes[1].set_ylabel("Count")
-    axes[1].set_title("MAP parameter distributions")
-    axes[1].legend(fontsize=8)
-
-    plt.tight_layout()
-    fig.savefig(run_dir / "diagnostics.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved diagnostics.png")
+    _plot_fitted(
+        fitted, title=f"{args.model} fitted outputs — validation origin", output_path=run_dir / "diagnostics.png"
+    )
 
     # ------------------------------------------------------------------
     # 6. Forecast PDF (paginated, --plots-per-page series per page)
@@ -406,7 +359,7 @@ def main() -> None:
 
             axes[-1].set_xlabel("Day")
             fig.suptitle(
-                f"SSP batch forecast — {label}  (page {page + 1}/{n_pages})",
+                f"{args.model} forecast — {label}  (page {page + 1}/{n_pages})",
                 y=1.01,
             )
             plt.tight_layout()
@@ -416,13 +369,13 @@ def main() -> None:
     logger.info("Saved forecasts.pdf  (%d series, %d pages)", n_plot, n_pages)
 
     # ------------------------------------------------------------------
-    # 7. Save fitted parameters
+    # 7. Save the model's fitted outputs
     # ------------------------------------------------------------------
     np.savez(
         run_dir / "batch_params.npz",
-        **fit_params,
+        **fitted,
         forecasts=forecasts,
-        **{f"{key}_evaluation": value for key, value in fit_params_by_window["evaluation"].items()},
+        **{f"{key}_evaluation": value for key, value in fitted_by_window["evaluation"].items()},
         forecasts_evaluation=forecasts_by_window["evaluation"],
         fit_idx=fit_idx,
     )
@@ -470,13 +423,12 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # 10. Run stats (wall-clock and peak memory)
+    # 10. Run stats (model, wall-clock and peak memory)
     # ------------------------------------------------------------------
     run_stats = {
+        "model": args.model,
+        "settings": settings,
         "n_series": n_fit,
-        "n_iter": args.n_iter,
-        "chunk_size": chunk_size,
-        "fit_chunk": fit_chunk,
         "fit_seconds": round(fit_seconds, 1),
         "fit_seconds_by_origin": {window: round(sec, 1) for window, sec in fit_seconds_by_window.items()},
         "total_seconds": round(time.time() - t_start, 1),

@@ -1,0 +1,154 @@
+"""Model registry for ``m5_run.py``: each entry is a model plus its settings.
+
+``m5_run.py --model NAME`` fits ``MODELS[NAME]`` once per forecast origin. An entry builds its own inputs
+from the dataset and calls the model functions in ``bunobee.models.m5``, so the model math stays in
+``src/``. Data loading, series sampling, the submission and scoring stay in the runner.
+
+To add a model, write a frozen dataclass with a ``fit_forecast`` method (see :class:`Model`) and register
+an instance of it in :data:`MODELS`. Its fields are its settings: ``m5_run.py`` records them in
+``run_stats.json``, so two entries of one class with different settings are two models.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Protocol
+
+import jax.numpy as jnp
+import numpy as np
+import xarray as xr
+
+from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+from bunobee.regression import make_periodic_dummies
+
+logger = logging.getLogger(__name__)
+
+
+class Model(Protocol):
+    """What ``m5_run.py`` needs from a registered model.
+
+    Entries are dataclasses; their fields are the settings ``m5_run.py`` records in ``run_stats.json``.
+    """
+
+    def fit_forecast(
+        self,
+        ds: xr.Dataset,
+        series_idx: np.ndarray,
+        fit_mask: np.ndarray,
+        forecast_mask: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Fit the selected series on the fit days and forecast the forecast days.
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            The preprocessed M5 dataset (``m5_common.load_m5_ds``): every series over every day.
+        series_idx : np.ndarray
+            Positions along ``series_id`` of the series to fit, in output order.
+        fit_mask : np.ndarray
+            Boolean mask along ``date`` of the days to fit on.
+        forecast_mask : np.ndarray
+            Boolean mask along ``date`` of the days to forecast. They follow the fit days.
+
+        Returns
+        -------
+        forecasts : np.ndarray
+            Point forecasts of shape ``(len(series_idx), forecast_mask.sum())``, in ``series_idx`` order,
+            with no NaNs.
+        fitted : dict of str to np.ndarray
+            Per-series outputs to save, each with leading dimension ``len(series_idx)``. ``m5_run.py``
+            writes them to ``batch_params.npz`` and plots their distributions in ``diagnostics.png``.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class SspDow:
+    """Weekday-dummy SSP fitted by MAP: ``fit_batch_series_opt`` with ``predict_batch_series_opt``.
+
+    The design matrix has one column per weekday from Tuesday to Sunday, with Monday dropped and no column
+    of ones, so Monday rows are all zero (see ``WORKFLOW.md``, "Known problems").
+
+    Parameters
+    ----------
+    n_iter : int
+        Adam optimisation steps per fit run, by default 100.
+    lr : float
+        Adam learning rate, by default 3e-2.
+    chunk_size : int | None
+        Max series per Kalman-filter ``vmap`` call within a run. ``None`` = no chunking. All chunks share
+        one gradient pass, so this does not cap peak memory while fitting; ``fit_chunk`` does. Default 4096.
+    fit_chunk : int | None
+        Max series per fit run, so peak memory scales with ``fit_chunk`` rather than with the number of
+        series. ``None`` = one run over all series. Default None.
+    """
+
+    n_iter: int = 100
+    lr: float = 3e-2
+    chunk_size: int | None = 4096
+    fit_chunk: int | None = None
+
+    #: Per-series outputs of ``fit_batch_series_opt`` returned as ``fitted``. The filtered states ``at`` and
+    #: ``Pt`` (n_series x n_steps x n_states each) are only needed to forecast, so they are dropped per run.
+    FITTED_KEYS = ("sigma_h", "sigma_q", "response_norm", "final_loss")
+
+    def fit_forecast(
+        self,
+        ds: xr.Dataset,
+        series_idx: np.ndarray,
+        fit_mask: np.ndarray,
+        forecast_mask: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Fit and forecast the series in independent runs of at most ``fit_chunk`` series.
+
+        ``fit_batch_series_opt`` chunks only its Kalman filter, inside one jitted ``value_and_grad``, so the
+        backward pass keeps every chunk's intermediates alive at once. Calling it once per ``fit_chunk``
+        series bounds that memory instead. The series are independent — the loss is a sum over series and
+        Adam updates each parameter on its own — so ``fit_chunk`` changes the forecasts only by float32
+        rounding: a different batch shape vectorises differently, and 100 Adam steps can amplify that to a
+        relative difference of up to ~4e-4 on a few series.
+
+        See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds the
+        :attr:`FITTED_KEYS` outputs of ``fit_batch_series_opt``.
+        """
+        # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
+        # each column a weekday from Tuesday to Sunday on every day, with Monday dropped.
+        dow = ds["day_of_week"].values
+        weekly = make_periodic_dummies(dow.size, period=7, phase=int(dow[0]))
+        Z = jnp.asarray(weekly[fit_mask])  # (n_fit_steps, 6)
+        Z_future = jnp.asarray(weekly[forecast_mask])  # (horizon, 6)
+        sales = ds["sales"].values[series_idx][:, fit_mask]  # (n_series, n_fit_steps)
+
+        n_series = sales.shape[0]
+        step = self.fit_chunk or n_series
+        n_runs = math.ceil(n_series / step)
+        fitted: dict[str, list[np.ndarray]] = {key: [] for key in self.FITTED_KEYS}
+        forecasts = []
+        for run, start in enumerate(range(0, n_series, step), start=1):
+            end = min(start + step, n_series)
+            if n_runs > 1:
+                logger.info("Fit run %d/%d: series %d-%d", run, n_runs, start, end - 1)
+            result = fit_batch_series_opt(
+                sales[start:end],
+                n_iter=self.n_iter,
+                lr=self.lr,
+                Z=Z,
+                chunk_size=self.chunk_size,
+                log_every=100,
+                show_progress=True,
+            )
+            forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
+            for key in self.FITTED_KEYS:
+                fitted[key].append(np.asarray(result[key]))
+        return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
+
+
+#: Registered models by name, the choices of ``m5_run.py --model``.
+MODELS: dict[str, Model] = {
+    "ssp_dow": SspDow(),
+}
+
+#: The baseline entry, ``m5_run.py``'s default ``--model``.
+DEFAULT_MODEL = "ssp_dow"
