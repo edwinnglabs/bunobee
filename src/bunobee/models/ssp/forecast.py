@@ -11,7 +11,7 @@ import xarray as xr
 from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.models.ssp.posterior import a_to_lam
-from bunobee.regression import make_peridoic_dummies
+from bunobee.regression import make_periodic_dummies
 from bunobee.utils import flatten_front_dim
 
 logger = logging.getLogger("bunobee")
@@ -492,7 +492,7 @@ def build_forecast_design(
     column of ``Z_train`` is resolved by exactly one of three rules:
 
     1. **Periodic** — columns named by a ``periodic`` block are regenerated with
-       ``make_peridoic_dummies(n_steps + horizon, period)[n_steps:]``, so the cycle
+       ``make_periodic_dummies(n_steps + horizon, period)[n_steps:]``, so the cycle
        phase continues unbroken from the training window.
     2. **Covariate** — columns supplied through ``covariates_future`` take the given
        future values.
@@ -539,9 +539,9 @@ def build_forecast_design(
     Examples
     --------
     >>> import numpy as np
-    >>> from bunobee.regression import make_peridoic_dummies
+    >>> from bunobee.regression import make_periodic_dummies
     >>> n_steps = 28
-    >>> Z_train = np.concatenate([np.ones((n_steps, 1)), make_peridoic_dummies(n_steps, 7)], axis=1)
+    >>> Z_train = make_periodic_dummies(n_steps, 7, intercept=True)
     >>> Z_future = build_forecast_design(Z_train, 14, periodic={"columns": slice(1, None), "period": 7})
     >>> Z_future.shape
     (14, 1, 7)
@@ -575,7 +575,7 @@ def build_forecast_design(
                 f"got {cols.size}"
             )
         dummies = np.asarray(
-            make_peridoic_dummies(n_steps + horizon, period=period, drop_first=drop_first), dtype=float
+            make_periodic_dummies(n_steps + horizon, period=period, drop_first=drop_first), dtype=float
         )
         if not np.allclose(Z_train[:, :, cols], dummies[:n_steps][:, None, :]):
             raise ValueError(

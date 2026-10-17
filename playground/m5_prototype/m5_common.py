@@ -13,29 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import xarray as xr
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "resource" / "m5-forecasting-accuracy"
 DS_FILE = "m5_ds.nc"
-
-
-def dow_dummies(dow: np.ndarray) -> np.ndarray:
-    """Day-of-week dummies with Monday dropped as the reference category.
-
-    Parameters
-    ----------
-    dow : np.ndarray
-        Day of week per step (Mon=0, Sun=6), e.g. ``ds["day_of_week"].values``.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 dummies of shape ``(len(dow), 6)``, one column per weekday from Tuesday to Sunday.
-    """
-    dummies = pd.get_dummies(dow, dtype=np.float32).reindex(columns=range(7), fill_value=0.0)
-    return dummies.iloc[:, 1:].values
 
 
 def load_m5_ds(data_dir: Path | str = DATA_DIR) -> xr.Dataset:

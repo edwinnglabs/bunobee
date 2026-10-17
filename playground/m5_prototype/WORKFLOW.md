@@ -102,8 +102,8 @@ Baseline, the current model:
 | File | What to change there |
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the transform, parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast and back-transform |
-| `playground/m5_prototype/m5_run.py` | `_fit_and_forecast` calls the model. `main` builds its inputs for each cutoff day (the `dow_dummies` calls) |
-| `playground/m5_prototype/m5_common.py` | `dow_dummies`, the model's only input today |
+| `playground/m5_prototype/m5_run.py` | `_fit_and_forecast` calls the model. `main` builds its inputs for each cutoff day (the `make_periodic_dummies` call) |
+| `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies, the model's only input today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
 A model takes the sales of the fit days (series × days) and per-day inputs for the fit days and the 28

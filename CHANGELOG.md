@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   level and slope (NaN entries are forecast as usual); length and shape are validated.
 - `tune` optional-dependency extra — `pip install bunobee[tune]` installs `scikit-optimize` for
   `hyper_tuning_dlt_with_wbic`.
+- `make_periodic_dummies` in `bunobee.regression` — periodic dummy design matrix with a `phase` argument
+  (the cycle position of step 0, e.g. the first day's weekday) and an `intercept` flag that prepends a
+  column of ones. `build_forecast_design`, the M5 NUTS fit and the M5 run script all build their weekly
+  dummies with it.
 
 ### Changed
 
@@ -20,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcmc_run_args` instead of a `data` dict, so models with regressors can be tuned. It returns a dict of
   the tuned `lev_sm`, `slp_sm` and `theta`, with the raw `skopt` result under `result`, and logs through
   the `bunobee` logger instead of printing.
+
+### Deprecated
+
+- `make_peridoic_dummies` — misspelled name, kept as an alias of `make_periodic_dummies` that emits a
+  `DeprecationWarning`.
 
 ### Fixed
 
