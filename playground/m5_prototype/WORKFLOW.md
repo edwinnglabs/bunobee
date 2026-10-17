@@ -385,6 +385,71 @@ Bias by group over the last 28 fit days (`m5_bias.py`; position and slope as in 
 **Decision:** `ssp_level_dow_yeojohnson_halfnormal` is the best entry on the sample. `ssp_dow` stays the default
 `--model` until #118 full-runs the winner and checks it on the evaluation window.
 
+### Integer rounding (#117)
+
+M5 sales are integers, but WRMSSE is a squared error, so the best point forecast of a day's sales is their mean,
+which is rarely an integer. `m5_run.py --round` clips the forecasts at 0 and rounds them to the nearest integer
+(halves to even) before it plots, saves, submits and scores them. It is off by default. The fits are deterministic,
+so a rounded run's forecasts are exactly the unrounded run's, rounded.
+
+Results on the 3,000-series sample (seed 2026) at the validation origin; a positive delta means rounding is worse.
+Zeros is the share of forecasts that round to 0, and all-zero the share of series whose 28 forecasts all do.
+
+| Entry | WRMSSE | Rounded | Delta | Bias | Rounded | Zeros | All-zero |
+|---|---|---|---|---|---|---|---|
+| `ssp_dow` | 0.94808 | 1.17867 | +0.23059 | −10.2% | −17.0% | 58.5% | 27.1% |
+| `ssp_level_dow_yeojohnson` | 0.83233 | 0.91244 | +0.08011 | −0.8% | −5.4% | 56.2% | 31.4% |
+| `ssp_level_dow_yeojohnson_halfnormal` | 0.74610 | 0.81296 | +0.06686 | +1.9% | −3.3% | 50.9% | 43.2% |
+
+On a full run of `ssp_level_dow_yeojohnson_halfnormal`, both origins, rounding scores the validation window 0.85819
+against 0.70891 (+0.14928) and the evaluation window 0.83142 against 0.79394 (+0.03747). Rounded, 51% (validation)
+and 49% (evaluation) of the forecasts are 0, and 43% and 41% of the series are forecast 0 on all 28 days.
+
+Per level of `ssp_level_dow_yeojohnson_halfnormal` (`m5_compare.py`):
+
+| Level | Sample | Rounded | Full, validation | Rounded | Full, evaluation | Rounded |
+|---|---|---|---|---|---|---|
+| 1 Total | 0.5127 | 0.5464 | 0.5318 | 0.7080 | 0.5972 | 0.4713 |
+| 2 State | 0.5796 | 0.6153 | 0.5725 | 0.7163 | 0.6508 | 0.5527 |
+| 3 Store | 0.7744 | 0.8119 | 0.6464 | 0.7856 | 0.6918 | 0.6566 |
+| 4 Category | 0.5784 | 0.7154 | 0.5690 | 0.8123 | 0.6301 | 0.7206 |
+| 5 Department | 0.7121 | 0.8755 | 0.6980 | 0.9476 | 0.7407 | 0.8969 |
+| 6 State × category | 0.6699 | 0.7546 | 0.6181 | 0.8089 | 0.7064 | 0.7574 |
+| 7 State × department | 0.7885 | 0.8990 | 0.7288 | 0.9364 | 0.7924 | 0.9211 |
+| 8 Store × category | 0.8182 | 0.8779 | 0.6856 | 0.8403 | 0.7462 | 0.8016 |
+| 9 Store × department | 0.8700 | 0.9386 | 0.7809 | 0.9440 | 0.8358 | 0.9410 |
+| 10 Item | 0.8842 | 0.9090 | 0.9019 | 0.9646 | 1.1193 | 1.1805 |
+| 11 Item × state | 0.8813 | 0.9046 | 0.8896 | 0.9262 | 1.0475 | 1.0839 |
+| 12 Item × store | 0.8839 | 0.9072 | 0.8843 | 0.9081 | 0.9691 | 0.9933 |
+| WRMSSE | 0.74610 | 0.81296 | 0.70891 | 0.85819 | 0.79394 | 0.83142 |
+| Bias, levels 1–9 | +1.0 to +2.0% | −3.2 to −5.3% | −1.3 to −1.5% | −6.4 to −7.6% | +4.2 to +5.2% | −1.8 to +0.2% |
+| Bias, levels 10–12 | +14.2 to +15.6% | +2.9 to +4.1% | +6.0 to +12.9% | −3.8 to +2.5% | +23.9 to +47.7% | +15.1 to +36.9% |
+
+- **Rounding is worse at every level** on the sample, for every entry, and on the full run's validation window. It
+  hurts the small series: in the sample's low-volume tercile 95% of the forecasts round to 0 and the tercile's
+  forecast total falls by 74%. The high-volume tercile barely moves (its squared error ×1.005). Across the sample,
+  the days whose forecast rounds to 0 sell 0.36 units on average, and rounding raises the squared error of 76% of
+  the series.
+- **The aggregates suffer most.** The low-volume series all round down, so their rounding errors share a sign and
+  add up in every sum instead of cancelling: rounding takes 5% off the forecast total, and on the full run's
+  validation window the category and department levels (4–7) worsen by 0.19–0.25.
+- **At the item levels the bias falls but the error rises.** On the full run's validation window rounding pulls the
+  dollar-weighted item bias from +6 to +13% to −4 to +3%, yet levels 10–12 worsen by 0.024–0.063. For a forecast at
+  a series' mean, rounding adds `(f − round(f))²`, up to 0.25 squared units, to each day's expected squared error.
+- **The evaluation window's gain at levels 1–3 is a bias correction, not an effect of integers.** There the
+  unrounded totals run 5.1% high, and rounding's 5% cut brings them to +0.1%, so the total, state and store levels
+  improve (by 0.126, 0.098 and 0.035). Levels 4–12 still worsen. A level correction would get the totals' gain
+  without the cost below them; on the validation window, where the totals are 1.3% low, rounding brings only the
+  cost.
+
+The unrounded full run is the first of the #116 winner: 0.70891 on the validation window and 0.79394 on the
+evaluation window, against 1.10175 and 0.99403 for `ssp_dow` after the #116 fix. It fits in 524 s (257 s and 267 s
+per origin) against `ssp_dow`'s 319 s, at a 22.1 GiB peak. Neither run's `submission.csv` was submitted to Kaggle; #118 decides
+the default model.
+
+**Decision:** rounding stays off by default; `--round` is opt-in. It is worse at every level on the validation
+window, on the sample and on the full run, and worse overall on the evaluation window.
+
 ## Working on the model
 
 ### Where the code is

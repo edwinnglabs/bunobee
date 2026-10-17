@@ -69,6 +69,10 @@ python m5_bias.py --model ssp_dow ssp_level_dow
 `--origins validation|evaluation|both` (default `both`) picks the forecast origins to fit. The quick
 loop fits only the validation origin, so it never looks at the evaluation window, the holdout.
 
+`--round` clips the forecasts at 0 and rounds them to the nearest integer before they are plotted, saved,
+submitted and scored. It is off by default, because WRMSSE is a squared error and the best forecast is the
+mean, which is rarely an integer. The results are in [WORKFLOW.md](WORKFLOW.md), "Integer rounding (#117)".
+
 ### What a run writes
 
 Each `m5_run.py` run writes to `output/<timestamp>/`:
@@ -77,16 +81,16 @@ Each `m5_run.py` run writes to `output/<timestamp>/`:
 |---|---|
 | `submission.csv` | 60,980 rows: `_validation` rows from the fit through d_1913, `_evaluation` rows from the fit through d_1941 (full runs with both origins only) |
 | `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per fitted origin |
-| `run_stats.json` | Model name and settings, origins, fit time (total and per origin), total time, peak memory |
+| `run_stats.json` | Model name and settings, origins, whether the forecasts were rounded (`round`), fit time (total and per origin), total time, peak memory |
 | `batch_params.npz` | `fit_idx` (the fitted series) and the model's fitted outputs and forecasts of each fitted origin; evaluation-origin arrays carry an `_evaluation` suffix |
 | `diagnostics.png` | Histograms of the model's fitted outputs (validation origin, or evaluation if only it is fitted) |
 | `forecasts.pdf` | Forecast review of each fitted origin: the total, store and department sums of the fitted series, then `--n-plot` series (default 50) picked by `--plot-select`: `random` (default), `worst` (highest RMSSE) or `top` (highest dollar-sales weight). Each panel shows the last 90 fit days, the actuals and the forecast over the forecast window, and the model's in-sample fit if it returns one; its title gives the RMSSE, bias and weight |
 
 and appends one row to the run log `output/runs.csv`: the timestamp, the run directory, the model and
-its settings, the number of series, sample mode and seed, the origins, the WRMSSE of each scored window,
-the fit time, the git commit and whether tracked files had uncommitted changes (`git_dirty`). After a
-Kaggle submission, type its scores into the run's `kaggle_public` and `kaggle_private` columns; later
-runs keep them.
+its settings, the number of series, sample mode and seed, the origins, whether the forecasts were rounded
+(`round`), the WRMSSE of each scored window, the fit time, the git commit and whether tracked files had
+uncommitted changes (`git_dirty`). After a Kaggle submission, type its scores into the run's
+`kaggle_public` and `kaggle_private` columns; later runs keep them.
 
 A sampled run aggregates and weights only its own series, so its WRMSSE is comparable with other runs
 on the same sample (same `--n-demo`, `--sample-mode` and `--seed`), not with a full-run score.

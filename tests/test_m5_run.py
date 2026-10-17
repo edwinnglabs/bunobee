@@ -8,6 +8,9 @@ a column added to the row later does not break an existing log.
 picked at random, by worst RMSSE or by top dollar-sales weight. These tests check the sums, the RMSSE, bias
 and weight in the panel titles against the scorer, and the picking, on a tiny synthetic dataset.
 
+``--round`` (issue #117) clips the forecasts at 0 and rounds them to integers. These tests check that it is off
+by default and that it leaves only non-negative integers.
+
 The runner is a playground script, not part of the package, so it is loaded by path as
 ``tests/test_m5_models.py`` loads the model registry.
 """
@@ -122,6 +125,24 @@ class TestRunLog:
 
         log = pd.read_csv(path, dtype=str, keep_default_na=False)
         assert list(log["peak_rss_gib"]) == ["", "3.5"]
+
+
+class TestRounding:
+    def test_rounding_is_off_by_default(self):
+        assert m5_run._parse_args([]).round is False
+        assert m5_run._parse_args(["--round"]).round is True
+
+    def test_rounded_forecasts_are_non_negative_integers(self):
+        forecasts = np.array([[-0.7, -0.2, 0.0, 0.4, 0.6], [1.49, 1.51, 2.5, 3.5, 12.2]], dtype=np.float32)
+
+        rounded = m5_run._round_forecasts(forecasts)
+
+        # Negatives clip to 0 before rounding; halves round to even.
+        np.testing.assert_array_equal(rounded, [[0, 0, 0, 0, 1], [1, 2, 2, 4, 12]])
+        assert rounded.shape == forecasts.shape and rounded.dtype == forecasts.dtype
+        assert (rounded >= 0).all() and (rounded == np.floor(rounded)).all()
+        # The input is left unrounded.
+        assert forecasts[0, 3] == np.float32(0.4)
 
 
 # Review dataset: 4 series in 2 stores x 2 departments, N_FIT_DAYS fit days, then the 28 validation days.
