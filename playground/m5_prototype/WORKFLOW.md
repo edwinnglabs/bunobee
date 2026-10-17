@@ -19,6 +19,7 @@ prerequisites, every command and the reference results, see [README.md](README.m
 | `m5_check_weights.py` | Nothing; prints a comparison | You change how the scorer computes weights |
 | `m5_run.py` | `output/<timestamp>/` and a row of `output/runs.csv` | Every experiment |
 | `m5_compare.py` | Nothing; prints the deltas | You want to compare a run with a baseline run on the same series |
+| `m5_bias.py` | `output/bias_<timestamp>/` | You change the transform or the back-transform and want to see which mean of the sales the forecast tracks |
 | `m5_score_submission.py` | Nothing; prints the score | You want to re-score a saved `submission.csv`, e.g. after changing the scorer |
 | `kaggle competitions submit` | A late submission on Kaggle | You want the official score |
 
@@ -133,6 +134,46 @@ The level lifts the totals, but only by 2.4 points of the 12.7% shortfall on val
 main cause of the low totals. `ssp_level_dow` stays registered as the starting point for the next
 experiments.
 
+### Level bias diagnosis (#113)
+
+`m5_bias.py --model ssp_dow ssp_level_dow` fits both entries on the 3,000-series sample at the validation
+origin and compares each series' forecast with the arithmetic mean (am) and the geometric mean (gm) of
+`max(sales, 0.1)` over the last 28 fit days. Ratios are ratios of sums over a group's series, so the bias is
+the group's forecast total over its actual total, minus one. `slope` measures how the forecast moves with the
+gap between the two means across a group's series: 0 if it is the geometric mean times a constant, 1 if it is
+the arithmetic mean times a constant.
+
+| Group | Bias, `ssp_dow` | Bias, `ssp_level_dow` | act/am | fc/am | fc/gm | am/gm | slope |
+|---|---|---|---|---|---|---|---|
+| Total | −9.6% | −7.6% | 0.973 | 0.879 | 1.362 | 1.549 | 0.24 |
+| HOBBIES_1 | −20.5% | −17.4% | 0.961 | 0.764 | 1.607 | 2.102 | 0.26 |
+| Low-volume tercile | −17.3% | −13.5% | 0.843 | 0.698 | 1.342 | 1.923 | 0.02 |
+| Mid-volume tercile | −24.7% | −21.0% | 0.966 | 0.727 | 1.471 | 2.023 | 0.07 |
+| High-volume tercile | −5.1% | −3.7% | 0.989 | 0.938 | 1.344 | 1.433 | 0.41 |
+
+The ratios and the slope are those of `ssp_dow`. Volume terciles split the sample into thirds by mean sales
+over the fit days.
+
+- **The forecast tracks the geometric mean.** It is the recent geometric mean times a lift that barely
+  depends on the gap to the arithmetic mean (slope 0.24 on the total, 0.02–0.41 by tercile; 0.25 for
+  `ssp_level_dow`). The lift is the lognormal correction, with `sigma_h` on its 0.5 cap for 96% of series.
+  Where zero days drive the means apart, the lift can't close the gap: series with zeros on under a quarter
+  of their days since their first sale are forecast 4% high, those with zeros on half to three quarters 23%
+  low.
+- **The recent arithmetic mean is close to the actuals:** they are 0.97 of it on the total and 0.96 on
+  HOBBIES_1, so a forecast that tracked it would be about 3–4% off instead of 10–20% low. On the
+  low-volume tercile the 0.1 floor on zero days puts the mean 19% above the actuals; without the floor it
+  is 8% below them.
+- **The level state (#106) removes about a fifth of the bias:** 2.0 of the 9.6 points on the total, 3.1 of
+  20.5 on HOBBIES_1 and 1.4–3.8 by tercile. It does not change which mean the forecast tracks.
+- **Means over all fit days can't show which mean the forecast tracks.** Half the sample has more than 100
+  zero days before its item was first stocked (median 193). They pull the all-day means, the geometric one
+  most, far below the level the forecast starts from: the actuals are 1.17 times the all-day mean of
+  `max(sales, 0.1)`, which is the model's `response_norm`.
+
+So the log transform is the main cause of the low totals and the missing level a minor one; the transform
+work (#114, #115) and the `sigma_h` cap (#116) are where the bias can be closed.
+
 ## Working on the model
 
 ### Where the code is
@@ -178,8 +219,9 @@ drift.
 - **Totals are forecast too low.** In the baseline run, total sales are 12.7% low on the validation window
   and 9.3% low on the evaluation window, and every level from 1 to 9 is low by a similar amount. The item
   levels (10–12) are not. The missing level state explains only part of it: `ssp_level_dow` lifts the
-  totals by 2.4 points on validation and 5.6 on evaluation. Untested candidates: the 0.1 clip on zero
-  days, and the back-transform.
+  totals by 2.4 points on validation and 5.6 on evaluation. The main cause is the log transform: the
+  forecast tracks the geometric mean of `max(sales, 0.1)`, and the lognormal correction, with `sigma_h`
+  capped, lifts it only part of the way to the arithmetic mean (see "Level bias diagnosis (#113)").
 - **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
   New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
   after the first the shared drift.
