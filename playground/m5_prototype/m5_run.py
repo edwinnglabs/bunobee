@@ -18,6 +18,9 @@ Usage examples
 # Review the 20 worst-forecast series of a quick loop in forecasts.pdf:
     python m5_run.py --n-demo 3000 --origins validation --plot-select worst --n-plot 20
 
+# The quick loop with the forecasts rounded to integers:
+    python m5_run.py --model ssp_dow --n-demo 3000 --origins validation --round
+
 ``--model`` picks an entry of ``MODELS`` in ``m5_models``: a model plus its settings (for ``ssp_dow``, the
 optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
 needs only a new entry there.
@@ -29,6 +32,10 @@ both:
     evaluation : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows)
 
 ``submission.csv`` needs every series at both origins, so only a full run with both origins writes it.
+
+``--round`` clips each origin's forecasts at 0 and rounds them to the nearest integer before they are plotted,
+saved, submitted and scored (see :func:`_round_forecasts`). It is off by default: WRMSSE is a squared error, so
+the best point forecast is the mean, which is rarely an integer (see ``WORKFLOW.md``, "Integer rounding (#117)").
 
 ``forecasts.pdf`` reviews each fitted origin: first the total, store and department sums of the fitted
 series, then ``--n-plot`` series picked by ``--plot-select`` (at random, by worst RMSSE or by top dollar-sales
@@ -42,9 +49,9 @@ run aggregates and weights only its own series, so its score is comparable with 
 sample (same ``--n-demo``, ``--sample-mode`` and ``--seed``; see ``m5_compare.py``), not with the full
 30,490-series score.
 
-Every run also writes the model name and settings, its wall-clock time and peak memory to ``run_stats.json``
-in the run directory, and appends one row to the run log ``runs.csv`` in ``--output-dir`` (see
-:func:`_append_run_log`).
+Every run also writes the model name and settings, whether it rounded (``--round``), its wall-clock time and
+peak memory to ``run_stats.json`` in the run directory, and appends one row to the run log ``runs.csv`` in
+``--output-dir`` (see :func:`_append_run_log`).
 """
 
 from __future__ import annotations
@@ -106,7 +113,7 @@ _PLOT_COLORS = {"actual": "#2a78d6", "forecast": "#eb6834", "insample": "#1baf7a
 # ---------------------------------------------------------------------------
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fit a registered M5 model and generate forecasts.")
     p.add_argument(
         "--model",
@@ -146,6 +153,12 @@ def _parse_args() -> argparse.Namespace:
         "both. A quick loop fits validation only, so it never looks at the evaluation window.",
     )
     p.add_argument(
+        "--round",
+        action="store_true",
+        help="Clip the forecasts at 0 and round them to the nearest integer before they are plotted, saved, "
+        "submitted and scored. Off by default.",
+    )
+    p.add_argument(
         "--n-plot",
         type=int,
         default=50,
@@ -163,7 +176,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--plots-per-page", type=int, default=5, metavar="N", help="Forecast subplots per PDF page, by default 5."
     )
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +221,25 @@ def _check_model_output(
             f"{model_name}: the in-sample fit {INSAMPLE_KEY!r} has shape {np.shape(fitted[INSAMPLE_KEY])}, expected "
             f"{(n_series, n_fit_days)}"
         )
+
+
+def _round_forecasts(forecasts: np.ndarray) -> np.ndarray:
+    """Forecasts clipped at 0, then rounded to the nearest integer (``--round``).
+
+    Halves round to the nearest even integer, as ``np.rint`` rounds them. The dtype is kept, so the result
+    holds integer values in floats.
+
+    Parameters
+    ----------
+    forecasts : np.ndarray
+        Point forecasts, with no NaNs.
+
+    Returns
+    -------
+    np.ndarray
+        The rounded forecasts, of the same shape and dtype: every value a non-negative integer.
+    """
+    return np.rint(np.maximum(forecasts, 0))
 
 
 def _plot_fitted(fitted: dict[str, np.ndarray], title: str, output_path: Path) -> None:
@@ -666,6 +698,15 @@ def main() -> None:
         _check_model_output(
             args.model, forecasts_by_window[window], fitted_by_window[window], n_fit, int(fit_mask.sum())
         )
+        if args.round:
+            unrounded = forecasts_by_window[window]
+            forecasts_by_window[window] = _round_forecasts(unrounded)
+            logger.info(
+                "Rounded the %s-origin forecasts to integers: %.1f%% of them are 0, and their total changes by %+.1f%%",
+                window,
+                100 * np.mean(forecasts_by_window[window] == 0),
+                100 * (forecasts_by_window[window].sum(dtype=np.float64) / unrounded.sum(dtype=np.float64) - 1),
+            )
         # The in-sample fit is as large as the sales it fits, so only the days forecasts.pdf shows are kept, and
         # it is neither histogrammed nor saved with the other fitted arrays.
         insample = fitted_by_window[window].pop(INSAMPLE_KEY, None)
@@ -801,6 +842,7 @@ def main() -> None:
         "settings": settings,
         "n_series": n_fit,
         "origins": list(windows),
+        "round": args.round,
         "fit_seconds": round(fit_seconds, 1),
         "fit_seconds_by_origin": {window: round(sec, 1) for window, sec in fit_seconds_by_window.items()},
         "total_seconds": round(time.time() - t_start, 1),
@@ -830,6 +872,7 @@ def main() -> None:
             "sample_mode": args.sample_mode,
             "seed": args.seed,
             "origins": args.origins,
+            "round": args.round,
             **{f"wrmsse_{window}": round(scores[window], 6) if window in scores else None for window in WINDOWS},
             "fit_seconds": run_stats["fit_seconds"],
             "git_commit": git_commit,

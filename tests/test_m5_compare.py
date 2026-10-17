@@ -202,3 +202,11 @@ class TestCli:
             m5_compare.main()
 
         assert "A 0.900000  B 0.775000  delta -0.125000" in caplog.text
+
+    def test_a_rounded_run_is_described_as_rounded(self, tmp_path):
+        run_a, run_b = _write_run(tmp_path / "a"), _write_run(tmp_path / "b")
+        (run_a / "run_stats.json").write_text('{"model": "ssp_dow", "n_series": 4, "round": false}')
+        (run_b / "run_stats.json").write_text('{"model": "ssp_dow", "n_series": 4, "round": true}')
+
+        assert m5_compare._describe(run_a) == f"{run_a}  (model ssp_dow, 4 series)"
+        assert m5_compare._describe(run_b) == f"{run_b}  (model ssp_dow, 4 series, forecasts rounded)"
