@@ -58,6 +58,11 @@ python m5_score_submission.py --submission output/<timestamp>/submission.csv --w
 #    then type the two scores into the run's row of output/runs.csv.
 kaggle competitions submit -c m5-forecasting-accuracy -f output/<timestamp>/submission.csv -m "<message>"
 kaggle competitions submissions -c m5-forecasting-accuracy | head -3
+
+# 9. Optional: diagnose the level bias. Fits each model on the quick-loop sample at the validation origin
+#    and compares its forecasts with the arithmetic and geometric means of the sales, per department, volume
+#    tercile and zero-share bin. About 20 s per model; writes output/bias_<timestamp>/.
+python m5_bias.py --model ssp_dow ssp_level_dow
 ```
 
 `--origins validation|evaluation|both` (default `both`) picks the forecast origins to fit. The quick
@@ -149,6 +154,7 @@ How well the local scorer matches the official one:
 | `m5_models.py` | Model registry: each entry is a model plus its settings, picked with `--model` |
 | `m5_run.py` | Fit a registered model, forecast, score, write the submission and append to the run log |
 | `m5_compare.py` | Per-level WRMSSE and bias deltas of two runs on the same series |
+| `m5_bias.py` | Which mean of the sales a model's forecast tracks, per department, volume tercile and zero-share bin |
 | `m5_score_submission.py` | 12-level WRMSSE of a submission for one window |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |
 | `m5_submission_diff.py` | Diagnostic diff of two submissions |
