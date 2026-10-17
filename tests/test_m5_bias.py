@@ -3,8 +3,8 @@
 The script asks whether a model's forecast tracks the arithmetic or the geometric mean of ``max(sales, 0.1)``
 (issue #113). These tests check its per-series means, the volume terciles and zero-share bins, the group
 ratios and the two tracking measures (``position`` and ``slope``) on series small enough to work out by hand,
-the share of series with a fitted sigma on a prior bound (issue #115), and that it fits the same random sample
-as ``m5_run.py``. None needs the raw M5 data.
+the share of series with a fitted sigma on a bound of the entry's uniform priors, within one Adam step of it
+(issues #115 and #116), and that it fits the same random sample as ``m5_run.py``. None needs the raw M5 data.
 
 The script is a playground script, not part of the package, so it is loaded by path as
 ``tests/test_m5_run.py`` loads the runner.
@@ -59,6 +59,7 @@ def _load_script(name: str) -> ModuleType:
 
 for _name in ("m5_common", "m5_models", "m5_score_submission"):
     _load_script(_name)
+m5_models = sys.modules["m5_models"]
 m5_bias = _load_script("m5_bias")
 
 
@@ -224,37 +225,67 @@ class TestTrackingSlope:
 
 class TestPriorBoundShares:
     def test_shares_of_series_on_each_bound(self):
-        # Priors: sigma_h ~ U(0.1, 0.5), within 0.004 of a bound; sigma_q ~ U(0.01, 0.1), within 0.0009.
-        # Series 0 has sigma_h and the first drift on their lower bounds, series 1 no sigma on a bound, series 2
-        # sigma_h on its upper bound and series 3 sigma_h past it and the shared drift on its upper bound.
+        # ssp_dow's priors: sigma_h ~ U(0.1, 0.5) and sigma_q ~ U(0.01, 0.1). At lr 0.03 one Adam step moves sigma_h
+        # by 0.0029 at 0.1 and 0.0118 at 0.5, and a drift by 0.0003 at 0.01 and 0.0029 at 0.1. Series 0 has sigma_h
+        # and the first drift on their lower bounds, series 1 no sigma on a bound, series 2 sigma_h on its upper bound
+        # and series 3 sigma_h on it and the shared drift on its upper bound. Series 4's sigma_h is two steps short.
         fitted = {
-            "sigma_h": np.array([0.1, 0.3, 0.497, 0.503]),
-            "sigma_q": np.array([[0.0105, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.0995, 0.0995]]),
+            "sigma_h": np.array([0.102, 0.3, 0.495, 0.49, 0.476]),
+            "sigma_q": np.array(
+                [[0.0102, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.05, 0.05], [0.05, 0.098, 0.098], [0.05, 0.05, 0.05]]
+            ),
         }
 
-        shares = m5_bias.prior_bound_shares(fitted)
+        shares = m5_bias.prior_bound_shares(fitted, m5_models.MODELS["ssp_dow"])
 
         assert shares == pytest.approx(
             {
-                "sigma_h_low": 0.25,
-                "sigma_h_high": 0.5,
-                "sigma_q_first_low": 0.25,
+                "sigma_h_low": 0.2,
+                "sigma_h_high": 0.4,
+                "sigma_q_first_low": 0.2,
                 "sigma_q_first_high": 0.0,
                 "sigma_q_rest_low": 0.0,
-                "sigma_q_rest_high": 0.25,
-                "any": 0.75,
+                "sigma_q_rest_high": 0.2,
+                "any": 0.6,
             }
         )
 
-    def test_bounds_are_the_fitters_priors(self):
-        from bunobee.models.m5 import m5_ssp_optim
+    def test_margin_is_one_adam_step_at_the_bound(self):
+        # sigma = softplus(x) has slope 1 - exp(-sigma), and Adam moves x by about lr a step.
+        assert m5_bias.bound_margin(0.5, 0.03) == pytest.approx(0.03 * (1 - np.exp(-0.5)))
+        assert m5_bias.bound_margin(0.5, 0.1) == pytest.approx(0.1 * (1 - np.exp(-0.5)))
 
-        assert m5_bias.SIGMA_H_BOUNDS == m5_ssp_optim.SIGMA_H_BOUNDS == (0.1, 0.5)
-        assert m5_bias.SIGMA_Q_BOUNDS == m5_ssp_optim.SIGMA_Q_BOUNDS == (0.01, 0.1)
+    def test_bounds_are_the_entrys_priors(self):
+        # The wide priors are U(0.05, 1.5) and U(0.0005, 0.5): 0.6 is on no bound there, but past the default's.
+        fitted = {"sigma_h": np.array([0.6, 1.49]), "sigma_q": np.array([[0.2, 0.2], [0.2, 0.00051]])}
 
-    def test_empty_without_the_ssp_sigmas(self):
-        assert m5_bias.prior_bound_shares({"sigma_h": np.array([0.3])}) == {}
-        assert m5_bias.prior_bound_shares({}) == {}
+        shares = m5_bias.prior_bound_shares(fitted, m5_models.MODELS["ssp_level_dow_yeojohnson_wide"])
+
+        assert shares["sigma_h_high"] == 0.5
+        assert shares["sigma_q_rest_low"] == 0.5
+        assert shares["any"] == 0.5
+
+    def test_soft_priors_have_no_bound(self):
+        fitted = {"sigma_h": np.array([0.6]), "sigma_q": np.array([[0.2, 0.2]])}
+        SspDow, SigmaPrior = m5_models.SspDow, m5_models.SigmaPrior
+
+        assert m5_bias.prior_bound_shares(fitted, m5_models.MODELS["ssp_level_dow_yeojohnson_halfnormal"]) == {}
+        # A soft sigma_h prior leaves out sigma_h only.
+        mixed = SspDow(sigma_h_prior=SigmaPrior("half_normal", (1.0,)))
+        assert set(m5_bias.prior_bound_shares(fitted, mixed)) == {
+            "sigma_q_first_low",
+            "sigma_q_first_high",
+            "sigma_q_rest_low",
+            "sigma_q_rest_high",
+            "any",
+        }
+
+    def test_empty_without_the_ssp_sigmas_or_priors(self):
+        model = m5_models.MODELS["ssp_dow"]
+        assert m5_bias.prior_bound_shares({"sigma_h": np.array([0.3])}, model) == {}
+        assert m5_bias.prior_bound_shares({}, model) == {}
+        fitted = {"sigma_h": np.array([0.3]), "sigma_q": np.array([[0.05, 0.05]])}
+        assert m5_bias.prior_bound_shares(fitted, object()) == {}
 
 
 def test_sample_matches_the_runner():

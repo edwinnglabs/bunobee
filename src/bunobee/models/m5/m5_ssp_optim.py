@@ -6,7 +6,9 @@ closed-form lognormal-mean correction has no posterior-replay equivalent. See ea
 function's deprecation note for the migration path.
 
 The fitters take the target transform as an argument (see :mod:`bunobee.models.m5.transforms`), by default
-:class:`~bunobee.models.m5.transforms.LogTransform`, and the predictors invert the transform a fit used.
+:class:`~bunobee.models.m5.transforms.LogTransform`, and the predictors invert the transform a fit used. They take
+the priors of the noise and the drifts as arguments too (see :class:`SigmaPrior`), by default the uniform priors
+:data:`SIGMA_H_PRIOR` and :data:`SIGMA_Q_PRIOR`, and return the parameters of the lowest loss over their steps.
 
 This module drives the optimization-mode demo and is the only part of ``bunobee`` that
 needs ``optax`` and ``tqdm``. Those live behind the optional ``m5`` extra, so importing
@@ -16,6 +18,10 @@ this module requires ``pip install 'bunobee[m5]'``.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import ClassVar
 
 from jax import jit, value_and_grad
 import numpy as np
@@ -40,10 +46,63 @@ logger = logging.getLogger(__name__)
 #: Batched Kalman filter over independent series, built from the single-series filter.
 kalman_filter_1d_batch = make_kalman_batch(kalman_filter_1d)
 
-#: Bounds of the uniform priors of the MAP fitters: ``sigma_h``, the observation noise, and ``sigma_q``, the
+#: Bounds of the default uniform priors of the MAP fitters: ``sigma_h``, the observation noise, and ``sigma_q``, the
 #: drifts of the states. They were set for the log target, whose noise is on the scale of log sales.
 SIGMA_H_BOUNDS = (0.1, 0.5)
 SIGMA_Q_BOUNDS = (0.01, 0.1)
+
+
+@dataclass(frozen=True)
+class SigmaPrior:
+    """Prior of a sigma of the MAP fitters: a positive distribution family and its parameters.
+
+    A uniform prior bounds the sigma: the fit never returns one outside ``params``. The half-normal and
+    log-normal priors are soft: they pull the sigma toward small values or toward ``exp(loc)`` but allow any
+    positive value. The fit starts each sigma at its prior's mean, so the default uniform priors start
+    ``sigma_h`` at 0.3 and the drifts at 0.055.
+
+    Parameters
+    ----------
+    family : str
+        ``"uniform"``, ``"half_normal"`` or ``"log_normal"``.
+    params : tuple of float
+        The family's parameters, as ``numpyro.distributions`` takes them: ``(low, high)`` for ``"uniform"``,
+        ``(scale,)`` for ``"half_normal"`` and ``(loc, scale)`` of the sigma's log for ``"log_normal"``.
+    """
+
+    family: str
+    params: tuple[float, ...]
+
+    #: Each family's distribution, and its mean as a function of its parameters: the sigma's starting point.
+    FAMILIES: ClassVar[dict[str, tuple[type[dist.Distribution], Callable[..., float]]]] = {
+        "uniform": (dist.Uniform, lambda low, high: (low + high) / 2),
+        "half_normal": (dist.HalfNormal, lambda scale: scale * math.sqrt(2 / math.pi)),
+        "log_normal": (dist.LogNormal, lambda loc, scale: math.exp(loc + scale**2 / 2)),
+    }
+
+    def __post_init__(self) -> None:
+        if self.family not in self.FAMILIES:
+            raise ValueError(f"family must be one of {sorted(self.FAMILIES)}, got {self.family!r}")
+
+    @property
+    def distribution(self) -> dist.Distribution:
+        """The prior as a ``numpyro`` distribution."""
+        return self.FAMILIES[self.family][0](*self.params)
+
+    @property
+    def init(self) -> float:
+        """The prior's mean, where the fit starts the sigma."""
+        return float(self.FAMILIES[self.family][1](*self.params))
+
+    @property
+    def bounds(self) -> tuple[float, float] | None:
+        """The ``(low, high)`` bounds of a uniform prior; None for a soft prior, which allows any positive sigma."""
+        return (float(self.params[0]), float(self.params[1])) if self.family == "uniform" else None
+
+
+#: Default priors of the MAP fitters: ``sigma_h`` ~ U(0.1, 0.5) and each drift ~ U(0.01, 0.1).
+SIGMA_H_PRIOR = SigmaPrior("uniform", SIGMA_H_BOUNDS)
+SIGMA_Q_PRIOR = SigmaPrior("uniform", SIGMA_Q_BOUNDS)
 
 
 def _softplus(x: jnp.ndarray) -> jnp.ndarray:
@@ -64,13 +123,16 @@ def fit_one_series_opt(
     tol: float = 1e-5,
     log_every: int | None = None,
     transform: Transform = LogTransform(),
+    sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR,
+    sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model via MAP (Adam optimiser).
 
     Uses the same Kalman filter and prior specification as ``fit_one_series`` but
     replaces NUTS with gradient-based MAP estimation — much faster, no posterior
     uncertainty. The model is fitted to ``transform.forward(sales)``, with the
-    transform's parameters fitted on ``sales`` first.
+    transform's parameters fitted on ``sales`` first. The returned parameters are
+    those of the lowest loss over the steps run.
 
     Parameters
     ----------
@@ -93,6 +155,12 @@ def fit_one_series_opt(
     transform : Transform
         Target transform, by default :class:`LogTransform`: the model is fitted to
         ``log(max(sales, 0.1) / mean)``.
+    sigma_h_prior : SigmaPrior
+        Prior of the observation noise ``sigma_h``, by default :data:`SIGMA_H_PRIOR`,
+        U(0.1, 0.5).
+    sigma_q_prior : SigmaPrior
+        Prior of each of the two drifts: the first state's and the one the other
+        states share. By default :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
 
     Returns
     -------
@@ -100,7 +168,9 @@ def fit_one_series_opt(
         Keys: ``at`` (n_steps, n_states), ``sigma_h`` (float), ``sigma_q``
         (n_states,), the transform's parameters (``response_norm`` for the log
         transform), ``transform``, ``Z``, ``a0``, ``P0``, ``losses``
-        (list[float]), ``n_iter_run`` (int).
+        (list[float], the loss before each step's update), ``final_loss`` (float,
+        the lowest of ``losses``, which the returned sigmas achieve), ``n_iter_run``
+        (int).
     """
     transform_params = transform.fit(sales)
     y = jnp.array(transform.forward(sales, transform_params))
@@ -132,17 +202,18 @@ def fit_one_series_opt(
         )
 
         log_prior = (
-            dist.Uniform(*SIGMA_H_BOUNDS).log_prob(sigma_h)
-            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_level)
-            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_seas)
+            sigma_h_prior.distribution.log_prob(sigma_h)
+            + sigma_q_prior.distribution.log_prob(sigma_q_level)
+            + sigma_q_prior.distribution.log_prob(sigma_q_seas)
         )
         return -(lp + log_prior)
 
+    # Each sigma starts at its prior's mean: for the default priors, the midpoints of U(0.1, 0.5) and U(0.01, 0.1).
     params = jnp.array(
         [
-            _softplus_inv(0.30),  # sigma_h midpoint of U(0.1, 0.5)
-            _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
-            _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+            _softplus_inv(sigma_h_prior.init),  # sigma_h
+            _softplus_inv(sigma_q_prior.init),  # sigma_q_level
+            _softplus_inv(sigma_q_prior.init),  # sigma_q_seas
         ]
     )
 
@@ -156,20 +227,26 @@ def fit_one_series_opt(
         return optax.apply_updates(params, updates), new_opt_state, loss
 
     losses: list[float] = []
-    best_loss = float("inf")
+    best_params, best_loss = params, float("inf")
+    patience_loss = float("inf")
     no_improve = 0
 
     for i in range(n_iter):
-        params, opt_state, loss = _step(params, opt_state)
+        new_params, opt_state, loss = _step(params, opt_state)
         loss_val = float(loss)
         losses.append(loss_val)
+        # The loss is that of params, before this step's update: they, not new_params, achieved it. A sigma
+        # pushed past a uniform prior's bound has an infinite loss, so the best parameters stay inside the bounds.
+        if loss_val < best_loss:
+            best_params, best_loss = params, loss_val
+        params = new_params
 
         if log_every is not None and i % log_every == 0:
             logger.debug("step %d  loss=%.6f", i, loss_val)
 
         if patience is not None:
-            if best_loss - loss_val > tol:
-                best_loss = loss_val
+            if patience_loss - loss_val > tol:
+                patience_loss = loss_val
                 no_improve = 0
             else:
                 no_improve += 1
@@ -177,9 +254,9 @@ def fit_one_series_opt(
                 logger.debug("early stop at step %d  loss=%.6f", i, loss_val)
                 break
 
-    sigma_h = float(_softplus(params[0]))
-    sigma_q_level = float(_softplus(params[1]))
-    sigma_q_seas = float(_softplus(params[2]))
+    sigma_h = float(_softplus(best_params[0]))
+    sigma_q_level = float(_softplus(best_params[1]))
+    sigma_q_seas = float(_softplus(best_params[2]))
     sigma_q = jnp.concatenate(
         [
             jnp.array([sigma_q_level]),
@@ -208,6 +285,7 @@ def fit_one_series_opt(
         "a0": a0,
         "P0": P0,
         "losses": losses,
+        "final_loss": best_loss,
         "n_iter_run": len(losses),
     }
 
@@ -278,13 +356,16 @@ def fit_batch_series_opt(
     log_every: int | None = None,
     show_progress: bool = False,
     transform: Transform = LogTransform(),
+    sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR,
+    sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model for B series in parallel.
 
     Uses ``jax.vmap`` to batch the Kalman filter across series and runs Adam
     optimisation for a fixed number of steps, tracking the best parameters
-    per series. Each series is fitted to ``transform.forward`` of its sales,
-    with its transform parameters fitted on its sales first.
+    per series: those of the lowest loss over the steps. Each series is fitted
+    to ``transform.forward`` of its sales, with its transform parameters fitted
+    on its sales first.
 
     Parameters
     ----------
@@ -306,6 +387,12 @@ def fit_batch_series_opt(
     transform : Transform
         Target transform, by default :class:`LogTransform`: each series is fitted
         to ``log(max(sales, 0.1) / mean)``.
+    sigma_h_prior : SigmaPrior
+        Prior of the observation noise ``sigma_h``, by default :data:`SIGMA_H_PRIOR`,
+        U(0.1, 0.5).
+    sigma_q_prior : SigmaPrior
+        Prior of each of the two drifts: the first state's and the one the other
+        states share. By default :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
 
     Returns
     -------
@@ -313,7 +400,8 @@ def fit_batch_series_opt(
         Keys: ``at`` (B, n_steps, n_states), ``sigma_h`` (B,),
         ``sigma_q`` (B, n_states), the transform's parameters (B,) each
         (``response_norm`` for the log transform), ``transform``, ``Z``,
-        ``a0``, ``P0``, ``final_loss`` (B,).
+        ``a0``, ``P0``, ``final_loss`` (B,), the lowest loss over the steps,
+        which the returned sigmas achieve.
     """
     B = sales_matrix.shape[0]
 
@@ -324,12 +412,13 @@ def fit_batch_series_opt(
     a0 = jnp.zeros(n_states)
     P0 = jnp.ones(n_states)
 
+    # Each sigma starts at its prior's mean: for the default priors, the midpoints of U(0.1, 0.5) and U(0.01, 0.1).
     init_params = jnp.tile(
         jnp.array(
             [
-                _softplus_inv(0.30),  # sigma_h midpoint of U(0.1, 0.5)
-                _softplus_inv(0.055),  # sigma_q_level midpoint of U(0.01, 0.1)
-                _softplus_inv(0.055),  # sigma_q_seas midpoint of U(0.01, 0.1)
+                _softplus_inv(sigma_h_prior.init),  # sigma_h
+                _softplus_inv(sigma_q_prior.init),  # sigma_q_level
+                _softplus_inv(sigma_q_prior.init),  # sigma_q_seas
             ]
         ),
         (B, 1),
@@ -363,9 +452,9 @@ def fit_batch_series_opt(
         )
 
         log_prior = (
-            dist.Uniform(*SIGMA_H_BOUNDS).log_prob(sigma_h)
-            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_level)
-            + dist.Uniform(*SIGMA_Q_BOUNDS).log_prob(sigma_q_seas)
+            sigma_h_prior.distribution.log_prob(sigma_h)
+            + sigma_q_prior.distribution.log_prob(sigma_q_level)
+            + sigma_q_prior.distribution.log_prob(sigma_q_seas)
         )  # (B,)
 
         per_series = -(log_p + log_prior)  # (B,)
@@ -377,9 +466,11 @@ def fit_batch_series_opt(
         updates, new_opt_state = optimizer.update(grads, opt_state)
         new_params = optax.apply_updates(params, updates)
 
+        # The loss is that of params, before this step's update: they, not new_params, achieved it. A sigma pushed
+        # past a uniform prior's bound has an infinite loss, so the best parameters stay inside the bounds.
         improved = per_series_loss < best_loss
         new_best_loss = jnp.where(improved, per_series_loss, best_loss)
-        new_best_params = jnp.where(improved[:, None], new_params, best_params)
+        new_best_params = jnp.where(improved[:, None], params, best_params)
         return new_params, new_opt_state, new_best_params, new_best_loss, per_series_loss
 
     best_params = init_params

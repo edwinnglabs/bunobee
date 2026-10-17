@@ -3,8 +3,8 @@
 The MAP fitters and predictors of ``m5_ssp_optim`` used to hard-code the log target: fit on
 ``log(max(sales, 0.1) / mean)``, forecast ``exp(mu + 0.5 · var) · mean``. They now take a ``Transform``, by
 default ``LogTransform``. These tests check that ``LogTransform`` is that target bit for bit, and that the
-default fit and forecast reproduce the pre-refactor implementation, kept verbatim below as the reference,
-exactly on a fixed set of series.
+default fit and forecast reproduce the pre-refactor implementation, kept verbatim below as the reference but for
+the best-parameter fix of issue #116, exactly on a fixed set of series.
 
 ``PowerTransform`` (issue #115) fits a Box-Cox or Yeo-Johnson λ per series with scikit-learn's
 ``PowerTransformer``. These tests check its forward map against scikit-learn's, its λ bounds against a bounded
@@ -114,7 +114,11 @@ def _softplus_inv(v):
 
 
 def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_size=4096):
-    """The pre-refactor ``fit_batch_series_opt``, kept verbatim but for logging, as the numerical reference."""
+    """The pre-refactor ``fit_batch_series_opt`` as the numerical reference.
+
+    Kept verbatim but for logging and the fix of issue #116: it keeps ``params``, whose loss each step computes,
+    as the best parameters, where it used to keep ``new_params``, one Adam step after them.
+    """
     B = sales_matrix.shape[0]
 
     sales_clipped = np.clip(sales_matrix, 1e-1, None).astype(np.float32)
@@ -155,7 +159,7 @@ def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_si
         new_params = optax.apply_updates(params, updates)
         improved = per_series_loss < best_loss
         new_best_loss = jnp.where(improved, per_series_loss, best_loss)
-        new_best_params = jnp.where(improved[:, None], new_params, best_params)
+        new_best_params = jnp.where(improved[:, None], params, best_params)  # #116: was new_params
         return new_params, new_opt_state, new_best_params, new_best_loss, per_series_loss
 
     best_params = init_params
@@ -197,7 +201,11 @@ def _legacy_predict_batch_series_opt(fit_result, Z_future):
 
 
 def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=1e-5):
-    """The pre-refactor ``fit_one_series_opt``, kept verbatim but for logging, as the numerical reference."""
+    """The pre-refactor ``fit_one_series_opt`` as the numerical reference.
+
+    Kept verbatim but for logging and the fix of issue #116: it returns the parameters of the lowest loss, where it
+    used to return those after the last step's update, whose loss it never computed.
+    """
     sales_clipped = np.clip(sales, 1e-1, None).astype(np.float32)
     response_norm = float(sales_clipped.mean())
     y = jnp.array(np.log(sales_clipped / response_norm))
@@ -233,9 +241,13 @@ def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=
 
     best_loss = float("inf")
     no_improve = 0
+    best_params, min_loss = params, float("inf")  # #116
     for _ in range(n_iter):
-        params, opt_state, loss = _step(params, opt_state)
+        new_params, opt_state, loss = _step(params, opt_state)
         loss_val = float(loss)
+        if loss_val < min_loss:  # #116
+            best_params, min_loss = params, loss_val
+        params = new_params
         if patience is not None:
             if best_loss - loss_val > tol:
                 best_loss = loss_val
@@ -245,9 +257,9 @@ def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=
             if no_improve >= patience:
                 break
 
-    sigma_h = float(_softplus(params[0]))
-    sigma_q_level = float(_softplus(params[1]))
-    sigma_q_seas = float(_softplus(params[2]))
+    sigma_h = float(_softplus(best_params[0]))  # #116: was params
+    sigma_q_level = float(_softplus(best_params[1]))
+    sigma_q_seas = float(_softplus(best_params[2]))
     sigma_q = jnp.concatenate([jnp.array([sigma_q_level]), jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1)])
     _, at, Pt, _, _, _ = m5_ssp_optim.kalman_filter_1d(
         a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q, y=y, Z=Z, logp=False
