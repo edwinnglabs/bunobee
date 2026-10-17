@@ -99,8 +99,12 @@ Baseline, the current model (`ssp_dow`):
 
 | | Validation (public) | Evaluation (private) |
 |---|---|---|
-| Local | 1.08136 | 0.97573 |
-| Kaggle | 1.08127 | 0.97572 |
+| Local, #94 submission | 1.08136 | 0.97573 |
+| Kaggle, #94 submission | 1.08127 | 0.97572 |
+| Local, after the #116 fix | 1.10175 | 0.99403 |
+
+The #116 fix of the best-parameter tracking changed `ssp_dow`'s forecasts (see "Sigma priors and best-parameter
+tracking (#116)"); compare new full runs with the last row.
 
 ### `ssp_level_dow` (#106)
 
@@ -239,7 +243,8 @@ The bias of levels 10–12 is the dollar-weighted mean of each series' relative 
 
 Share of series with a fitted sigma within 1% of its prior's width of a bound, or past it (`m5_bias.py`,
 `bounds.csv`; the priors are `sigma_h` ~ U(0.1, 0.5) and each drift ~ U(0.01, 0.1)). No `sigma_h` and at
-most 5% of the drifts sit on a lower bound.
+most 5% of the drifts sit on a lower bound. These fits predate the #116 fix, which keeps sigmas inside their
+bounds; `m5_bias.py` now counts within one Adam step of a bound instead.
 
 | Entry | Any sigma | `sigma_h` on 0.5 | First drift on 0.1 | Shared drift on 0.1 |
 |---|---|---|---|---|
@@ -268,12 +273,117 @@ most 5% of the drifts sit on a lower bound.
   since their first sale 25% low.
 - **The sigma priors don't fit the standardised scale.** They were set for log sales; the standardised
   powered sales have unit variance, so `sigma_h` sits on its 0.5 cap for 92–100% of series. The inverse
-  takes the capped variance, which understates the spread and so the correction. #116 is about that cap.
+  takes the capped variance, which understates the spread and so the correction. #116 removes that cap (see
+  "Sigma priors and best-parameter tracking (#116)").
 - **Fitting takes longer:** 26–35 s against 17–20 s on the sample, for scikit-learn's λ fit (slowest for
   Box-Cox) and the quadrature over the in-sample fit.
 
 **Decision:** `ssp_dow` stays the default `--model` until `ssp_level_dow_yeojohnson` passes a full run and the
 evaluation window, which this issue did not run. The sample misled once before (see "Open items").
+
+### Sigma priors and best-parameter tracking (#116)
+
+**The bug.** Each Adam step computes the loss of the current parameters, then updates them.
+`fit_batch_series_opt` kept the updated parameters as the best, one step after the loss they were credited with.
+A step past a uniform prior's bound has an infinite loss, so a sigma its bound held came back up to one step past
+the bound (`sigma_h` up to 0.509). `fit_one_series_opt` returned the parameters after its last step. Both now
+return the parameters of their lowest loss, which lie inside the bounds; a sigma a bound holds now stops up to one
+step short of it.
+
+The fix alone, with the default priors, on the 3,000-series sample at the validation origin unless the row says
+otherwise:
+
+| Entry | WRMSSE before | After | Delta | Bias before | After |
+|---|---|---|---|---|---|
+| `ssp_dow` | 0.93487 | 0.94808 | +0.01320 | −9.6% | −10.2% |
+| `ssp_level_dow` | 0.94145 | 0.94956 | +0.00811 | −7.6% | −8.2% |
+| `ssp_level_dow_yeojohnson` | 0.83171 | 0.83233 | +0.00062 | −0.4% | −0.8% |
+| `ssp_dow`, sample, evaluation origin | 0.88578 | 0.90002 | +0.01424 | | |
+| `ssp_dow`, full run, validation | 1.08136 | 1.10175 | +0.02038 | −12.7% | −13.2% |
+| `ssp_dow`, full run, evaluation | 0.97573 | 0.99403 | +0.01830 | −9.3% | −9.9% |
+
+Every level's bias falls by 0.5–0.8 points. `sigma_h` used to sit just past its 0.5 cap and now sits just inside
+it, so the lognormal correction `exp(σ_h² / 2)` is smaller: levels 1–9 worsen and the item levels (10–12), which
+the log entries forecast high, improve by up to 0.002. The baseline's full-run scores are 0.018–0.020 worse.
+
+**The priors** are now settings: `SspDow` has `sigma_h_prior` and `sigma_q_prior` fields, each a `SigmaPrior`
+(uniform, half-normal or log-normal), passed to the fitter. The defaults are the old U(0.1, 0.5) and U(0.01, 0.1).
+The fit starts each sigma at its prior's mean, which for the defaults is the old starting point. `m5_bias.py`
+reads each entry's priors and counts a sigma as on a bound within one Adam step of it, `lr · (1 − exp(−bound))`,
+where it used to count 1% of the prior's width; with the default priors the shares match #115's (95.8% of
+`ssp_dow`'s `sigma_h` on 0.5, against 95.6%).
+
+**What the sigmas want on the Yeo-Johnson scale.** `ssp_level_dow_yeojohnson` fitted to convergence with no
+effective bound (1,000 steps at lr 0.03, or 300 at lr 0.1) scores 0.74839. Its noise sits at 0.16–1.0 (median
+0.88), the level's drift at 0.004–0.33 (median 0.047) and the weekdays' shared drift at 0.0005–0.036 (median
+0.006). The default priors hold `sigma_h` at 0.5 and so leave noise over for the states, whose drifts rise to
+their own 0.1 cap; freed, the weekday drift falls below the old 0.01 floor for 93% of series.
+
+The registered variants are `ssp_level_dow_yeojohnson` with other priors, at today's 100 steps and lr 0.03. Each
+family got one setting, read off the ranges above (fit days only), not tuned on the validation window:
+
+| Entry | `sigma_h` prior | Drift prior | WRMSSE | Delta | Bias | On a bound |
+|---|---|---|---|---|---|---|
+| `ssp_level_dow_yeojohnson` (#115, before the fix) | U(0.1, 0.5) | U(0.01, 0.1) | 0.83171 | | −0.4% | 99.9% |
+| `ssp_level_dow_yeojohnson` | U(0.1, 0.5) | U(0.01, 0.1) | 0.83233 | +0.00062 | −0.8% | 99.6% |
+| `ssp_level_dow_yeojohnson_wide` | U(0.05, 1.5) | U(0.0005, 0.5) | 0.81790 | −0.01382 | +5.6% | 0.0% |
+| `ssp_level_dow_yeojohnson_halfnormal` | HalfNormal(1) | HalfNormal(0.05) | **0.74610** | **−0.08561** | +1.9% | no bound |
+| `ssp_level_dow_yeojohnson_lognormal` | LogNormal(log 0.8, 0.5) | LogNormal(log 0.02, 1) | 0.74740 | −0.08431 | +2.0% | no bound |
+
+Delta is against #115's best, the first row. "On a bound" is the share of series with any sigma on a bound
+(`m5_bias.py`, `bounds.csv`); #115's 99.9% was counted the old way.
+
+Per level (`m5_compare.py`):
+
+| Level | #115 best | After the fix | `_wide` | `_halfnormal` | `_lognormal` |
+|---|---|---|---|---|---|
+| 1 Total | 0.6690 | 0.6696 | 0.6812 | 0.5127 | 0.5137 |
+| 2 State | 0.7066 | 0.7075 | 0.7050 | 0.5796 | 0.5813 |
+| 3 Store | 0.8413 | 0.8419 | 0.8352 | 0.7744 | 0.7771 |
+| 4 Category | 0.6881 | 0.6901 | 0.6914 | 0.5784 | 0.5797 |
+| 5 Department | 0.8138 | 0.8157 | 0.8041 | 0.7121 | 0.7155 |
+| 6 State × category | 0.7660 | 0.7669 | 0.7491 | 0.6699 | 0.6703 |
+| 7 State × department | 0.8681 | 0.8689 | 0.8463 | 0.7885 | 0.7900 |
+| 8 Store × category | 0.8760 | 0.8764 | 0.8622 | 0.8182 | 0.8197 |
+| 9 Store × department | 0.9302 | 0.9303 | 0.9091 | 0.8700 | 0.8712 |
+| 10 Item | 0.9399 | 0.9397 | 0.9116 | 0.8842 | 0.8845 |
+| 11 Item × state | 0.9390 | 0.9387 | 0.9084 | 0.8813 | 0.8816 |
+| 12 Item × store | 0.9425 | 0.9422 | 0.9110 | 0.8839 | 0.8842 |
+| Bias, levels 1–9 | −0.3 to −1.1% | −0.8 to −1.6% | +4.9 to +5.6% | +1.0 to +2.0% | +1.1 to +2.1% |
+| Bias, levels 10–12 | +10.5 to +12.2% | +9.9 to +11.6% | +18.2 to +19.7% | +14.2 to +15.6% | +14.1 to +15.5% |
+
+Bias by group over the last 28 fit days (`m5_bias.py`; position and slope as in #113):
+
+| Group | #115 best, after the fix | `_halfnormal` |
+|---|---|---|
+| Total | −0.8% | +1.9% |
+| HOBBIES_1 | −2.6% | −1.9% |
+| Low-volume tercile | −29.6% | −32.4% |
+| Mid-volume tercile | −14.3% | −13.0% |
+| High-volume tercile | +5.2% | +8.9% |
+| Position, slope (total) | 0.92, 0.85 | 0.98, 0.68 |
+
+- **The soft priors are better at every level**: `_halfnormal` by 0.056–0.156, most on the totals. They reach the
+  unbounded optimum (0.74839) within today's 100 steps because they start near it, at their means: 0.80 for the
+  noise and 0.040 for the drifts under the half-normals. The fit time is unchanged (29 s).
+- **The wide uniform priors are right but start too far away.** They hold no series on a bound, so the cap is
+  gone, but the fit starts at their midpoints, 0.775 and 0.25, and in 100 steps the weekday drift gets only to
+  0.04: 0.81790, and 5.6% high. At lr 0.1 the same priors score 0.74973 (not registered).
+- **The half-normal drift prior is tight for the level's drift**: it puts 9.3% of them past its 99th percentile,
+  0.129 (2.4% under the log-normal). Separate priors for the level's and the weekdays' drifts, which differ by an
+  order of magnitude, are an open item.
+- **The bias moves up and splits further by volume.** The totals go from 0.8% low to 1.9% high, and the
+  dollar-weighted item bias from +10–12% to +14–16%. The low-volume tercile stays about 30% low and the
+  high-volume one goes 9% high.
+- **On the log target, removing the cap backfires.** `ssp_level_dow_halfnormal` (`ssp_level_dow` with the
+  half-normal priors) scores 1.39880, +0.449 against `ssp_level_dow`, and forecasts 23% high at levels 1–9. Freed,
+  log-scale `sigma_h` goes to 0.47–1.33 (5th to 95th percentile), so the lognormal correction `exp(σ_h² / 2)`
+  reaches ×2.4. The log of
+  intermittent sales is far from Gaussian, so the variance that fits it overstates the correction; the cap had
+  hidden that. The log entries keep the default priors.
+
+**Decision:** `ssp_level_dow_yeojohnson_halfnormal` is the best entry on the sample. `ssp_dow` stays the default
+`--model` until #118 full-runs the winner and checks it on the evaluation window.
 
 ## Working on the model
 
@@ -281,9 +391,9 @@ evaluation window, which this issue did not run. The sample misled once before (
 
 | File | What to change there |
 |---|---|
-| `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, priors, loss and optimizer. `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
+| `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, loss and optimizer. `SigmaPrior`: the priors of the noise and the drifts, which the fitter takes as arguments (by default `SIGMA_H_PRIOR` and `SIGMA_Q_PRIOR`). `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
 | `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction), `LogTransform`, the default, and `PowerTransform`, a Box-Cox or Yeo-Johnson power fitted per series. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
-| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `transform`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
+| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `transform`, `sigma_h_prior`, `sigma_q_prior`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
 | `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
@@ -303,7 +413,8 @@ so adding a model needs only a new entry.
 - **Structure:** `y_t = Σ_i Z[t, i] · a[t, i] + noise`. The columns of `Z` are weekday indicators for
   Tuesday to Sunday (Monday is dropped), and each state `a_i` drifts as a random walk.
 - **Parameters:** 3 per series: the noise level, the drift of the first state and a drift shared by the
-  other five. Uniform priors; 100 Adam steps at learning rate 0.03.
+  other five. Uniform priors, U(0.1, 0.5) on the noise and U(0.01, 0.1) on each drift, which hold most series
+  on their upper bounds; 100 Adam steps at learning rate 0.03, keeping the parameters of the lowest loss.
 - **Forecast:** the last filtered state times the future `Z`, back-transformed as a lognormal mean and
   rescaled by `mean`.
 
@@ -326,7 +437,9 @@ drift.
   forecast tracks the geometric mean of `max(sales, 0.1)`, and the lognormal correction, with `sigma_h`
   capped, lifts it only part of the way to the arithmetic mean (see "Level bias diagnosis (#113)").
   `ssp_level_dow_yeojohnson` follows the arithmetic mean and forecasts the sample's totals 0.4% low, but
-  not yet on a full run (see "Power transforms (#115)").
+  not yet on a full run (see "Power transforms (#115)"). With soft sigma priors in place of the caps,
+  `ssp_level_dow_yeojohnson_halfnormal` forecasts them 1.9% high and scores 0.74610 on the sample (see "Sigma
+  priors and best-parameter tracking (#116)").
 - **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
   New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
   after the first the shared drift.
@@ -341,6 +454,9 @@ drift.
 - **Hierarchical parameter sharing:** share the weekday drift within department × store groups (70 groups),
   either outright or through a prior that pulls each series toward its group. Most useful for sparse
   series.
+- **One prior for both drifts:** `sigma_q_prior` covers the level's drift and the weekdays' shared drift, which
+  on the Yeo-Johnson scale sit an order of magnitude apart (medians 0.047 and 0.006). A prior for each would let
+  the level's drift prior be wider than `HalfNormal(0.05)`.
 - **No test that the batch fit is correct:** nothing checks that `fit_batch_series_opt` matches the
   single-series `fit_one_series_opt` on the same series.
 - **float32 log-likelihood:** the loss sums 1,913 steps in float32. Summing in float64 has not been tried.

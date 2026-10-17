@@ -9,7 +9,10 @@ an instance of it in :data:`MODELS`. Its fields are its settings: ``m5_run.py`` 
 ``run_stats.json``, so two entries of one class with different settings are two models. An SSP entry picks
 its target transform (a ``bunobee.models.m5.transforms.Transform``) with its ``transform`` field, so trying a
 transform needs only a new entry, not an edit of the fitter: the ``*_boxcox_*`` and ``*_yeojohnson`` entries are
-``ssp_dow`` and ``ssp_level_dow`` with a power transform fitted per series (issue #115).
+``ssp_dow`` and ``ssp_level_dow`` with a power transform fitted per series (issue #115). It picks the priors of its
+noise and drifts the same way, with its ``sigma_h_prior`` and ``sigma_q_prior`` fields (a
+``bunobee.models.m5.m5_ssp_optim.SigmaPrior`` each): the ``*_wide``, ``*_halfnormal`` and ``*_lognormal`` entries
+swap the default uniform priors, set for the log target, for wider or soft ones (issue #116).
 """
 
 from __future__ import annotations
@@ -23,7 +26,13 @@ import jax.numpy as jnp
 import numpy as np
 import xarray as xr
 
-from bunobee.models.m5.m5_ssp_optim import fit_batch_series_opt, predict_batch_series_opt
+from bunobee.models.m5.m5_ssp_optim import (
+    SIGMA_H_PRIOR,
+    SIGMA_Q_PRIOR,
+    SigmaPrior,
+    fit_batch_series_opt,
+    predict_batch_series_opt,
+)
 from bunobee.models.m5.transforms import LogTransform, PowerTransform, Transform
 from bunobee.regression import make_periodic_dummies
 
@@ -126,6 +135,10 @@ class SspDow:
     transform : Transform
         Target transform of ``fit_batch_series_opt``, by default ``LogTransform()``: each series is fitted to
         ``log(max(sales, 0.1) / mean)`` and its forecasts are inverted as lognormal means.
+    sigma_h_prior : SigmaPrior
+        Prior of the noise ``sigma_h``, by default ``SIGMA_H_PRIOR``, U(0.1, 0.5), set for the log target.
+    sigma_q_prior : SigmaPrior
+        Prior of each drift, by default ``SIGMA_Q_PRIOR``, U(0.01, 0.1), set for the log target.
     n_iter : int
         Adam optimisation steps per fit run, by default 100.
     lr : float
@@ -140,6 +153,8 @@ class SspDow:
 
     level: bool = False
     transform: Transform = LogTransform()
+    sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR
+    sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR
     n_iter: int = 100
     lr: float = 3e-2
     chunk_size: int | None = 4096
@@ -197,6 +212,8 @@ class SspDow:
                 log_every=100,
                 show_progress=True,
                 transform=self.transform,
+                sigma_h_prior=self.sigma_h_prior,
+                sigma_q_prior=self.sigma_q_prior,
             )
             forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
             for key, value in result.items():
@@ -206,9 +223,27 @@ class SspDow:
         return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
 
 
+#: Sigma priors for the standardised power scale (issue #116), where the default priors, set for log sales, hold
+#: ``sigma_h`` at 0.5 and the drifts at 0.1. Fitted with no bound, the noise sits at 0.16-1.0 there, the level's
+#: drift at 0.004-0.33 and the weekdays' drift at 0.0005-0.04. ``WIDE_PRIORS`` are uniform priors wide enough for all
+#: of them, and ``HALF_NORMAL_PRIORS`` and ``LOG_NORMAL_PRIORS`` soft priors, with no bound, centred near them.
+WIDE_PRIORS = {
+    "sigma_h_prior": SigmaPrior("uniform", (0.05, 1.5)),
+    "sigma_q_prior": SigmaPrior("uniform", (0.0005, 0.5)),
+}
+HALF_NORMAL_PRIORS = {
+    "sigma_h_prior": SigmaPrior("half_normal", (1.0,)),
+    "sigma_q_prior": SigmaPrior("half_normal", (0.05,)),
+}
+LOG_NORMAL_PRIORS = {
+    "sigma_h_prior": SigmaPrior("log_normal", (math.log(0.8), 0.5)),
+    "sigma_q_prior": SigmaPrior("log_normal", (math.log(0.02), 1.0)),
+}
+
 #: Registered models by name, the choices of ``m5_run.py --model``. The power-transform entries fit Box-Cox of
 #: ``sales + 0.5`` (``boxcox_shift``), Box-Cox of ``max(sales, 0.1)`` (``boxcox_floor``) and Yeo-Johnson, which on
-#: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state.
+#: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state. The ``_wide``,
+#: ``_halfnormal`` and ``_lognormal`` entries swap the default sigma priors for those above.
 MODELS: dict[str, Model] = {
     "ssp_dow": SspDow(),
     "ssp_level_dow": SspDow(level=True),
@@ -218,6 +253,14 @@ MODELS: dict[str, Model] = {
     "ssp_level_dow_boxcox_shift": SspDow(level=True, transform=PowerTransform("box-cox", shift=0.5)),
     "ssp_level_dow_boxcox_floor": SspDow(level=True, transform=PowerTransform("box-cox", floor=0.1)),
     "ssp_level_dow_yeojohnson": SspDow(level=True, transform=PowerTransform("yeo-johnson")),
+    "ssp_level_dow_yeojohnson_wide": SspDow(level=True, transform=PowerTransform("yeo-johnson"), **WIDE_PRIORS),
+    "ssp_level_dow_yeojohnson_halfnormal": SspDow(
+        level=True, transform=PowerTransform("yeo-johnson"), **HALF_NORMAL_PRIORS
+    ),
+    "ssp_level_dow_yeojohnson_lognormal": SspDow(
+        level=True, transform=PowerTransform("yeo-johnson"), **LOG_NORMAL_PRIORS
+    ),
+    "ssp_level_dow_halfnormal": SspDow(level=True, **HALF_NORMAL_PRIORS),
 }
 
 #: The baseline entry, ``m5_run.py``'s default ``--model``.

@@ -110,11 +110,15 @@ model, add an entry; `m5_run.py` needs no change.
 
 | Entry | Model | Settings |
 |---|---|---|
-| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The default, and the model of the #93 and #94 Kaggle submissions | `level=False`, `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
+| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The default, and the model of the #93 and #94 Kaggle submissions | `level=False`, `transform=LogTransform()`, `sigma_h_prior=SIGMA_H_PRIOR` (U(0.1, 0.5)), `sigma_q_prior=SIGMA_Q_PRIOR` (U(0.01, 0.1)), `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
 | `ssp_level_dow` | `ssp_dow` with a level state: a column of ones leads the weekday dummies, so 7 states (#106) | `level=True`, otherwise as `ssp_dow` |
 | `ssp_dow_boxcox_shift`, `ssp_level_dow_boxcox_shift` | `ssp_dow`, `ssp_level_dow` fitted to a Box-Cox power of `sales + 0.5`, λ fitted per series (#115) | `transform=PowerTransform("box-cox", shift=0.5)` |
 | `ssp_dow_boxcox_floor`, `ssp_level_dow_boxcox_floor` | The same with Box-Cox of `max(sales, 0.1)` | `transform=PowerTransform("box-cox", floor=0.1)` |
 | `ssp_dow_yeojohnson`, `ssp_level_dow_yeojohnson` | The same with Yeo-Johnson of `sales`, which on sales is Box-Cox of `sales + 1` | `transform=PowerTransform("yeo-johnson")` |
+| `ssp_level_dow_yeojohnson_wide` | `ssp_level_dow_yeojohnson` with uniform sigma priors wide enough for the standardised scale (#116) | `sigma_h_prior=SigmaPrior("uniform", (0.05, 1.5))`, `sigma_q_prior=SigmaPrior("uniform", (0.0005, 0.5))` |
+| `ssp_level_dow_yeojohnson_halfnormal` | The same with soft half-normal priors, no bound. Best on the 3,000-series sample (0.74610) | `sigma_h_prior=SigmaPrior("half_normal", (1.0,))`, `sigma_q_prior=SigmaPrior("half_normal", (0.05,))` |
+| `ssp_level_dow_yeojohnson_lognormal` | The same with soft log-normal priors | `sigma_h_prior=SigmaPrior("log_normal", (log(0.8), 0.5))`, `sigma_q_prior=SigmaPrior("log_normal", (log(0.02), 1.0))` |
+| `ssp_level_dow_halfnormal` | `ssp_level_dow` with the half-normal priors: on the log target it forecasts 23% high | As `ssp_level_dow_yeojohnson_halfnormal`, with the log transform |
 
 ## Reference results
 
@@ -126,8 +130,8 @@ Mac as below:
 | Fit time | 16.9 s (validation origin) + 17.2 s (evaluation origin) |
 | Whole run | about 20 s with `--origins validation`, 37 s with both origins |
 | Peak memory | 3.3 GiB with `--origins validation`, 3.5 GiB with both origins |
-| Local WRMSSE, validation window | 0.93487 |
-| Local WRMSSE, evaluation window | 0.88578 |
+| Local WRMSSE, validation window | 0.94808 (0.93487 before the #116 fix) |
+| Local WRMSSE, evaluation window | 0.90002 (0.88578 before the #116 fix) |
 
 Full run of `ssp_dow` with its default settings on an 18-core, 128 GB Mac, JAX on CPU:
 
@@ -135,8 +139,8 @@ Full run of `ssp_dow` with its default settings on an 18-core, 128 GB Mac, JAX o
 |---|---|
 | Fit time | 158.9 s (validation origin) + 160.2 s (evaluation origin); 328 s for the whole run |
 | Peak memory | 22.3 GiB (14.4 GiB after the first origin: the second fit does not release all of the first one's memory) |
-| Local WRMSSE, validation window | 1.08136 |
-| Local WRMSSE, evaluation window | 0.97573 |
+| Local WRMSSE, validation window | 1.10175 (1.08136 before the #116 fix, the #94 submission) |
+| Local WRMSSE, evaluation window | 0.99403 (0.97573 before the #116 fix) |
 
 How well the local scorer matches the official one:
 

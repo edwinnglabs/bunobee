@@ -9,6 +9,8 @@ in-sample fit, drawn in ``forecasts.pdf`` (issue #105), is checked against the K
 one-step-ahead prediction. An entry picks its target transform with its ``transform`` field (issue #114),
 so a transform the fitter has never seen is tried without editing it. The power-transform entries (issue #115)
 are ``ssp_dow`` and ``ssp_level_dow`` with a Box-Cox or Yeo-Johnson transform; no entry forecasts negative sales.
+An entry picks the priors of its noise and drifts with its ``sigma_h_prior`` and ``sigma_q_prior`` fields (issue
+#116); the prior entries are their base entries with other priors, and every other entry keeps the default ones.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -213,6 +215,51 @@ class TestRegistry:
         model = m5_models.MODELS[name]
         assert is_dataclass(model)
         json.dumps(asdict(model))
+
+
+# The prior entries (issue #116): name -> the entry they swap the priors of, and their priors.
+PRIOR_ENTRIES = {
+    "ssp_level_dow_yeojohnson_wide": ("ssp_level_dow_yeojohnson", m5_models.WIDE_PRIORS),
+    "ssp_level_dow_yeojohnson_halfnormal": ("ssp_level_dow_yeojohnson", m5_models.HALF_NORMAL_PRIORS),
+    "ssp_level_dow_yeojohnson_lognormal": ("ssp_level_dow_yeojohnson", m5_models.LOG_NORMAL_PRIORS),
+    "ssp_level_dow_halfnormal": ("ssp_level_dow", m5_models.HALF_NORMAL_PRIORS),
+}
+DEFAULT_PRIORS = {"sigma_h_prior": m5_models.SIGMA_H_PRIOR, "sigma_q_prior": m5_models.SIGMA_Q_PRIOR}
+
+
+class TestPriors:
+    """An entry picks the priors of its noise and drifts with its fields, by default the fitter's uniform priors."""
+
+    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in PRIOR_ENTRIES])
+    def test_other_entries_keep_the_default_priors(self, name):
+        model = m5_models.MODELS[name]
+        assert (model.sigma_h_prior, model.sigma_q_prior) == tuple(DEFAULT_PRIORS.values())
+
+    @pytest.mark.parametrize("name", list(PRIOR_ENTRIES))
+    def test_prior_entries_differ_from_their_base_only_by_the_priors(self, name):
+        base, priors = PRIOR_ENTRIES[name]
+        model = m5_models.MODELS[name]
+        assert (model.sigma_h_prior, model.sigma_q_prior) == (priors["sigma_h_prior"], priors["sigma_q_prior"])
+        assert replace(model, **DEFAULT_PRIORS) == m5_models.MODELS[base]
+
+    def test_settings_record_the_priors(self):
+        settings = json.loads(json.dumps(asdict(m5_models.MODELS["ssp_level_dow_yeojohnson_halfnormal"])))
+        assert settings["sigma_h_prior"] == {"family": "half_normal", "params": [1.0]}
+        assert settings["sigma_q_prior"] == {"family": "half_normal", "params": [0.05]}
+        assert json.loads(json.dumps(asdict(m5_models.MODELS["ssp_dow"])))["sigma_h_prior"] == {
+            "family": "uniform",
+            "params": [0.1, 0.5],
+        }
+
+    def test_the_entry_fits_with_its_priors(self, ds):
+        narrow = {
+            "sigma_h_prior": m5_models.SigmaPrior("uniform", (0.2, 0.25)),
+            "sigma_q_prior": m5_models.SigmaPrior("uniform", (0.02, 0.03)),
+        }
+        model = replace(m5_models.MODELS["ssp_level_dow"], n_iter=20, **narrow)
+        _, fitted = model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        assert np.all((fitted["sigma_h"] >= 0.2) & (fitted["sigma_h"] <= 0.25))
+        assert np.all((fitted["sigma_q"] >= 0.02) & (fitted["sigma_q"] <= 0.03))
 
 
 class TestContract:

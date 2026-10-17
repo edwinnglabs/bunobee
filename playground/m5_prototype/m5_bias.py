@@ -38,7 +38,8 @@ them by the share of zero days from their first sale on, so days before an item 
 
 For a model that returns the SSP noise and drifts, it also logs the share of series with each of them on a
 bound of its uniform prior, and with any of them on one (see :func:`prior_bound_shares`): the bias correction
-of the back-transform grows with ``sigma_h``, so a ``sigma_h`` held at its upper bound caps it.
+of the back-transform grows with ``sigma_h``, so a ``sigma_h`` held at its upper bound caps it. A soft prior
+(half-normal or log-normal) has no bound, so its sigmas are left out.
 
 The per-series statistics, the group tables and the bound shares are written to ``series.csv``, ``groups.csv``
 and ``bounds.csv`` in ``<--output-dir>/bias_<timestamp>/``. The evaluation window is never fitted or read.
@@ -48,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -55,8 +57,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
-
-from bunobee.models.m5.m5_ssp_optim import SIGMA_H_BOUNDS, SIGMA_Q_BOUNDS
 
 from m5_common import DATA_DIR, load_m5_ds
 from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
@@ -79,10 +79,6 @@ ZERO_SHARE_EDGES = (0.25, 0.5, 0.75, 1.0)
 #: Groupings of :func:`group_table`, in output order: name -> ``series.csv`` column of each series' group,
 #: or None for one group of all series.
 GROUPINGS: dict[str, str | None] = {"total": None, "dept": "dept_id", "volume": "volume", "zero_share": "zero_bin"}
-
-#: Share of a prior's width within which a fitted sigma counts as on a bound of the prior. The fitters keep the
-#: parameters one Adam step past the best loss, so a sigma its bound holds can sit just past the bound.
-BOUND_TOL = 0.01
 
 
 def _parse_args() -> argparse.Namespace:
@@ -345,8 +341,33 @@ def log_group_table(table: pd.DataFrame, model: str, window: str, window_days: s
         )
 
 
-def prior_bound_shares(fitted: dict[str, np.ndarray], tol: float = BOUND_TOL) -> dict[str, float]:
+def bound_margin(bound: float, lr: float) -> float:
+    """How far one Adam step moves a sigma at ``bound``: ``lr · (1 - exp(-bound))``.
+
+    The fitters optimise each sigma's softplus inverse, and Adam moves a parameter by about ``lr`` a step when its
+    gradient keeps its sign, so the sigma moves by ``lr`` times the softplus' slope there, ``1 - exp(-sigma)``.
+
+    Parameters
+    ----------
+    bound : float
+        A bound of a uniform prior of a sigma.
+    lr : float
+        The fit's Adam learning rate.
+
+    Returns
+    -------
+    float
+        The step of the sigma at the bound.
+    """
+    return lr * -math.expm1(-bound)
+
+
+def prior_bound_shares(fitted: dict[str, np.ndarray], model: object) -> dict[str, float]:
     """Share of series with each fitted sigma on a bound of its uniform prior, and with any of them on one.
+
+    A step that takes a sigma past a uniform prior's bound has an infinite loss, so the fit keeps the last
+    parameters inside the bounds and a sigma the bound holds stops up to one Adam step short of it. A sigma counts
+    as on a bound within :func:`bound_margin` of it. A sigma with a soft prior has no bound and is left out.
 
     Parameters
     ----------
@@ -354,33 +375,41 @@ def prior_bound_shares(fitted: dict[str, np.ndarray], tol: float = BOUND_TOL) ->
         A model's ``fitted`` output. The SSP entries return ``sigma_h``, the noise, of shape ``(n_series,)`` and
         ``sigma_q``, the drifts, of shape ``(n_series, n_states)``: the first state's drift, then the drift the
         other states share.
-    tol : float
-        Share of a prior's width within which a sigma counts as on a bound, by default :data:`BOUND_TOL`. A
-        sigma past a bound counts as on it.
+    model : Model
+        The registered entry that fitted them. The SSP entries' ``sigma_h_prior`` and ``sigma_q_prior`` are the
+        priors and their ``lr`` sets the margin.
 
     Returns
     -------
     dict of str to float
-        For ``sigma_h``, ``sigma_q_first`` (the first state's drift) and ``sigma_q_rest`` (the shared drift),
-        the share of series with it on the lower and on the upper bound of its prior, under the keys
-        ``<sigma>_low`` and ``<sigma>_high``. Last, ``any``: the share of series with any of them on a bound.
-        Empty if ``fitted`` has no ``sigma_h`` or no ``sigma_q``.
+        For each of ``sigma_h``, ``sigma_q_first`` (the first state's drift) and ``sigma_q_rest`` (the shared
+        drift) with a uniform prior, the share of series with it on the lower and on the upper bound of its prior,
+        under the keys ``<sigma>_low`` and ``<sigma>_high``. Last, ``any``: the share of series with any of them
+        on a bound. Empty if ``fitted`` has no ``sigma_h`` or no ``sigma_q``, if ``model`` has no priors, or if
+        none of them is uniform.
     """
-    if "sigma_h" not in fitted or "sigma_q" not in fitted:
+    priors = [getattr(model, name, None) for name in ("sigma_h_prior", "sigma_q_prior")]
+    if "sigma_h" not in fitted or "sigma_q" not in fitted or None in priors:
         return {}
+    sigma_h_prior, sigma_q_prior = priors
     sigma_q = np.asarray(fitted["sigma_q"])
     sigmas = {
-        "sigma_h": (np.asarray(fitted["sigma_h"]), SIGMA_H_BOUNDS),
-        "sigma_q_first": (sigma_q[:, 0], SIGMA_Q_BOUNDS),
-        "sigma_q_rest": (sigma_q[:, 1], SIGMA_Q_BOUNDS),
+        "sigma_h": (np.asarray(fitted["sigma_h"]), sigma_h_prior.bounds),
+        "sigma_q_first": (sigma_q[:, 0], sigma_q_prior.bounds),
+        "sigma_q_rest": (sigma_q[:, 1], sigma_q_prior.bounds),
     }
     shares: dict[str, float] = {}
     on_any = np.zeros(sigma_q.shape[0], dtype=bool)
-    for name, (values, (low, high)) in sigmas.items():
-        margin = tol * (high - low)
-        on_low, on_high = values <= low + margin, values >= high - margin
+    for name, (values, bounds) in sigmas.items():
+        if bounds is None:
+            continue
+        low, high = bounds
+        on_low = values <= low + bound_margin(low, model.lr)
+        on_high = values >= high - bound_margin(high, model.lr)
         shares[f"{name}_low"], shares[f"{name}_high"] = float(on_low.mean()), float(on_high.mean())
         on_any |= on_low | on_high
+    if not shares:
+        return {}
     shares["any"] = float(on_any.mean())
     return shares
 
@@ -483,7 +512,7 @@ def main() -> None:
         forecasts, fitted = MODELS[model].fit_forecast(ds, fit_idx, fit_mask, forecast_mask)
         logger.info("Fitted %s on %d series in %.1fs", model, fit_idx.size, time.time() - t0)
         fitted.pop(INSAMPLE_KEY, None)
-        bounds = prior_bound_shares(fitted)
+        bounds = prior_bound_shares(fitted, MODELS[model])
         if bounds:
             log_bound_shares(bounds, model)
             bound_rows.append({"model": model, **bounds})

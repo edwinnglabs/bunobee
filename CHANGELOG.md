@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   range from 0 to its largest fit-day sales, so forecasts are never negative.
 - `SIGMA_H_BOUNDS` and `SIGMA_Q_BOUNDS` in `bunobee.models.m5.m5_ssp_optim` — the bounds of the uniform
   priors on the noise and the drifts of the MAP fitters, which use them. Their values are unchanged.
+- `SigmaPrior` in `bunobee.models.m5.m5_ssp_optim` — the prior of a sigma of the MAP fitters: uniform (bounded),
+  half-normal or log-normal. `fit_one_series_opt` and `fit_batch_series_opt` take `sigma_h_prior` and
+  `sigma_q_prior` arguments, by default `SIGMA_H_PRIOR` = U(0.1, 0.5) and `SIGMA_Q_PRIOR` = U(0.01, 0.1), the
+  previous priors, and start each sigma at its prior's mean (the previous midpoints for the defaults).
+  `fit_one_series_opt` also returns `final_loss`, the loss of the returned parameters.
 
 ### Changed
 
@@ -45,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `fit_batch_series_opt` returns the parameters that achieved its best loss. It kept the parameters one Adam step
+  after them, so a sigma its uniform prior's bound held came back just past the bound (e.g. `sigma_h` 0.5085
+  under U(0.1, 0.5)). `fit_one_series_opt` returned the parameters after its last step, whose loss it never
+  computed; it now returns those of its lowest loss too. The returned sigmas lie inside their prior's bounds.
+  This changes the M5 forecasts slightly, as the capped `sigma_h` and its lognormal correction shrink: `ssp_dow`'s
+  validation WRMSSE moves from 0.93487 to 0.94808 on the 3,000-series sample and from 1.08136 to 1.10175 on
+  the full run.
 - `hyper_tuning_dlt_with_wbic` runs again: it called `run_dlt_model` with arguments that no longer exist
   and raised a `TypeError`.
 - DLT `make_inference` documents that with `noise_embed=False` (the default) the forecast band reflects
