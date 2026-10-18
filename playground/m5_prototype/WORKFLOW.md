@@ -82,9 +82,11 @@ Every level counts equally, so the store and department totals matter as much as
 
 In `output/<timestamp>/`, `wrmsse_per_level.csv` gives the score of each level and a bias column showing
 whether forecasts run high or low. That's where to look for what to fix. `forecasts.pdf` shows where: for
-each cutoff day, the total, store and department sums of the fitted series, then 50 series picked at random,
-by worst RMSSE or by top weight (`--plot-select random|worst|top`). Each panel draws the actuals, the
-model's in-sample fit and the forecast, with the RMSSE, bias and weight in its title.
+each cutoff day, the total, store, category and department sums of the fitted series, then the 10 series with
+the worst RMSSE, the 10 with the best, the 10 with the worst contribution (weight × RMSSE, what a series costs
+the item-level score once its dollar sales are counted), the 10 with the best, and 30 series at random
+(`--n-plot-ranked`, `--n-plot-random`). Each panel draws the actuals, the model's in-sample fit and the
+forecast, with the RMSSE, bias, weight and contribution in its title.
 
 ## The experiment loop
 
