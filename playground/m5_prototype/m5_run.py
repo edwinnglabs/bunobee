@@ -15,8 +15,8 @@ Usage examples
 # Fit all 30,490 series with a named model at all three origins and generate a submission CSV:
     python m5_run.py --model ssp_dow --n-demo 0
 
-# Review the 20 worst-forecast series of a quick loop in forecasts.pdf:
-    python m5_run.py --n-demo 3000 --origins prevalidation --plot-select worst --n-plot 20
+# A quick loop whose forecasts.pdf draws 20 series in each ranked section and none at random:
+    python m5_run.py --n-demo 3000 --origins prevalidation --n-plot-ranked 20 --n-plot-random 0
 
 # The quick loop with the forecasts rounded to integers:
     python m5_run.py --model ssp_dow --n-demo 3000 --origins prevalidation --round
@@ -42,10 +42,11 @@ See ``WORKFLOW.md``, "The experiment loop".
 saved, submitted and scored (see :func:`_round_forecasts`). It is off by default: WRMSSE is a squared error, so
 the best point forecast is the mean, which is rarely an integer (see ``WORKFLOW.md``, "Integer rounding (#117)").
 
-``forecasts.pdf`` reviews each fitted origin: first the total, store and department sums of the fitted
-series, then ``--n-plot`` series picked by ``--plot-select`` (at random, by worst RMSSE or by top dollar-sales
-weight). Every panel shows the last ``PLOT_HISTORY`` fit days, the actuals and the forecast over the forecast
-window, and the model's in-sample fit when the model returns one (``m5_models.INSAMPLE_KEY``).
+``forecasts.pdf`` reviews each fitted origin: first the total, store, category and department sums of the fitted
+series, then the ``PLOT_RANKED`` sections of ``--n-plot-ranked`` series each (the worst and best RMSSE, and the
+worst and best contribution, weight x RMSSE), then ``--n-plot-random`` series at random. Every panel shows the
+last ``PLOT_HISTORY`` fit days, the actuals and the forecast over the forecast window, and the model's in-sample
+fit when the model returns one (``m5_models.INSAMPLE_KEY``).
 
 The run scores each origin's forecasts with the 12-level hierarchical WRMSSE and writes the per-level
 tables to ``wrmsse_per_level.csv`` in the run directory, one ``window`` per origin. The evaluation window
@@ -109,15 +110,21 @@ ORIGINS: dict[str, tuple[str, ...]] = {
 #: File name of the run log in ``--output-dir``, next to the run directories.
 RUN_LOG = "runs.csv"
 
-#: ``--plot-select`` choice -> how ``forecasts.pdf`` orders the fitted series before taking ``--n-plot``.
-PLOT_SELECT: dict[str, str] = {"random": "picked at random", "worst": "worst RMSSE first", "top": "top weight first"}
+#: Ranked sections of ``forecasts.pdf``, in drawing order: heading -> (the score they rank the fitted series by,
+#: whether the highest comes first). A series' contribution is its weight x RMSSE, its term in the level-12 WRMSSE.
+PLOT_RANKED: dict[str, tuple[str, bool]] = {
+    "worst RMSSE": ("rmsse", True),
+    "best RMSSE": ("rmsse", False),
+    "worst contribution": ("contribution", True),
+    "best contribution": ("contribution", False),
+}
 
 #: Fit days ``forecasts.pdf`` shows before each forecast origin.
 PLOT_HISTORY = 90
 
 #: Sums of the fitted series ``forecasts.pdf`` draws after the total: panel name prefix -> the ``series_id``
 #: coordinate they group by.
-PLOT_SUMS: dict[str, str] = {"store": "store_id", "dept": "dept_id"}
+PLOT_SUMS: dict[str, str] = {"store": "store_id", "cat": "cat_id", "dept": "dept_id"}
 
 #: Line colours of ``forecasts.pdf``: the first three slots of a colourblind-checked categorical palette.
 _PLOT_COLORS = {"actual": "#2a78d6", "forecast": "#eb6834", "insample": "#1baf7a"}
@@ -175,19 +182,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "submitted and scored. Off by default.",
     )
     p.add_argument(
-        "--n-plot",
+        "--n-plot-ranked",
         type=int,
-        default=50,
+        default=10,
         metavar="N",
-        help="Number of series to include in forecasts.pdf per origin, after the total, store and department "
-        "sums. 0 = all fitted series.",
+        help="Number of series in each ranked section of forecasts.pdf per origin, after the sums: the worst and "
+        "best RMSSE over the forecast window, and the worst and best contribution (weight x RMSSE), by default "
+        "10. 0 = no ranked sections.",
     )
     p.add_argument(
-        "--plot-select",
-        choices=tuple(PLOT_SELECT),
-        default="random",
-        help="How to pick the --n-plot series at each origin: random, worst (highest RMSSE over the forecast "
-        "window) or top (highest dollar-sales weight), by default random.",
+        "--n-plot-random",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Number of series picked at random for forecasts.pdf per origin, after the ranked sections, the "
+        "same at every origin, by default 30. 0 = none.",
     )
     p.add_argument(
         "--plots-per-page", type=int, default=5, metavar="N", help="Forecast subplots per PDF page, by default 5."
@@ -335,6 +344,10 @@ class _Panels:
         """RMSSE of each row's forecast over the forecast days, NaN for rows without actuals."""
         return np.sqrt(np.mean((self.forecast - self.actual) ** 2, axis=1) / rmsse_scale(self.history))
 
+    def contribution(self) -> np.ndarray:
+        """Each row's weight x RMSSE, its term in the WRMSSE of its level; NaN for rows without actuals."""
+        return self.weight * self.rmsse()
+
     def bias(self) -> np.ndarray:
         """Each row's forecast total over its actual total, minus one; NaN without actuals or sales."""
         actual = self.actual.sum(axis=1)
@@ -435,47 +448,99 @@ def _sum_panels(panels: _Panels, ds: xr.Dataset, fit_idx: np.ndarray) -> _Panels
     return panels.summed(names, np.stack(members))
 
 
-def _select_series(select: str, panels: _Panels, random_order: np.ndarray, n_plot: int) -> np.ndarray:
-    """Rows of the series ``forecasts.pdf`` draws, in drawing order.
+def _rank_series(panels: _Panels, score: str, highest_first: bool, n_plot: int) -> np.ndarray:
+    """Rows of the series with the highest or lowest score, in drawing order.
+
+    Rows without a finite score (no actuals) are left out. Ranking by contribution also leaves out the rows of
+    weight 0: they contribute nothing whatever their RMSSE, so they would fill the best-contribution section with
+    ties at 0.
 
     Parameters
     ----------
-    select : str
-        A ``PLOT_SELECT`` choice: ``"random"`` takes ``random_order``, ``"worst"`` the highest RMSSE first
-        (rows without actuals last) and ``"top"`` the highest weight first.
     panels : _Panels
         Panels of the fitted series.
-    random_order : np.ndarray
-        A random permutation of the rows of ``panels``.
+    score : str
+        ``"rmsse"`` or ``"contribution"`` (weight x RMSSE), as in ``PLOT_RANKED``.
+    highest_first : bool
+        Whether the highest score comes first.
     n_plot : int
-        Number of rows to return.
+        Number of rows to return, at most.
 
     Returns
     -------
     np.ndarray
-        ``n_plot`` row positions.
+        Up to ``n_plot`` row positions; ties keep fit order.
     """
-    if select == "worst":
-        order = np.argsort(-panels.rmsse(), kind="stable")  # -NaN is NaN, which argsort puts last
-    elif select == "top":
-        order = np.argsort(-panels.weight, kind="stable")
-    else:
-        order = random_order
-    return order[:n_plot]
+    values = panels.rmsse() if score == "rmsse" else panels.contribution()
+    keep = np.isfinite(values)
+    if score == "contribution":
+        keep &= panels.weight > 0
+    rows = np.flatnonzero(keep)
+    order = np.argsort(-values[rows] if highest_first else values[rows], kind="stable")
+    return rows[order[:n_plot]]
 
 
-def _panel_title(name: str, rmsse: float, bias: float, weight: float) -> str:
-    """Panel title: the name, then the RMSSE and bias when there are actuals, then the weight."""
+def _series_sections(
+    panels: _Panels, random_order: np.ndarray, n_ranked: int, n_random: int, window: str
+) -> list[tuple[str, np.ndarray]]:
+    """The sections of single series ``forecasts.pdf`` draws at one origin, after the sums, in drawing order.
+
+    Each ``PLOT_RANKED`` section takes ``n_ranked`` series, and the random section the first ``n_random`` of
+    ``random_order``; a series can appear in more than one section. Empty sections are left out, so without
+    actuals, which leave nothing to rank by, only the random section is drawn.
+
+    Parameters
+    ----------
+    panels : _Panels
+        Panels of the fitted series.
+    random_order : np.ndarray
+        A random permutation of the rows of ``panels``.
+    n_ranked : int
+        Number of series in each ranked section.
+    n_random : int
+        Number of series in the random section.
+    window : str
+        The forecast origin, a key of ``WINDOWS``, for the warning without actuals.
+
+    Returns
+    -------
+    list of (str, np.ndarray)
+        Each section's heading and row positions.
+    """
+    if n_ranked > 0 and not np.isfinite(panels.actual).any():
+        logger.warning(
+            "forecasts.pdf skips the ranked sections at the %s origin: the dataset has no actuals for %s, so there "
+            "is no RMSSE to rank by.",
+            window,
+            WINDOWS[window].days,
+        )
+    sections = [
+        (heading, _rank_series(panels, score, highest_first, n_ranked))
+        for heading, (score, highest_first) in PLOT_RANKED.items()
+    ]
+    sections.append(("random", random_order[:n_random]))
+    return [(heading, rows) for heading, rows in sections if rows.size]
+
+
+def _panel_title(name: str, rmsse: float, bias: float, weight: float, level_total: float | None = None) -> str:
+    """Panel title: the name, then the RMSSE and bias when there are actuals, then the weight.
+
+    With ``level_total``, the level-12 WRMSSE of the fitted series, a single series' title then gives its
+    contribution (weight x RMSSE) and its share of that score.
+    """
     parts = [name]
     if np.isfinite(rmsse):
         parts.append(f"RMSSE {rmsse:.2f}")
     if np.isfinite(bias):
         parts.append(f"bias {bias:+.1%}")
     parts.append(f"weight {100 * weight:.3g}%")
+    if level_total and np.isfinite(rmsse):
+        contribution = weight * rmsse
+        parts.append(f"contribution {contribution:.3g} ({100 * contribution / level_total:.3g}% of level 12)")
     return "   ".join(parts)
 
 
-def _draw_pages(pdf: PdfPages, panels: _Panels, title: str, per_page: int) -> int:
+def _draw_pages(pdf: PdfPages, panels: _Panels, title: str, per_page: int, level_total: float | None = None) -> int:
     """Draw one panel per row of ``panels``, ``per_page`` panels to a page.
 
     Each panel shows the last ``PLOT_HISTORY`` fit days and the forecast days: the sales (actuals included,
@@ -491,6 +556,9 @@ def _draw_pages(pdf: PdfPages, panels: _Panels, title: str, per_page: int) -> in
         Title of every page, before its page number.
     per_page : int
         Panels per page.
+    level_total : float, optional
+        The level-12 WRMSSE of the fitted series, when the rows are single series: each panel title then adds
+        the series' contribution and its share of it (:func:`_panel_title`).
 
     Returns
     -------
@@ -525,7 +593,9 @@ def _draw_pages(pdf: PdfPages, panels: _Panels, title: str, per_page: int) -> in
             )
             ax.axvline(origin, color="grey", linestyle=":", alpha=0.5)
             ax.set_title(
-                _panel_title(panels.names[row], rmsse[row], bias[row], panels.weight[row]), fontsize=9, loc="left"
+                _panel_title(panels.names[row], rmsse[row], bias[row], panels.weight[row], level_total),
+                fontsize=9,
+                loc="left",
             )
             ax.set_ylabel("Units")
         axes[0].legend(fontsize=8, loc="upper left")
@@ -745,11 +815,11 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 6. Forecast PDF: at each origin, the total, store and department sums of the fitted series, then
-    #    --n-plot series picked by --plot-select (paginated, --plots-per-page panels per page)
+    # 6. Forecast PDF: at each origin, the total, store, category and department sums of the fitted series,
+    #    then the PLOT_RANKED sections of --n-plot-ranked series each and --n-plot-random series at random
+    #    (paginated, --plots-per-page panels per page)
     # ------------------------------------------------------------------
-    n_plot = n_fit if args.n_plot == 0 else min(args.n_plot, n_fit)
-    # One random order for every origin, so --plot-select random draws the same series at each.
+    # One random order for every origin, so the random section draws the same series at each.
     random_order = rng.permutation(n_fit)
     n_pages = 0
     with PdfPages(run_dir / "forecasts.pdf") as pdf:
@@ -759,31 +829,24 @@ def main() -> None:
             n_pages += _draw_pages(
                 pdf,
                 _sum_panels(panels, ds, fit_idx),
-                f"{heading} — total, store and department sums of the {n_fit} series [{label}]",
+                f"{heading} — total, store, category and department sums of the {n_fit} series [{label}]",
                 args.plots_per_page,
             )
-            select = args.plot_select
-            if select == "worst" and not np.isfinite(panels.actual).any():
-                logger.warning(
-                    "forecasts.pdf picks the %s-origin series at random: the dataset has no actuals for %s, so "
-                    "there is no RMSSE to pick the worst by.",
-                    window,
-                    WINDOWS[window].days,
+            level_total = float(np.nansum(panels.contribution()))
+            for section, rows in _series_sections(panels, random_order, args.n_plot_ranked, args.n_plot_random, window):
+                n_pages += _draw_pages(
+                    pdf,
+                    panels.take(rows),
+                    f"{heading} — {section}: {rows.size} of the {n_fit} series [{label}]",
+                    args.plots_per_page,
+                    level_total,
                 )
-                select = "random"
-            rows = _select_series(select, panels, random_order, n_plot)
-            n_pages += _draw_pages(
-                pdf,
-                panels.take(rows),
-                f"{heading} — {n_plot} of the {n_fit} series [{label}], {PLOT_SELECT[select]}",
-                args.plots_per_page,
-            )
 
     logger.info(
-        "Saved forecasts.pdf  (%s; sums and %d series each, %s; %d pages)",
+        "Saved forecasts.pdf  (%s; sums, then %d series in each ranked section and %d at random; %d pages)",
         " and ".join(windows),
-        n_plot,
-        PLOT_SELECT[args.plot_select],
+        args.n_plot_ranked,
+        min(args.n_plot_random, n_fit),
         n_pages,
     )
 

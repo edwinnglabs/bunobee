@@ -8,9 +8,10 @@ adds ``wrmsse_prevalidation`` before ``wrmsse_validation``).
 ``--origins`` (issue #125) fits the pre-validation, validation and evaluation origins by default. These tests
 check the choices and that ``both`` is still the two origins a submission needs.
 
-``forecasts.pdf`` (issue #105) draws the total, store and department sums of the fitted series, then series
-picked at random, by worst RMSSE or by top dollar-sales weight. These tests check the sums, the RMSSE, bias
-and weight in the panel titles against the scorer, and the picking, on a tiny synthetic dataset.
+``forecasts.pdf`` (issues #105 and #127) draws the total, store, category and department sums of the fitted
+series, then sections of series ranked by worst and best RMSSE and by worst and best contribution (weight x
+RMSSE), then series at random. These tests check the sums, the RMSSE, bias, weight and contribution in the panel
+titles against the scorer, and the ranking and sections, on a tiny synthetic dataset.
 
 ``--round`` (issue #117) clips the forecasts at 0 and rounds them to integers. These tests check that it is off
 by default and that it leaves only non-negative integers.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -190,6 +192,9 @@ PRICES = np.array([1.0, 2.0, 0.5, 4.0])
 OFFSETS = np.array([2.0, 0.0, 5.0, 1.0])
 # Dollar sales over the last 28 fit days: (28 x level + 14) x price = 42, 196, 91, 1176; top first is 3, 1, 2, 0.
 DOLLARS = (28 * LEVELS + 14) * PRICES
+# Contribution = weight x RMSSE = (84, 0, 455, 1176) / 1505: worst first is 3, 2, 0, 1.
+# The random order the section tests draw from.
+RANDOM_ORDER = np.array([1, 3, 0, 2])
 
 
 @pytest.fixture(scope="module")
@@ -231,11 +236,22 @@ class TestForecastReview:
         assert panels.history.shape == (4, N_FIT_DAYS)
         assert panels.actual.shape == panels.forecast.shape == (4, HORIZON)
 
-    def test_sums_are_the_total_then_each_store_and_department(self, review_ds, panels):
+    def test_sums_are_the_total_then_each_store_category_and_department(self, review_ds, panels):
         sums = m5_run._sum_panels(panels, review_ds, np.arange(4))
 
-        assert sums.names == ["Total", "store CA_1", "store CA_2", "dept FOODS_1", "dept HOBBIES_1"]
-        members = np.array([[1, 1, 1, 1], [1, 1, 0, 0], [0, 0, 1, 1], [1, 0, 1, 0], [0, 1, 0, 1]], dtype=float)
+        assert sums.names == [
+            "Total",
+            "store CA_1",
+            "store CA_2",
+            "cat FOODS",
+            "cat HOBBIES",
+            "dept FOODS_1",
+            "dept HOBBIES_1",
+        ]
+        members = np.array(
+            [[1, 1, 1, 1], [1, 1, 0, 0], [0, 0, 1, 1], [1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1]],
+            dtype=float,
+        )
         for field in ("history", "insample", "actual", "forecast", "weight"):
             np.testing.assert_allclose(getattr(sums, field), members @ getattr(panels, field), err_msg=field)
 
@@ -249,11 +265,68 @@ class TestForecastReview:
         assert sums.rmsse()[0] == pytest.approx(level_1["wrmsse"])
         assert sums.bias()[0] == pytest.approx(level_1["bias_pct"] / 100)
 
-    @pytest.mark.parametrize("select, expected", [("worst", [2, 0, 3]), ("top", [3, 1, 2]), ("random", [1, 3, 0])])
-    def test_select_series(self, panels, select, expected):
-        rows = m5_run._select_series(select, panels, random_order=np.array([1, 3, 0, 2]), n_plot=3)
+    def test_contributions_sum_to_the_level_12_score(self, review_ds, panels):
+        scores = m5_run.compute_hierarchical_wrmsse(
+            review_ds, panels.forecast.astype(np.float64), review_ds["series_id"].values, window="validation"
+        ).set_index("level")
 
-        assert list(rows) == expected
+        np.testing.assert_allclose(panels.contribution(), panels.weight * OFFSETS)
+        assert panels.contribution().sum() == pytest.approx(scores.loc[12, "wrmsse"])
+
+    @pytest.mark.parametrize(
+        "section, expected",
+        [
+            ("worst RMSSE", [2, 0, 3]),
+            ("best RMSSE", [1, 3, 0]),
+            ("worst contribution", [3, 2, 0]),
+            ("best contribution", [1, 0, 2]),
+        ],
+    )
+    def test_ranked_sections(self, panels, section, expected):
+        score, highest_first = m5_run.PLOT_RANKED[section]
+
+        assert list(m5_run._rank_series(panels, score, highest_first, n_plot=3)) == expected
+
+    def test_contribution_sections_leave_out_series_of_weight_0(self, panels):
+        # Series 1 has an RMSSE of 0 and series 2 a weight of 0: both contribute 0, but only series 1 is ranked.
+        zero = dataclasses.replace(panels, weight=np.array([0.1, 0.2, 0.0, 0.7]))
+
+        assert list(m5_run._rank_series(zero, "contribution", False, n_plot=4)) == [1, 0, 3]
+        assert list(m5_run._rank_series(zero, "contribution", True, n_plot=4)) == [3, 0, 1]
+        assert list(m5_run._rank_series(zero, "rmsse", False, n_plot=4)) == [1, 3, 0, 2]
+
+    def test_sections_by_default(self, panels):
+        args = m5_run._parse_args([])
+
+        sections = m5_run._series_sections(
+            panels, RANDOM_ORDER, args.n_plot_ranked, args.n_plot_random, window="validation"
+        )
+
+        assert (args.n_plot_ranked, args.n_plot_random) == (10, 30)
+        # The tiny dataset has 4 series, so every section takes all of them.
+        assert [(heading, list(rows)) for heading, rows in sections] == [
+            ("worst RMSSE", [2, 0, 3, 1]),
+            ("best RMSSE", [1, 3, 0, 2]),
+            ("worst contribution", [3, 2, 0, 1]),
+            ("best contribution", [1, 0, 2, 3]),
+            ("random", [1, 3, 0, 2]),
+        ]
+
+    def test_0_turns_sections_off(self, panels):
+        no_ranked = m5_run._series_sections(panels, RANDOM_ORDER, n_ranked=0, n_random=2, window="validation")
+        no_random = m5_run._series_sections(panels, RANDOM_ORDER, n_ranked=2, n_random=0, window="validation")
+
+        assert [(heading, list(rows)) for heading, rows in no_ranked] == [("random", [1, 3])]
+        assert [heading for heading, _ in no_random] == list(m5_run.PLOT_RANKED)
+
+    def test_without_actuals_only_the_random_section_is_drawn(self, panels, caplog):
+        no_actuals = dataclasses.replace(panels, actual=np.full_like(panels.actual, np.nan))
+
+        with caplog.at_level(logging.WARNING, logger=m5_run.logger.name):
+            sections = m5_run._series_sections(no_actuals, RANDOM_ORDER, n_ranked=2, n_random=3, window="validation")
+
+        assert [(heading, list(rows)) for heading, rows in sections] == [("random", [1, 3, 0])]
+        assert "skips the ranked sections at the validation origin" in caplog.text
 
     def test_without_actuals_there_is_no_rmsse_or_bias_in_the_title(self, panels):
         no_actuals = dataclasses.replace(panels, actual=np.full_like(panels.actual, np.nan))
@@ -261,13 +334,20 @@ class TestForecastReview:
         assert np.isnan(no_actuals.rmsse()).all() and np.isnan(no_actuals.bias()).all()
         assert m5_run._panel_title("F_1_CA_1", np.nan, np.nan, 0.25) == "F_1_CA_1   weight 25%"
         assert m5_run._panel_title("Total", 0.804, -0.1013, 1.0) == "Total   RMSSE 0.80   bias -10.1%   weight 100%"
+        assert m5_run._panel_title("F_1_CA_1", np.nan, np.nan, 0.25, level_total=2.0) == "F_1_CA_1   weight 25%"
+
+    def test_a_series_title_gives_its_contribution(self):
+        title = m5_run._panel_title("F_1_CA_1", 2.0, 0.05, 0.25, level_total=2.0)
+
+        assert title == "F_1_CA_1   RMSSE 2.00   bias +5.0%   weight 25%   contribution 0.5 (25% of level 12)"
 
     def test_pages_hold_per_page_panels(self, tmp_path, review_ds, panels):
         sums = m5_run._sum_panels(panels, review_ds, np.arange(4))
         with m5_run.PdfPages(tmp_path / "forecasts.pdf") as pdf:
-            assert m5_run._draw_pages(pdf, sums, "sums", per_page=2) == 3
-            assert m5_run._draw_pages(pdf, dataclasses.replace(panels, insample=None), "series", per_page=5) == 1
-            assert pdf.get_pagecount() == 4
+            assert m5_run._draw_pages(pdf, sums, "sums", per_page=2) == 4
+            series = dataclasses.replace(panels, insample=None)
+            assert m5_run._draw_pages(pdf, series, "series", per_page=5, level_total=1.0) == 1
+            assert pdf.get_pagecount() == 5
 
     def test_a_misshapen_insample_fit_is_rejected(self):
         forecasts = np.zeros((4, m5_run.HORIZON))
