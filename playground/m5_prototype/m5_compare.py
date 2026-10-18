@@ -176,7 +176,7 @@ def log_comparison(table: pd.DataFrame, run_a: Path, run_b: Path) -> None:
     logger.info("A: %s", _describe(run_a))
     logger.info("B: %s", _describe(run_b))
     for window, rows in table.groupby("window", sort=False):
-        logger.info("Per-level WRMSSE and bias_%% (%s %s), delta = B - A:", window, WINDOWS[window][2])
+        logger.info("Per-level WRMSSE and bias_%% (%s %s), delta = B - A:", window, WINDOWS[window].days)
         logger.info(
             "  %-3s  %-22s  %-8s  %-8s  %-9s  %-8s  %-8s  %-8s",
             "lvl",

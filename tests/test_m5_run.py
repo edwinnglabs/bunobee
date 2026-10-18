@@ -2,7 +2,11 @@
 
 Every run appends one row to ``output/runs.csv`` (issue #104), and the Kaggle scores of a submitted run are
 typed into its row by hand. These tests check that appending keeps such hand-typed values verbatim and that
-a column added to the row later does not break an existing log.
+a column added to the row later does not break an existing log, but lands where the row puts it (issue #125
+adds ``wrmsse_prevalidation`` before ``wrmsse_validation``).
+
+``--origins`` (issue #125) fits the pre-validation, validation and evaluation origins by default. These tests
+check the choices and that ``both`` is still the two origins a submission needs.
 
 ``forecasts.pdf`` (issue #105) draws the total, store and department sums of the fitted series, then series
 picked at random, by worst RMSSE or by top dollar-sales weight. These tests check the sums, the RMSSE, bias
@@ -125,6 +129,37 @@ class TestRunLog:
 
         log = pd.read_csv(path, dtype=str, keep_default_na=False)
         assert list(log["peak_rss_gib"]) == ["", "3.5"]
+
+    def test_columns_follow_the_latest_row(self, tmp_path):
+        # A log written before #125: no pre-validation score, a Kaggle score typed in, and a column later runs
+        # no longer write.
+        path = tmp_path / "runs.csv"
+        m5_run._append_run_log(path, {**_row(kaggle_public="1.08127"), "retired": "x"})
+        row: dict[str, object] = {}
+        for key, value in _row(run_dir="20261016_210000").items():
+            if key == "wrmsse_validation":
+                row["wrmsse_prevalidation"] = 0.9
+            row[key] = value
+
+        m5_run._append_run_log(path, row)
+
+        log = pd.read_csv(path, dtype=str, keep_default_na=False)
+        assert list(log.columns) == [*row, "retired"]
+        assert list(log["wrmsse_prevalidation"]) == ["", "0.9"]
+        assert list(log["kaggle_public"]) == ["1.08127", ""]
+        assert list(log["retired"]) == ["x", ""]
+
+
+class TestOrigins:
+    def test_all_three_origins_by_default(self):
+        assert m5_run._parse_args([]).origins == "all"
+        assert m5_run.ORIGINS["all"] == ("prevalidation", "validation", "evaluation")
+
+    def test_both_is_the_two_origins_a_submission_needs(self):
+        assert m5_run.ORIGINS["both"] == ("validation", "evaluation")
+
+    def test_a_quick_loop_can_fit_prevalidation_alone(self):
+        assert m5_run.ORIGINS[m5_run._parse_args(["--origins", "prevalidation"]).origins] == ("prevalidation",)
 
 
 class TestRounding:

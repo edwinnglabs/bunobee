@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 from m5_common import DATA_DIR, load_m5_ds
-from m5_score_submission import WINDOWS, level_weights
+from m5_score_submission import SUBMISSION_WINDOWS, level_weights
 
 # The official files name each group by (Agg_Level_1, Agg_Level_2), with "X" for an unused slot. Their key
 # order matches ``_LEVELS`` except at level 11, which the official file lists as (state, item).
@@ -72,13 +72,14 @@ def compare(ds, window: str, data_dir: Path) -> pd.DataFrame:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="directory with m5_ds.nc and weights_*.csv")
-    parser.add_argument("--window", choices=(*WINDOWS, "both"), default="both")
+    # Only the two windows Kaggle scores have official weights; the pre-validation window has none.
+    parser.add_argument("--window", choices=(*SUBMISSION_WINDOWS, "both"), default="both")
     parser.add_argument("--tol", type=float, default=1e-8, help="max allowed absolute weight difference")
     args = parser.parse_args()
 
     ds = load_m5_ds(args.data_dir)
     ok = True
-    for window in WINDOWS if args.window == "both" else (args.window,):
+    for window in SUBMISSION_WINDOWS if args.window == "both" else (args.window,):
         table = compare(ds, window, args.data_dir)
         worst = table["max_weight_diff"].max()
         passed = worst <= args.tol

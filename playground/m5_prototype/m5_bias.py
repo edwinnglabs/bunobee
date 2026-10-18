@@ -3,17 +3,21 @@
 
 Usage
 -----
-    # The quick-loop sample (3,000 random series, seed 2026) at the validation origin, both SSP entries:
+    # The quick-loop sample (3,000 random series, seed 2026) at the pre-validation origin, both SSP entries:
     python m5_bias.py --model ssp_dow ssp_level_dow
 
     # One model on a smaller sample:
     python m5_bias.py --model ssp_dow --n-demo 500
 
+    # The validation origin, as the #113 diagnosis ran:
+    python m5_bias.py --model ssp_dow ssp_level_dow --window validation
+
 The SSP models fit ``log(max(sales, 0.1) / mean)``, so on intermittent series their level may follow the
 geometric mean of the clipped sales rather than the arithmetic mean that WRMSSE rewards (issue #113). Run
 outputs keep no per-series forecasts, so this script fits each ``--model`` (an entry of ``MODELS`` in
-``m5_models.py``) at the validation origin, on the same series ``m5_run.py`` picks for the same ``--n-demo``
-and ``--seed``, and compares each series' forecast with:
+``m5_models.py``) at the ``--window`` origin (pre-validation by default, the window models are chosen on), on
+the same series ``m5_run.py`` picks for the same ``--n-demo`` and ``--seed``, and compares each series'
+forecast with:
 
 - the arithmetic mean of the actuals over the 28 forecast days,
 - the arithmetic and geometric means of ``max(sales, 0.1)`` over two windows of fit days: all of them
@@ -60,7 +64,7 @@ import xarray as xr
 
 from m5_common import DATA_DIR, load_m5_ds
 from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
-from m5_score_submission import WINDOWS
+from m5_score_submission import WINDOWS, window_masks
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +84,11 @@ ZERO_SHARE_EDGES = (0.25, 0.5, 0.75, 1.0)
 #: or None for one group of all series.
 GROUPINGS: dict[str, str | None] = {"total": None, "dept": "dept_id", "volume": "volume", "zero_share": "zero_bin"}
 
+#: ``--window`` choices: the forecast origins the diagnosis may fit. Never the evaluation one.
+BIAS_WINDOWS: tuple[str, ...] = ("prevalidation", "validation")
 
-def _parse_args() -> argparse.Namespace:
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare M5 forecasts with the arithmetic and geometric means of sales.")
     p.add_argument(
         "--model",
@@ -115,7 +122,14 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="Fit days at the end of the fit window for the local means, by default 28.",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--window",
+        choices=BIAS_WINDOWS,
+        default="prevalidation",
+        help="Forecast origin to fit: prevalidation (d_1886-d_1913) or validation (d_1914-d_1941), by default "
+        "prevalidation.",
+    )
+    return p.parse_args(argv)
 
 
 def sample_series(n_series_total: int, n_demo: int, seed: int) -> np.ndarray:
@@ -482,9 +496,8 @@ def main() -> None:
     models = list(dict.fromkeys(args.model))
 
     ds: xr.Dataset = load_m5_ds(args.data_dir)
-    split = ds["split"].values
-    fit_splits, forecast_split, forecast_days = WINDOWS["validation"]
-    fit_mask, forecast_mask = np.isin(split, fit_splits), split == forecast_split
+    fit_mask, forecast_mask = window_masks(ds["split"].values, args.window)
+    forecast_days = WINDOWS[args.window].days
     if args.recent_days < 1 or args.recent_days > fit_mask.sum():
         raise SystemExit(f"m5_bias.py: --recent-days must be between 1 and {fit_mask.sum()}, got {args.recent_days}")
 
@@ -496,7 +509,8 @@ def main() -> None:
             f"m5_bias.py: the dataset has no actuals for {forecast_days}; run m5_fetch.py, then m5_preprocess.py."
         )
     logger.info(
-        "Validation origin: fit on %d days, compare with %s; %d series (random sample, seed=%d)",
+        "%s origin: fit on %d days, compare with %s; %d series (random sample, seed=%d)",
+        args.window,
         fit_mask.sum(),
         forecast_days,
         fit_idx.size,

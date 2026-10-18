@@ -44,25 +44,28 @@ the next `m5_run.py` without a reinstall.
 
 ## A run
 
-Kaggle wants two 28-day forecasts, so by default (`--origins both`) `m5_run.py` fits the model twice,
-once per cutoff day:
+Kaggle wants two 28-day forecasts, and a third cutoff day 28 days before the first gives a window Kaggle
+never scores (#125). By default (`--origins all`) `m5_run.py` fits the model three times, once per cutoff
+day:
 
 ```
-d_1 ─────────────────────────── d_1913 │ d_1914 ── d_1941 │ d_1942 ── d_1969
- fit (validation origin) ───────────────┤ forecast →       │
- fit (evaluation origin) ──────────────────────────────────┤ forecast →
-                                         _validation rows    _evaluation rows
-                                         Kaggle public       Kaggle private
+d_1 ────────────── d_1885 │ d_1886 ── d_1913 │ d_1914 ── d_1941 │ d_1942 ── d_1969
+ fit (pre-validation) ─────┤ forecast →       │                  │
+ fit (validation origin) ─────────────────────┤ forecast →       │
+ fit (evaluation origin) ────────────────────────────────────────┤ forecast →
+                            no submission rows  _validation rows   _evaluation rows
+                            not on Kaggle       Kaggle public      Kaggle private
 ```
 
 For each cutoff day it hands the model picked with `--model` (by default `ssp_dow`) all sales up to that
 day. The model builds its own inputs, fits all 30,490 series at once and forecasts the next 28 days. It
-then writes `submission.csv` (60,980 rows, half from each cutoff day), scores both halves against the true
-sales and saves everything to `output/<timestamp>/`.
+then writes `submission.csv` (60,980 rows, half from each of the two Kaggle cutoff days), scores all three
+windows against the true sales and saves everything to `output/<timestamp>/`. The pre-validation window's
+actuals are in the `train` split, so it needs nothing beyond the Kaggle files.
 
-`--n-demo 3000 --origins validation` fits 3,000 random series at the first cutoff day only, in about
-20 s. A sampled run aggregates and weights its own series, so its score can be compared with another run
-on the same sample (`m5_compare.py` checks that), not with a full run's.
+`--n-demo 3000 --origins prevalidation` fits 3,000 random series at the pre-validation cutoff day only, in
+about 20 s. A sampled run aggregates and weights its own series, so its score can be compared with another
+run on the same sample (`m5_compare.py` checks that), not with a full run's.
 
 ## The score
 
@@ -87,21 +90,26 @@ model's in-sample fit and the forecast, with the RMSSE, bias and weight in its t
 
 1. Add or edit a model entry in `m5_models.py` (see below).
 2. `python m5_run.py --model NAME --n-demo 50` to check nothing crashes.
-3. `python m5_run.py --model NAME --n-demo 0` for the real score: about 5.5 minutes, ~22 GiB peak.
-4. Compare with the baseline run: `python m5_compare.py output/<baseline> output/<run>`.
+3. Quick loop: `python m5_run.py --model NAME --n-demo 3000 --origins prevalidation`, then compare with the
+   sample baseline: `python m5_compare.py output/<baseline> output/<run>`.
+4. `python m5_run.py --model NAME --n-demo 0` for the full score at all three origins: about 8 minutes for
+   `ssp_dow`, ~23 GiB peak. Compare it with the full baseline run the same way.
 5. Submit only when you want the official number: the local scorer matches Kaggle to within 0.0001.
 
-Make decisions on the validation score only, and keep the evaluation score as the final check. Both
-windows' actuals are on disk, so it is easy to tune to both without noticing, and then the private score
-stops telling you anything.
+Make decisions on the pre-validation score only, and read the validation and evaluation scores once per
+candidate, on its full run, as the final check. Those two windows are Kaggle's public and private
+leaderboards, and the local scores match Kaggle's, so a choice made on either is tuned on the test: their
+actuals are on disk, so it is easy to tune to them without noticing, and then the leaderboard stops telling
+you anything. Until #125 the quick loop ran the validation window, so every choice from #106 to #117 was
+made on it, and every full run printed the evaluation score.
 
 Baseline, the current model (`ssp_dow`):
 
-| | Validation (public) | Evaluation (private) |
-|---|---|---|
-| Local, #94 submission | 1.08136 | 0.97573 |
-| Kaggle, #94 submission | 1.08127 | 0.97572 |
-| Local, after the #116 fix | 1.10175 | 0.99403 |
+| | Pre-validation | Validation (public) | Evaluation (private) |
+|---|---|---|---|
+| Local, #94 submission | not run | 1.08136 | 0.97573 |
+| Kaggle, #94 submission | not scored | 1.08127 | 0.97572 |
+| Local, after the #116 fix | 1.05983 | 1.10175 | 0.99403 |
 
 The #116 fix of the best-parameter tracking changed `ssp_dow`'s forecasts (see "Sigma priors and best-parameter
 tracking (#116)"); compare new full runs with the last row.
@@ -450,6 +458,69 @@ the default model.
 **Decision:** rounding stays off by default; `--round` is opt-in. It is worse at every level on the validation
 window, on the sample and on the full run, and worse overall on the evaluation window.
 
+### Pre-validation window (#125)
+
+The validation and evaluation windows are Kaggle's public and private leaderboards, and the local scorer matches
+Kaggle to within 0.0001, so a local score on either is a leaderboard score. Every choice from #106 to #117 was made
+on the validation window, and every full run printed the evaluation score. #125 adds a window Kaggle never scores:
+fit on d_1–d_1885 and score d_1886–d_1913, the validation window moved 28 days earlier. It follows Kaggle's recipe:
+the RMSSE scale runs over all the fit days, and the weights are the dollar sales of the last 28 (d_1858–d_1885).
+Its actuals are in the `train` split. `--origins all`, the default, fits all three windows; a submission still
+takes only the validation and evaluation forecasts.
+
+All three windows, on the 3,000-series sample (seed 2026) and on full runs. The Kaggle columns are blank: none of
+these forecasts has been submitted (the #94 and #106 submissions predate the #116 fix), and a sample cannot be.
+
+| Entry | Series | Pre-validation | Validation | Evaluation | Kaggle public | Kaggle private |
+|---|---|---|---|---|---|---|
+| `ssp_dow` | 3,000 | 1.00659 | 0.94808 | 0.90002 | | |
+| `ssp_level_dow` | 3,000 | 0.94898 | 0.94956 | 0.90309 | | |
+| `ssp_level_dow_yeojohnson_halfnormal` | 3,000 | 0.82376 | 0.74610 | 0.74957 | | |
+| `ssp_dow` | 30,490 | 1.05983 | 1.10175 | 0.99403 | | |
+| `ssp_level_dow` | 30,490 | 0.97009 | 1.06591 | 0.98720 | | |
+| `ssp_level_dow_yeojohnson_halfnormal` | 30,490 | 0.79563 | 0.70891 | 0.79394 | | |
+
+Per level of the full runs on the pre-validation window, with the bias of the total:
+
+| Level | `ssp_dow` | `ssp_level_dow` | `ssp_level_dow_yeojohnson_halfnormal` |
+|---|---|---|---|
+| 1 Total | 1.0617 | 0.8183 | 0.5793 |
+| 2 State | 1.0221 | 0.8280 | 0.6463 |
+| 3 Store | 1.0376 | 0.8721 | 0.7024 |
+| 4 Category | 1.0957 | 0.9190 | 0.6704 |
+| 5 Department | 1.2003 | 1.1442 | 0.8856 |
+| 6 State × category | 1.0556 | 0.9353 | 0.7209 |
+| 7 State × department | 1.1284 | 1.0986 | 0.8744 |
+| 8 Store × category | 1.0406 | 0.9482 | 0.7776 |
+| 9 Store × department | 1.0903 | 1.0663 | 0.8903 |
+| 10 Item | 1.0480 | 1.0345 | 0.9558 |
+| 11 Item × state | 0.9895 | 0.9990 | 0.9350 |
+| 12 Item × store | 0.9480 | 0.9776 | 0.9096 |
+| WRMSSE | 1.05983 | 0.97009 | 0.79563 |
+| Bias of the total | −11.4% | −6.8% | +4.4% |
+
+- **On the full runs the three windows rank the entries the same:** the #116 winner first, then `ssp_level_dow`,
+  then `ssp_dow`.
+- **On the sample, the pre-validation window agrees with the full runs where the validation window does not.**
+  The sample's validation and evaluation windows score `ssp_level_dow` worse than `ssp_dow` (+0.0015 and
+  +0.0031), the full runs better on every window. The sample's pre-validation window scores it better
+  (−0.0576). That is one pair of entries, so it does not yet show the pre-validation sample predicts full runs.
+- **The #116 winner runs high on two windows of three:** its total is 4.4% high on pre-validation, 1.3% low on
+  validation and 5.1% high on evaluation. `ssp_dow` is 11.4%, 12.7% and 9.3% low.
+- **Easter Sunday is d_1885**, the window's last fit day. The ranking matches the Kaggle windows, so it does
+  not reorder these three entries; whether it moves the level at the cutoff was not checked.
+- **Nothing else moved:** the validation and evaluation scores of the sample `ssp_dow` run and of the full
+  `ssp_dow` and `ssp_level_dow_yeojohnson_halfnormal` runs equal those of the earlier runs at every level
+  (`20261017_104210`, `_104252` and `_114423`), and the two full runs' `submission.csv` files are identical to
+  theirs. There is no earlier full run of `ssp_level_dow` after the #116 fix to compare with.
+- **Cost:** a third origin adds one fit, so a full run of `ssp_dow` takes 496 s instead of 328 s, and of the
+  #116 winner 820 s; peak memory is 22.7, 25.5 and 22.9 GiB for the three entries. A pre-validation quick loop
+  on the sample takes 20 s, as the validation one did.
+
+**Decision:** choose models on the pre-validation window from now on, and read the validation and evaluation
+windows once per candidate, on its full run (see "The experiment loop"). For #118, all three windows put
+`ssp_level_dow_yeojohnson_halfnormal` first.
+
 ## Working on the model
 
 ### Where the code is
@@ -467,7 +538,7 @@ fit and the fit and forecast days. It returns forecasts (series × 28) with no N
 arrays, which `m5_run.py` saves to `batch_params.npz` and plots in `diagnostics.png`. The dict can also hold
 the model's in-sample fit (series × fit days) under `insample`, which `forecasts.pdf` draws; `ssp_dow`
 returns each fit day's one-step-ahead prediction, back-transformed as its forecast is. Everything else
-(data loading, both cutoff days, the submission, the scoring) lives in `m5_run.py` and works with any model,
+(data loading, the three cutoff days, the submission, the scoring) lives in `m5_run.py` and works with any model,
 so adding a model needs only a new entry.
 
 ### The current model (`ssp_dow`)
@@ -514,8 +585,10 @@ drift.
 ### Open items
 
 - **The sample did not predict the full run:** for `ssp_level_dow`, the 3,000-series sample scored the
-  validation window +0.0066 worse while the full run scored it −0.0308 better. Enlarge the sample or
-  stratify it by store × department before steering the next model by it.
+  validation window +0.0066 worse while the full run scored it −0.0308 better (+0.0015 and −0.0358 after the
+  #116 fix). On the pre-validation window the sample gets the sign right (−0.0576, full run −0.0897; see
+  "Pre-validation window (#125)"), but that is one pair of entries. Enlarge the sample or stratify it by
+  store × department before steering the next model by it.
 - **Hierarchical parameter sharing:** share the weekday drift within department × store groups (70 groups),
   either outright or through a prior that pulls each series toward its group. Most useful for sparse
   series.
@@ -525,8 +598,9 @@ drift.
 - **No test that the batch fit is correct:** nothing checks that `fit_batch_series_opt` matches the
   single-series `fit_one_series_opt` on the same series.
 - **float32 log-likelihood:** the loss sums 1,913 steps in float32. Summing in float64 has not been tried.
-- **Memory:** the second fit does not release the first one's memory, so a full run peaks at 22.3 GiB
-  instead of about 14.4 GiB. The `fit_chunk` setting of `SspDow` caps it meanwhile.
+- **Memory:** later fits do not release the earlier ones' memory, so a full run of `ssp_dow` at three origins
+  peaks at 22.7 GiB, against 13.8 GiB after the first (25.5 GiB for `ssp_level_dow`). The `fit_chunk` setting
+  of `SspDow` caps it meanwhile.
 - **Optimizer loop:** a Python loop over a compiled step, not `lax.scan`. A cutoff day already fits in
   about 159 s, so this only matters for speed.
 - **Multiple devices:** no `pmap`; only useful with several GPUs.

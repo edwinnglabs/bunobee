@@ -9,29 +9,34 @@ Usage examples
 # Fit 50 top-volume series:
     python m5_run.py --n-demo 50 --sample-mode top
 
-# Quick loop: fit 3,000 random series at the validation origin only (about 20 s):
-    python m5_run.py --model ssp_dow --n-demo 3000 --origins validation
+# Quick loop: fit 3,000 random series at the pre-validation origin only (about 20 s):
+    python m5_run.py --model ssp_dow --n-demo 3000 --origins prevalidation
 
-# Fit all 30,490 series with a named model and generate a submission CSV:
+# Fit all 30,490 series with a named model at all three origins and generate a submission CSV:
     python m5_run.py --model ssp_dow --n-demo 0
 
 # Review the 20 worst-forecast series of a quick loop in forecasts.pdf:
-    python m5_run.py --n-demo 3000 --origins validation --plot-select worst --n-plot 20
+    python m5_run.py --n-demo 3000 --origins prevalidation --plot-select worst --n-plot 20
 
 # The quick loop with the forecasts rounded to integers:
-    python m5_run.py --model ssp_dow --n-demo 3000 --origins validation --round
+    python m5_run.py --model ssp_dow --n-demo 3000 --origins prevalidation --round
 
 ``--model`` picks an entry of ``MODELS`` in ``m5_models``: a model plus its settings (for ``ssp_dow``, the
 optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
 needs only a new entry there.
 
 ``--origins`` picks the forecast origins to fit (see ``WINDOWS`` in ``m5_score_submission``), by default
-both:
+all three:
 
-    validation : fit on d_1-d_1913, forecast d_1914-d_1941  (``_validation`` submission rows)
-    evaluation : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows)
+    prevalidation : fit on d_1-d_1885, forecast d_1886-d_1913  (no submission rows; Kaggle never scores it)
+    validation    : fit on d_1-d_1913, forecast d_1914-d_1941  (``_validation`` submission rows, Kaggle public)
+    evaluation    : fit on d_1-d_1941, forecast d_1942-d_1969  (``_evaluation`` submission rows, Kaggle private)
 
-``submission.csv`` needs every series at both origins, so only a full run with both origins writes it.
+Choose models on the pre-validation window: Kaggle scores the other two, and the local scores match Kaggle's.
+See ``WORKFLOW.md``, "The experiment loop".
+
+``submission.csv`` needs every series at the validation and evaluation origins, so only a full run with both
+(``--origins all`` or ``both``) writes it.
 
 ``--round`` clips each origin's forecasts at 0 and rounds them to the nearest integer before they are plotted,
 saved, submitted and scored (see :func:`_round_forecasts`). It is off by default: WRMSSE is a squared error, so
@@ -76,7 +81,15 @@ import xarray as xr
 
 from m5_common import DATA_DIR, load_m5_ds
 from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
-from m5_score_submission import WINDOWS, compute_hierarchical_wrmsse, dollar_sales, log_per_level, rmsse_scale
+from m5_score_submission import (
+    SUBMISSION_WINDOWS,
+    WINDOWS,
+    compute_hierarchical_wrmsse,
+    dollar_sales,
+    log_per_level,
+    rmsse_scale,
+    window_masks,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -84,11 +97,13 @@ logger = logging.getLogger(__name__)
 HORIZON = 28
 _DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
-#: ``--origins`` choice -> forecast origins to fit, in ``WINDOWS`` order.
+#: ``--origins`` choice -> forecast origins to fit, in ``WINDOWS`` order. ``both`` is the two a submission needs.
 ORIGINS: dict[str, tuple[str, ...]] = {
+    "prevalidation": ("prevalidation",),
     "validation": ("validation",),
     "evaluation": ("evaluation",),
-    "both": tuple(WINDOWS),
+    "both": SUBMISSION_WINDOWS,
+    "all": tuple(WINDOWS),
 }
 
 #: File name of the run log in ``--output-dir``, next to the run directories.
@@ -148,9 +163,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--origins",
         choices=tuple(ORIGINS),
-        default="both",
-        help="Forecast origins to fit: validation (d_1914-d_1941), evaluation (d_1942-d_1969) or both, by default "
-        "both. A quick loop fits validation only, so it never looks at the evaluation window.",
+        default="all",
+        help="Forecast origins to fit: prevalidation (d_1886-d_1913), validation (d_1914-d_1941), evaluation "
+        "(d_1942-d_1969), both (validation and evaluation, the two a submission needs) or all, by default all. A "
+        "quick loop fits prevalidation only, so it never looks at the two windows Kaggle scores.",
     )
     p.add_argument(
         "--round",
@@ -382,9 +398,7 @@ def _origin_panels(
     insample : np.ndarray or None
         The model's in-sample fit over the last ``PLOT_HISTORY`` fit days, or None.
     """
-    split = ds["split"].values
-    fit_splits, forecast_split, _ = WINDOWS[window]
-    fit_mask, forecast_mask = np.isin(split, fit_splits), split == forecast_split
+    fit_mask, forecast_mask = window_masks(ds["split"].values, window)
     sales = ds["sales"].values[fit_idx]
     dollars = dollar_sales(sales, ds["sell_price"].values[fit_idx], fit_mask)
     dates = ds["date"].values
@@ -556,7 +570,8 @@ def _append_run_log(path: Path, row: dict[str, object]) -> None:
     """Append one run's row to the run log, creating the log with a header if it does not exist yet.
 
     The log is read back as text and rewritten, so values typed into it by hand (the Kaggle scores of a
-    submitted run) are kept verbatim, and a column new in ``row`` is added with blanks for earlier runs.
+    submitted run) are kept verbatim. The columns follow ``row``'s order: a column new in ``row`` lands where
+    ``row`` puts it, with blanks for earlier runs, and columns of the log that ``row`` lacks follow at the end.
 
     Parameters
     ----------
@@ -567,7 +582,9 @@ def _append_run_log(path: Path, row: dict[str, object]) -> None:
     """
     log = pd.DataFrame([{key: "" if value is None else str(value) for key, value in row.items()}])
     if path.exists():
-        log = pd.concat([pd.read_csv(path, dtype=str, keep_default_na=False), log], ignore_index=True)
+        earlier = pd.read_csv(path, dtype=str, keep_default_na=False)
+        columns = [*row, *(column for column in earlier.columns if column not in row)]
+        log = pd.concat([earlier, log], ignore_index=True)[columns]
     log.to_csv(path, index=False)
 
 
@@ -680,20 +697,17 @@ def main() -> None:
     fit_seconds_by_window: dict[str, float] = {}
     insample_by_window: dict[str, np.ndarray | None] = {}
     for window in windows:
-        fit_splits, forecast_split, days = WINDOWS[window]
-        fit_mask = np.isin(split, fit_splits)
+        fit_mask, forecast_mask = window_masks(split, window)
         logger.info(
             "Origin %s: fit on %d days, forecast %s  (model %s: %s)",
             window,
             fit_mask.sum(),
-            days,
+            WINDOWS[window].days,
             args.model,
             "  ".join(f"{key}={value}" for key, value in settings.items()),
         )
         t0 = time.time()
-        forecasts_by_window[window], fitted_by_window[window] = model.fit_forecast(
-            ds, fit_idx, fit_mask, split == forecast_split
-        )
+        forecasts_by_window[window], fitted_by_window[window] = model.fit_forecast(ds, fit_idx, fit_mask, forecast_mask)
         fit_seconds_by_window[window] = time.time() - t0
         _check_model_output(
             args.model, forecasts_by_window[window], fitted_by_window[window], n_fit, int(fit_mask.sum())
@@ -721,7 +735,7 @@ def main() -> None:
     fit_seconds = sum(fit_seconds_by_window.values())
 
     # ------------------------------------------------------------------
-    # 5. Diagnostics plot of the first origin fitted: validation, unless only evaluation is
+    # 5. Diagnostics plot of the first origin fitted, in WINDOWS order: pre-validation when it is fitted
     # ------------------------------------------------------------------
     plot_window = windows[0]
     _plot_fitted(
@@ -754,7 +768,7 @@ def main() -> None:
                     "forecasts.pdf picks the %s-origin series at random: the dataset has no actuals for %s, so "
                     "there is no RMSSE to pick the worst by.",
                     window,
-                    WINDOWS[window][2],
+                    WINDOWS[window].days,
                 )
                 select = "random"
             rows = _select_series(select, panels, random_order, n_plot)
@@ -774,8 +788,8 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 7. Save the model's fitted outputs: validation-origin arrays under their own names, evaluation-origin
-    #    arrays with an "_evaluation" suffix
+    # 7. Save the model's fitted outputs: validation-origin arrays under their own names, the other origins'
+    #    arrays with an "_<origin>" suffix ("_prevalidation", "_evaluation")
     # ------------------------------------------------------------------
     arrays: dict[str, np.ndarray] = {}
     for window in windows:
@@ -786,16 +800,22 @@ def main() -> None:
     logger.info("Saved batch_params.npz")
 
     # ------------------------------------------------------------------
-    # 8. Submission CSV (only when all series are fitted at both origins)
+    # 8. Submission CSV (only when all series are fitted at the validation and evaluation origins; it has no
+    #    pre-validation rows)
     # ------------------------------------------------------------------
     base_ids = ds["series_id"].values[fit_idx]
-    if n_fit == n_series_total and windows == tuple(WINDOWS):
+    if n_fit == n_series_total and set(SUBMISSION_WINDOWS) <= set(windows):
         sample_sub = pd.read_csv(args.data_dir / "sample_submission.csv")
-        _make_submission(forecasts_by_window, base_ids, sample_sub, output_path=run_dir / "submission.csv")
+        _make_submission(
+            {window: forecasts_by_window[window] for window in SUBMISSION_WINDOWS},
+            base_ids,
+            sample_sub,
+            output_path=run_dir / "submission.csv",
+        )
     else:
         logger.info(
-            "Skipping submission — it needs all %d series (--n-demo 0) at both origins (--origins both); this run "
-            "fitted %d series at %s.",
+            "Skipping submission — it needs all %d series (--n-demo 0) at the validation and evaluation origins "
+            "(--origins all or both); this run fitted %d series at %s.",
             n_series_total,
             n_fit,
             " and ".join(windows),
@@ -806,12 +826,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     tables = []
     for window in windows:
-        _, score_split, days = WINDOWS[window]
-        if not np.isfinite(ds["sales"].values[:, split == score_split]).all():
+        _, score_mask = window_masks(split, window)
+        if not np.isfinite(ds["sales"].values[:, score_mask]).all():
             logger.warning(
                 "Skipping the %s score: the dataset has no actuals for %s (run m5_fetch.py, then m5_preprocess.py).",
                 window,
-                days,
+                WINDOWS[window].days,
             )
             continue
         per_level = compute_hierarchical_wrmsse(
@@ -857,8 +877,8 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 11. Run log: one row per run, next to the run directories. The Kaggle columns are left blank, to be
-    #     filled in by hand once the run's submission is scored.
+    # 11. Run log: one row per run, next to the run directories. The Kaggle columns follow the three local
+    #     scores and are left blank, to be filled in by hand once the run's submission is scored.
     # ------------------------------------------------------------------
     run_log_path = args.output_dir / RUN_LOG
     _append_run_log(
@@ -874,11 +894,11 @@ def main() -> None:
             "origins": args.origins,
             "round": args.round,
             **{f"wrmsse_{window}": round(scores[window], 6) if window in scores else None for window in WINDOWS},
+            "kaggle_public": None,
+            "kaggle_private": None,
             "fit_seconds": run_stats["fit_seconds"],
             "git_commit": git_commit,
             "git_dirty": git_dirty,
-            "kaggle_public": None,
-            "kaggle_private": None,
         },
     )
     logger.info("Appended this run to %s", run_log_path)
