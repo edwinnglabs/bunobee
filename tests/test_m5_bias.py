@@ -4,7 +4,8 @@ The script asks whether a model's forecast tracks the arithmetic or the geometri
 (issue #113). These tests check its per-series means, the volume terciles and zero-share bins, the group
 ratios and the two tracking measures (``position`` and ``slope``) on series small enough to work out by hand,
 the share of series with a fitted sigma on a bound of the entry's uniform priors, within one Adam step of it
-(issues #115 and #116), and that it fits the same random sample as ``m5_run.py``. None needs the raw M5 data.
+(issues #115 and #116), that it fits the same random sample as ``m5_run.py``, and that it fits the
+pre-validation origin unless told otherwise, never the evaluation one (issue #125). None needs the raw M5 data.
 
 The script is a playground script, not part of the package, so it is loaded by path as
 ``tests/test_m5_run.py`` loads the runner.
@@ -294,3 +295,10 @@ def test_sample_matches_the_runner():
 
     np.testing.assert_array_equal(m5_bias.sample_series(30490, 3000, 2026), expected)
     assert m5_bias.sample_series(10, 0, 1).size == 10
+
+
+def test_the_prevalidation_origin_by_default():
+    assert m5_bias._parse_args([]).window == "prevalidation"
+    assert m5_bias._parse_args(["--window", "validation"]).window == "validation"
+    with pytest.raises(SystemExit):
+        m5_bias._parse_args(["--window", "evaluation"])

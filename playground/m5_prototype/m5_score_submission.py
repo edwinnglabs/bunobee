@@ -29,10 +29,16 @@ published one:
 - Dollar sales skip days with no listed price, so a price gap drops those days
   from a series' weight instead of zeroing all of it.
 
-Scoring windows (``--window``):
+Scoring windows, each trained on every day before the days it scores:
 
-    validation : actuals d_1914-d_1941, trained on d_1-d_1913  (``_validation`` rows)
-    evaluation : actuals d_1942-d_1969, trained on d_1-d_1941  (``_evaluation`` rows)
+    prevalidation : actuals d_1886-d_1913, trained on d_1-d_1885  (no submission rows)
+    validation    : actuals d_1914-d_1941, trained on d_1-d_1913  (``_validation`` rows, Kaggle public)
+    evaluation    : actuals d_1942-d_1969, trained on d_1-d_1941  (``_evaluation`` rows, Kaggle private)
+
+The pre-validation window is the validation window moved 28 days earlier, inside
+the ``train`` split. Kaggle never scores it, so models can be chosen on it without
+spending the two windows Kaggle scores. A submission has rows for those two only,
+so ``--window`` takes those.
 
 The Kaggle files stop at d_1941, so the evaluation window only scores once the
 dataset's ``test`` split carries the released actuals: ``m5_fetch.py`` downloads
@@ -44,6 +50,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -55,12 +62,35 @@ logger = logging.getLogger(__name__)
 
 N_STEPS = 28
 
-# Scoring window -> (splits forming its training span, split holding its actuals, day range for logs). The
-# training span feeds the RMSSE scale, and its last N_STEPS days feed the dollar-sales weights.
-WINDOWS: dict[str, tuple[tuple[str, ...], str, str]] = {
-    "validation": (("train",), "validation", "d_1914-d_1941"),
-    "evaluation": (("train", "validation"), "test", "d_1942-d_1969"),
+
+class Window(NamedTuple):
+    """Where a scoring window lies in the calendar.
+
+    Attributes
+    ----------
+    split : str
+        The ``split`` label the window is placed on.
+    days_back : int
+        How many days before that split's days the window's scored days lie; 0 scores the split's own days.
+    days : str
+        The scored days, for logs.
+    """
+
+    split: str
+    days_back: int
+    days: str
+
+
+# Scoring window -> where it lies, in date order. Every window trains on all the days before the days it scores:
+# they feed the RMSSE scale, and their last N_STEPS days feed the dollar-sales weights (see window_masks).
+WINDOWS: dict[str, Window] = {
+    "prevalidation": Window("validation", N_STEPS, "d_1886-d_1913"),
+    "validation": Window("validation", 0, "d_1914-d_1941"),
+    "evaluation": Window("test", 0, "d_1942-d_1969"),
 }
+
+#: The windows a Kaggle submission has rows for (``<series_id>_<window>``): the public and private leaderboards.
+SUBMISSION_WINDOWS: tuple[str, ...] = ("validation", "evaluation")
 
 # (level_number, human_name, grouping_keys). None = no grouping (Total level).
 _LEVELS: list[tuple[int, str, tuple[str, ...] | None]] = [
@@ -91,11 +121,45 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--window",
-        choices=tuple(WINDOWS),
+        choices=SUBMISSION_WINDOWS,
         default="validation",
-        help="Scoring window: validation (d_1914-d_1941) or evaluation (d_1942-d_1969).",
+        help="Scoring window: validation (d_1914-d_1941) or evaluation (d_1942-d_1969). A submission has no "
+        "pre-validation rows.",
     )
     return p.parse_args()
+
+
+def window_masks(split: np.ndarray, window: str) -> tuple[np.ndarray, np.ndarray]:
+    """Training days and scored days of one scoring window.
+
+    Parameters
+    ----------
+    split : np.ndarray, shape (T,)
+        ``split`` label of each day, in date order.
+    window : str
+        Scoring window, a key of ``WINDOWS``.
+
+    Returns
+    -------
+    train_mask : np.ndarray, shape (T,)
+        True on the window's training days: every day before its scored days.
+    score_mask : np.ndarray, shape (T,)
+        True on the window's scored days.
+
+    Raises
+    ------
+    ValueError
+        If ``window`` is not a key of ``WINDOWS``, or the calendar has no days for it.
+    """
+    if window not in WINDOWS:
+        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
+    anchor, days_back, days = WINDOWS[window]
+    scored = np.flatnonzero(split == anchor) - days_back
+    if scored.size == 0 or scored[0] < 0:
+        raise ValueError(f"The calendar has no days for the {window} window ({days})")
+    score_mask = np.zeros(split.shape, dtype=bool)
+    score_mask[scored] = True
+    return np.arange(split.size) < scored[0], score_mask
 
 
 def _group_index(keys: list[np.ndarray]) -> tuple[np.ndarray, int]:
@@ -233,7 +297,7 @@ def compute_hierarchical_wrmsse(
         Point forecasts over the scoring window, one row per entry of ``series_order``.
     series_order : np.ndarray, shape (n_series,)
         ``series_id`` of each forecast row.
-    window : {"validation", "evaluation"}, optional
+    window : {"prevalidation", "validation", "evaluation"}, optional
         Scoring window, a key of ``WINDOWS``. Default ``"validation"``.
 
     Returns
@@ -248,17 +312,12 @@ def compute_hierarchical_wrmsse(
     RuntimeError
         If the window is not ``N_STEPS`` days long or the dataset has no actuals for it.
     """
-    if window not in WINDOWS:
-        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
-    train_splits, score_split, days = WINDOWS[window]
+    train_mask, score_mask = window_masks(ds["split"].values, window)
+    days = WINDOWS[window].days
 
     ds_ids = ds["series_id"].values
     id_to_idx = {sid: i for i, sid in enumerate(ds_ids)}
     idx = np.array([id_to_idx[sid] for sid in series_order])
-
-    split = ds["split"].values
-    train_mask = np.isin(split, train_splits)
-    score_mask = split == score_split
 
     sales = ds["sales"].values[idx].astype(np.float64)
     prices = ds["sell_price"].values[idx].astype(np.float64)
@@ -301,7 +360,7 @@ def level_weights(ds: xr.Dataset, window: str = "validation") -> pd.DataFrame:
     ----------
     ds : xr.Dataset
         Dataset from ``m5_preprocess.build_m5_dataset``.
-    window : {"validation", "evaluation"}, optional
+    window : {"prevalidation", "validation", "evaluation"}, optional
         Scoring window, a key of ``WINDOWS``; it fixes the 28 days the dollar sales are summed over.
         Default ``"validation"``.
 
@@ -311,9 +370,7 @@ def level_weights(ds: xr.Dataset, window: str = "validation") -> pd.DataFrame:
         One row per group: ``level``, ``group`` (the level's keys in ``_LEVELS`` order joined by ``"|"``,
         ``"Total"`` at level 1), ``dollar_sales`` and ``weight``. Weights sum to 1 within each level.
     """
-    if window not in WINDOWS:
-        raise ValueError(f"Unknown window {window!r}; expected one of {sorted(WINDOWS)}")
-    train_mask = np.isin(ds["split"].values, WINDOWS[window][0])
+    train_mask, _ = window_masks(ds["split"].values, window)
     dollar = dollar_sales(ds["sales"].values, ds["sell_price"].values, train_mask)
 
     frames = []
@@ -345,10 +402,10 @@ def log_per_level(per_level: pd.DataFrame, window: str = "validation") -> None:
     ----------
     per_level : pd.DataFrame
         Output of :func:`compute_hierarchical_wrmsse`.
-    window : {"validation", "evaluation"}, optional
+    window : {"prevalidation", "validation", "evaluation"}, optional
         Scoring window ``per_level`` was computed on, named in the table header. Default ``"validation"``.
     """
-    logger.info("Per-level WRMSSE + bias (%s %s):", window, WINDOWS[window][2])
+    logger.info("Per-level WRMSSE + bias (%s %s):", window, WINDOWS[window].days)
     logger.info(
         "  %-3s  %-22s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s",
         "lvl",

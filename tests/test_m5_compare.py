@@ -155,6 +155,12 @@ class TestSharedWindows:
 
         assert m5_compare.shared_windows(a, b) == ["validation", "evaluation"]
 
+    def test_prevalidation_comes_first(self):
+        a = pd.DataFrame({"window": ["evaluation", "validation", "prevalidation"]})
+        b = pd.DataFrame({"window": ["prevalidation", "evaluation"]})
+
+        assert m5_compare.shared_windows(a, b) == ["prevalidation", "evaluation"]
+
 
 class TestDeltas:
     """Differences are ``RUN_B - RUN_A``, level by level, for each shared window."""

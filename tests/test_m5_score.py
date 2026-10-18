@@ -7,6 +7,9 @@ One test class per acceptance criterion of issue #91:
 2. A series with partially missing prices keeps the dollar sales of its priced days as its weight.
 3. The scorer accepts a validation (d_1914-d_1941) or an evaluation (d_1942-d_1969) window.
 
+Issue #125 adds a third window, pre-validation (d_1886-d_1913): the validation window moved 28 days earlier,
+trained on the days before it only.
+
 Criterion 4 — running in CI without the raw M5 data — holds because every test here scores a tiny
 synthetic hierarchy built in this module. The scorer is a playground script, not part of the package,
 so it is loaded by path as ``tests/test_m5_accuracy.py`` loads the fixture builder.
@@ -72,6 +75,7 @@ scorer = _load_script("m5_score_submission")
 N_TRAIN = 40
 N_STEPS = 28
 N_DATES = N_TRAIN + 2 * N_STEPS
+PREVALIDATION_DAYS = slice(N_TRAIN - N_STEPS, N_TRAIN)
 VALIDATION_DAYS = slice(N_TRAIN, N_TRAIN + N_STEPS)
 EVALUATION_DAYS = slice(N_TRAIN + N_STEPS, N_DATES)
 
@@ -275,3 +279,43 @@ class TestScoringWindow:
         assert list(series_order) == SERIES_IDS
         assert forecasts.shape == (N_SERIES, N_STEPS)
         np.testing.assert_array_equal(forecasts, value)
+
+
+class TestPrevalidationWindow:
+    """The pre-validation window scores the 28 days before the validation window, trained on the days before."""
+
+    @pytest.mark.parametrize(
+        ("window", "days"),
+        [("prevalidation", PREVALIDATION_DAYS), ("validation", VALIDATION_DAYS), ("evaluation", EVALUATION_DAYS)],
+    )
+    def test_each_window_trains_on_every_day_before_its_scored_days(self, window: str, days: slice):
+        train_mask, score_mask = scorer.window_masks(_make_ds()["split"].values, window)
+
+        t = np.arange(N_DATES)
+        np.testing.assert_array_equal(np.flatnonzero(score_mask), t[days])
+        np.testing.assert_array_equal(np.flatnonzero(train_mask), t[: days.start])
+
+    def test_it_is_the_validation_recipe_28_days_earlier(self):
+        # The calendar cut after its train days, the last 28 of them relabelled as validation: its validation
+        # score must be the full calendar's pre-validation score. The cut has no later days, so this also shows
+        # the pre-validation score reads nothing after its scored days. The price gap of series 0 falls on the
+        # scored days, so the weights come from the 12 days before them: $12 of $21 for series 0.
+        ds = _make_ds()
+        cut = ds.isel(date=slice(0, N_TRAIN)).assign_coords(
+            split=("date", np.array(["train"] * (N_TRAIN - N_STEPS) + ["validation"] * N_STEPS))
+        )
+
+        levels = _score(ds, PREVALIDATION_DAYS, window="prevalidation")
+
+        assert levels == pytest.approx(_score(cut, PREVALIDATION_DAYS, window="validation"))
+        assert levels[12] == pytest.approx(12 / 21)
+
+    def test_a_calendar_too_short_for_it_raises(self):
+        split = np.array(["train"] * (N_STEPS - 1) + ["validation"] * N_STEPS)
+
+        with pytest.raises(ValueError, match="no days for the prevalidation window"):
+            scorer.window_masks(split, "prevalidation")
+
+    def test_a_submission_has_rows_for_the_kaggle_windows_only(self):
+        assert scorer.SUBMISSION_WINDOWS == ("validation", "evaluation")
+        assert list(scorer.WINDOWS) == ["prevalidation", *scorer.SUBMISSION_WINDOWS]
