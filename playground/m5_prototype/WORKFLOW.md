@@ -57,8 +57,8 @@ d_1 ────────────── d_1885 │ d_1886 ── d_1913 �
                             not on Kaggle       Kaggle public      Kaggle private
 ```
 
-For each cutoff day it hands the model picked with `--model` (by default `ssp_dow`) all sales up to that
-day. The model builds its own inputs, fits all 30,490 series at once and forecasts the next 28 days. It
+For each cutoff day it hands the model picked with `--model` (by default `ssp_level_dow_yeojohnson_halfnormal`,
+#118) all sales up to that day. The model builds its own inputs, fits all 30,490 series at once and forecasts the next 28 days. It
 then writes `submission.csv` (60,980 rows, half from each of the two Kaggle cutoff days), scores all three
 windows against the true sales and saves everything to `output/<timestamp>/`. The pre-validation window's
 actuals are in the `train` split, so it needs nothing beyond the Kaggle files.
@@ -105,7 +105,7 @@ actuals are on disk, so it is easy to tune to them without noticing, and then th
 you anything. Until #125 the quick loop ran the validation window, so every choice from #106 to #117 was
 made on it, and every full run printed the evaluation score.
 
-Baseline, the current model (`ssp_dow`):
+Baseline, `ssp_dow`, the default model until #118:
 
 | | Pre-validation | Validation (public) | Evaluation (private) |
 |---|---|---|---|
@@ -114,7 +114,9 @@ Baseline, the current model (`ssp_dow`):
 | Local, after the #116 fix | 1.05983 | 1.10175 | 0.99403 |
 
 The #116 fix of the best-parameter tracking changed `ssp_dow`'s forecasts (see "Sigma priors and best-parameter
-tracking (#116)"); compare new full runs with the last row.
+tracking (#116)"); compare new full runs with the last row. The default model is now
+`ssp_level_dow_yeojohnson_halfnormal`, which scores 0.79563, 0.70891 and 0.79394 on the three windows (Kaggle 0.70888
+and 0.79394); see "Full run and the default model (#118)".
 
 ### `ssp_level_dow` (#106)
 
@@ -470,8 +472,9 @@ the RMSSE scale runs over all the fit days, and the weights are the dollar sales
 Its actuals are in the `train` split. `--origins all`, the default, fits all three windows; a submission still
 takes only the validation and evaluation forecasts.
 
-All three windows, on the 3,000-series sample (seed 2026) and on full runs. The Kaggle columns are blank: none of
-these forecasts has been submitted (the #94 and #106 submissions predate the #116 fix), and a sample cannot be.
+All three windows, on the 3,000-series sample (seed 2026) and on full runs. Of these forecasts only the full run of
+`ssp_level_dow_yeojohnson_halfnormal` has been submitted, for #118 (the #94 and #106 submissions predate the #116
+fix), and a sample cannot be.
 
 | Entry | Series | Pre-validation | Validation | Evaluation | Kaggle public | Kaggle private |
 |---|---|---|---|---|---|---|
@@ -480,7 +483,7 @@ these forecasts has been submitted (the #94 and #106 submissions predate the #11
 | `ssp_level_dow_yeojohnson_halfnormal` | 3,000 | 0.82376 | 0.74610 | 0.74957 | | |
 | `ssp_dow` | 30,490 | 1.05983 | 1.10175 | 0.99403 | | |
 | `ssp_level_dow` | 30,490 | 0.97009 | 1.06591 | 0.98720 | | |
-| `ssp_level_dow_yeojohnson_halfnormal` | 30,490 | 0.79563 | 0.70891 | 0.79394 | | |
+| `ssp_level_dow_yeojohnson_halfnormal` | 30,490 | 0.79563 | 0.70891 | 0.79394 | 0.70888 | 0.79394 |
 
 Per level of the full runs on the pre-validation window, with the bias of the total:
 
@@ -523,6 +526,54 @@ Per level of the full runs on the pre-validation window, with the bias of the to
 windows once per candidate, on its full run (see "The experiment loop"). For #118, all three windows put
 `ssp_level_dow_yeojohnson_halfnormal` first.
 
+### Full run and the default model (#118)
+
+The #116 winner, `ssp_level_dow_yeojohnson_halfnormal`, against `ssp_dow` on full runs (30,490 series), read on the
+validation and evaluation windows once, here. The runs are the #125 ones, `20261017_195848` (`ssp_dow`) and
+`20261017_201617` (the winner), both at all three origins; they were not re-fitted. Both were made at commit
+`da6ebca` with a dirty working tree (`git_dirty` in `runs.csv`): the uncommitted #125 change, which the #125 notes
+show left both runs' validation and evaluation forecasts unchanged. The winner's `submission.csv` was submitted to
+Kaggle by hand; its scores are in `runs.csv`.
+
+Per level (`m5_compare.py`), against `ssp_dow` before the #116 fix (the #94 submission, `20261016_215316`) and
+after it. A dash means the forecasts were not submitted.
+
+| Level | Validation, #94 | `ssp_dow` | Default | Evaluation, #94 | `ssp_dow` | Default |
+|---|---|---|---|---|---|---|
+| 1 Total | 1.1067 | 1.1426 | 0.5318 | 0.8628 | 0.8970 | 0.5972 |
+| 2 State | 1.0784 | 1.1093 | 0.5725 | 0.8833 | 0.9113 | 0.6508 |
+| 3 Store | 1.0961 | 1.1229 | 0.6464 | 0.9290 | 0.9527 | 0.6918 |
+| 4 Category | 1.1297 | 1.1627 | 0.5690 | 0.9108 | 0.9416 | 0.6301 |
+| 5 Department | 1.1972 | 1.2270 | 0.6980 | 0.9890 | 1.0174 | 0.7407 |
+| 6 State × category | 1.0947 | 1.1224 | 0.6181 | 0.9371 | 0.9611 | 0.7064 |
+| 7 State × department | 1.1394 | 1.1636 | 0.7288 | 1.0008 | 1.0219 | 0.7924 |
+| 8 Store × category | 1.0762 | 1.0981 | 0.6856 | 0.9491 | 0.9680 | 0.7462 |
+| 9 Store × department | 1.1041 | 1.1209 | 0.7809 | 0.9938 | 1.0088 | 0.8358 |
+| 10 Item | 1.0325 | 1.0329 | 0.9019 | 1.1666 | 1.1658 | 1.1193 |
+| 11 Item × state | 0.9772 | 0.9762 | 0.8896 | 1.0817 | 1.0800 | 1.0475 |
+| 12 Item × store | 0.9440 | 0.9424 | 0.8843 | 1.0047 | 1.0028 | 0.9691 |
+| WRMSSE | 1.08136 | 1.10175 | **0.70891** | 0.97573 | 0.99403 | **0.79394** |
+| Kaggle | 1.08127 | – | **0.70888** | 0.97572 | – | **0.79394** |
+| Bias, levels 1–9 | −12.6 to −13.2% | −13.1 to −13.8% | −1.3 to −1.5% | −9.3 to −10.2% | −9.9 to −10.8% | +4.2 to +5.2% |
+| Bias, levels 10–12 | −2.6 to +8.1% | −3.2 to +7.4% | +6.0 to +12.9% | +7.1 to +28.2% | +6.4 to +27.4% | +23.9 to +47.7% |
+
+- **The winner is better at every level on both windows**, against both baselines: −0.37245 on validation and
+  −0.18179 on evaluation against the #94 submission (−0.39283 and −0.20008 against `ssp_dow` after the #116 fix).
+  The gain is largest on the totals (level 1: −0.575 and −0.266) and smallest on the item levels (level 12: −0.060
+  and −0.036).
+- **The epic's bias target is met:** the validation total is 1.3% low, against the baseline's 12.7%. On the
+  evaluation window it is 5.1% high, against 9.3% low, and on pre-validation 4.4% high (#125).
+- **The item levels run high, most on the evaluation window.** The dollar-weighted item bias rises from +6 to +13%
+  on validation to +24 to +48% on evaluation, and level 10 (item) still scores 1.1193 there, worse than the naive
+  forecast; `ssp_dow`'s item levels run high too (+6 to +27%). The open item is in "Known problems".
+- **Kaggle matches the local scorer:** public 0.70888 against a local 0.70891, private 0.79394 against 0.79394.
+- **Cost:** the full run takes 820 s against 496 s for `ssp_dow` (259–270 s per origin against 152–161 s), at a
+  22.9 GiB peak against 22.7 GiB.
+
+**Decision:** `ssp_level_dow_yeojohnson_halfnormal` is the default `--model` (`DEFAULT_MODEL` in `m5_models.py`).
+It wins on the sample, on all three full-run windows and on both Kaggle leaderboards. `ssp_dow` stays registered as
+the baseline that runs are compared with.
+
 ## Working on the model
 
 ### Where the code is
@@ -543,7 +594,11 @@ returns each fit day's one-step-ahead prediction, back-transformed as its foreca
 (data loading, the three cutoff days, the submission, the scoring) lives in `m5_run.py` and works with any model,
 so adding a model needs only a new entry.
 
-### The current model (`ssp_dow`)
+### The baseline model (`ssp_dow`)
+
+`ssp_dow` was the default until #118. The default, `ssp_level_dow_yeojohnson_halfnormal`, is the same model with the
+level state, a Yeo-Johnson target and half-normal sigma priors (see "Power transforms (#115)" and "Sigma priors and
+best-parameter tracking (#116)").
 
 - **Transform:** it models `log(max(sales, 0.1) / mean)` with Gaussian noise, where `mean` is the series'
   mean of `max(sales, 0.1)` over the fit days. Every zero-sales day becomes `log(0.1 / mean)`. This is
@@ -567,7 +622,7 @@ drift.
   and every Monday forecast is `mean · exp(σ_h² / 2)`: the series' average over all fit days, whatever its
   recent sales. In the baseline run, all four Monday forecasts of every series equal that value. The
   "level" drift actually applies to the Tuesday state. `ssp_level_dow` adds the level (see its results
-  above), but is not the default.
+  above), and so does the default model.
 - **Totals are forecast too low.** In the baseline run, total sales are 12.7% low on the validation window
   and 9.3% low on the evaluation window, and every level from 1 to 9 is low by a similar amount. The item
   levels (10–12) are not. The missing level state explains only part of it: `ssp_level_dow` lifts the
@@ -577,7 +632,12 @@ drift.
   `ssp_level_dow_yeojohnson` follows the arithmetic mean and forecasts the sample's totals 0.4% low, but
   not yet on a full run (see "Power transforms (#115)"). With soft sigma priors in place of the caps,
   `ssp_level_dow_yeojohnson_halfnormal` forecasts them 1.9% high and scores 0.74610 on the sample (see "Sigma
-  priors and best-parameter tracking (#116)").
+  priors and best-parameter tracking (#116)"). On the full run, now the default, it forecasts them 1.3% low on
+  validation and 5.1% high on evaluation (see "Full run and the default model (#118)").
+- **The default model forecasts the items too high.** On the full run its dollar-weighted item bias (levels 10–12)
+  is +6 to +13% on validation and +24 to +48% on evaluation, and the item level scores 1.1193 on evaluation. On
+  the sample the bias splits by volume: the low-volume tercile runs about 30% low and the high-volume one 9% high
+  (see "Sigma priors and best-parameter tracking (#116)").
 - **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
   New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
   after the first the shared drift.

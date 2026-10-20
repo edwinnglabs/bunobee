@@ -263,5 +263,6 @@ MODELS: dict[str, Model] = {
     "ssp_level_dow_halfnormal": SspDow(level=True, **HALF_NORMAL_PRIORS),
 }
 
-#: The baseline entry, ``m5_run.py``'s default ``--model``.
-DEFAULT_MODEL = "ssp_dow"
+#: ``m5_run.py``'s default ``--model``: the best entry on the full run at all three origins and on Kaggle (issue
+#: #118). ``ssp_dow`` stays registered as the baseline.
+DEFAULT_MODEL = "ssp_level_dow_yeojohnson_halfnormal"
