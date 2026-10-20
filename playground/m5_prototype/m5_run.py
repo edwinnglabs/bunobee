@@ -3,7 +3,7 @@
 
 Usage examples
 --------------
-# Fit 10 random series (demo mode) with the baseline model, ssp_dow:
+# Fit 10 random series (demo mode) with the default model, ssp_level_dow_yeojohnson_halfnormal:
     python m5_run.py
 
 # Fit 50 top-volume series:

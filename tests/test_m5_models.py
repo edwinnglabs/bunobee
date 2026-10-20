@@ -186,11 +186,12 @@ def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transf
 
 
 class TestRegistry:
-    """The registry names the baseline, and every entry's settings can be written to ``run_stats.json``."""
+    """The registry names the default model, and every entry's settings can be written to ``run_stats.json``."""
 
     def test_default_model_is_registered(self):
-        assert m5_models.DEFAULT_MODEL == "ssp_dow"
+        assert m5_models.DEFAULT_MODEL == "ssp_level_dow_yeojohnson_halfnormal"
         assert m5_models.DEFAULT_MODEL in m5_models.MODELS
+        assert "ssp_dow" in m5_models.MODELS
 
     @pytest.mark.parametrize("name", ["ssp_dow", "ssp_level_dow"])
     def test_ssp_entries_keep_the_log_transform(self, name):
