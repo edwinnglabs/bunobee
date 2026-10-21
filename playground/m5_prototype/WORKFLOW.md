@@ -1,7 +1,8 @@
 # M5 workflow
 
-How the M5 pipeline fits together, what to rerun after a change, and where to work on the model. For
-prerequisites, every command and the reference results, see [README.md](README.md).
+How the M5 pipeline fits together, what to rerun after a change, the cycle a model change goes through, and
+where to work on the model. For prerequisites, every command and flag, and the reference results, see
+[README.md](README.md).
 
 ## The pipeline
 
@@ -90,20 +91,77 @@ forecast, with the RMSSE, bias, weight and contribution in its title.
 
 ## The experiment loop
 
-1. Add or edit a model entry in `m5_models.py` (see below).
-2. `python m5_run.py --model NAME --n-demo 50` to check nothing crashes.
-3. Quick loop: `python m5_run.py --model NAME --n-demo 3000 --origins prevalidation`, then compare with the
-   sample baseline: `python m5_compare.py output/<baseline> output/<run>`.
-4. `python m5_run.py --model NAME --n-demo 0` for the full score at all three origins: about 8 minutes for
-   `ssp_dow`, ~23 GiB peak. Compare it with the full baseline run the same way.
-5. Submit only when you want the official number: the local scorer matches Kaggle to within 0.0001.
+Every model change goes through the same cycle. The commands run from `playground/m5_prototype/`.
 
-Make decisions on the pre-validation score only, and read the validation and evaluation scores once per
-candidate, on its full run, as the final check. Those two windows are Kaggle's public and private
-leaderboards, and the local scores match Kaggle's, so a choice made on either is tuned on the test: their
-actuals are on disk, so it is easy to tune to them without noticing, and then the leaderboard stops telling
-you anything. Until #125 the quick loop ran the validation window, so every choice from #106 to #117 was
-made on it, and every full run printed the evaluation score.
+```
+ develop       →  smoke test   →  quick fit        →  compare        →  full run      →  submit
+ m5_models.py     --n-demo 50     3,000 series,       m5_compare.py     --n-demo 0,      by hand,
+                                  pre-validation                        all 3 origins    optional
+```
+
+1. **Develop.** Add or edit an entry of `MODELS` in `m5_models.py` (see "Working on the model"). A setting is
+   a field of the entry and a new model is a new entry, so `m5_run.py` needs no change. Leave the entries you
+   compare against registered.
+2. **Smoke test.** `python m5_run.py --model NAME --n-demo 50 --origins prevalidation` checks that the entry
+   fits and forecasts on a few series. Glance at `forecasts.pdf` for anything plainly wrong.
+3. **Quick fit.** `python m5_run.py --model NAME --n-demo 3000 --origins prevalidation` fits 3,000 random
+   series (seed 2026) at the pre-validation cutoff day only, in about 20 s (30 s with a power transform).
+4. **Compare.** `python m5_compare.py output/<baseline> output/<run>` prints the overall and per-level
+   WRMSSE and bias deltas of every window both runs scored; a negative delta means the second run is better.
+   The baseline is a quick fit of the current default model on the same sample,
+   `python m5_run.py --n-demo 3000 --origins prevalidation`, made once and reused until the default changes.
+   When the bias moves, `python m5_bias.py --model BASELINE NAME` shows which mean of the sales each
+   forecast tracks and how many sigmas sit on a prior bound.
+5. **Full run.** A candidate that beats the baseline on the sample gets `python m5_run.py --model NAME
+   --n-demo 0`: all 30,490 series at all three cutoff days, about 14 minutes for the default model and 8 for
+   `ssp_dow`, at a ~23 GiB peak. Compare it with the default's full run the same way. This is where its
+   validation and evaluation scores are read, once (see "The holdout rule").
+6. **Submit.** Only when you want the official number; the local scorer matches Kaggle to within 0.0001.
+   `kaggle competitions submit -c m5-forecasting-accuracy -f output/<timestamp>/submission.csv -m
+   "<message>"`, then type the public and private scores into the run's `kaggle_public` and `kaggle_private`
+   columns of `output/runs.csv`.
+7. **Record.** Add the results and a decision to this file under a heading named for the issue, as for #106
+   to #118 below. A new default is `DEFAULT_MODEL` in `m5_models.py`.
+
+Every `m5_run.py` run appends a row to `output/runs.csv` (columns in [README.md](README.md), "What a run
+writes"). Use it to find a run's directory and its baseline: two rows with the same `n_series`,
+`sample_mode` and `seed` fitted the same series. `git_commit` and `git_dirty` tie each score to the code
+that made it, so commit before a run you will cite.
+
+### Comparing on a sample
+
+A sampled run scores its own series only: it sums them into its own 12 levels, so its store and department
+totals are totals of the 3,000 series, and it weights them by their own dollar sales. Its score is not an
+estimate of the full-run score, and it compares only with runs on the same series: the same `--n-demo`,
+`--sample-mode` and `--seed`. `m5_compare.py` refuses two runs fitted on different series. A delta on the
+sample is a guess at the full-run delta, not a measurement of it.
+
+The guess can be wrong. For `ssp_level_dow` (#106) the sample scored the validation window 0.0066 worse
+while the full run scored it 0.0308 better; the pre-validation sample got the sign right (#125), but on that
+one pair of entries. Enlarge the sample (`--n-demo`) or stratify it:
+
+- **When a sample gain turns into a full-run loss, or the reverse.** The sample has misled once; do not
+  steer the next model by it until a larger or stratified sample agrees with the full runs.
+- **When the delta is small.** A few thousandths on 3,000 of 30,490 series can be which series were drawn.
+  Rerun both entries with another `--seed`, and trust the delta only if its sign holds.
+- **When the change targets a subgroup.** A change aimed at sparse series or at one department has few of
+  them in a random sample; their share of the sample, not the overall delta, decides whether it can show.
+
+Stratified sampling, a fixed share of every store × department, is not implemented yet (see "Open items").
+`--sample-mode top` fits the highest-volume series: a quick look at the series that dominate the weights,
+not a sample of the rest.
+
+### The holdout rule
+
+Make decisions on the pre-validation score only (d_1886–d_1913, which Kaggle never scores; the quick loop
+fits that origin only), and read the validation and evaluation scores once per candidate, on its full run,
+as the final check. Those two windows are Kaggle's public and private leaderboards, and the local scores
+match Kaggle's, so a choice made on either is tuned on the test: their actuals are on disk, so it is easy to
+tune to them without noticing, and then the leaderboard stops telling you anything. Until #125 the quick
+loop ran the validation window, so every choice from #106 to #117 was made on it, and every full run
+printed the evaluation score.
+
+### Reference scores
 
 Baseline, `ssp_dow`, the default model until #118:
 
@@ -617,12 +675,16 @@ drift.
 
 ### Known problems
 
-- **`ssp_dow` has no level state.** The docstrings call the model "local level + weekly seasonality", but
-  its `Z` has no column of ones. Monday rows of `Z` are all zero, so Monday sales never update the states
-  and every Monday forecast is `mean · exp(σ_h² / 2)`: the series' average over all fit days, whatever its
-  recent sales. In the baseline run, all four Monday forecasts of every series equal that value. The
-  "level" drift actually applies to the Tuesday state. `ssp_level_dow` adds the level (see its results
-  above), and so does the default model.
+- **`ssp_dow` has no level state, because the runner leaves out the column of ones.** The model code is
+  fine: `fit_batch_series_opt` fits a local level plus weekly seasonality when the first column of `Z` is a
+  column of ones, giving that state the level's drift, and the MCMC version (`m5_ssp_mcmc.py`) builds the
+  ones and the weekday dummies itself. The code that builds `Z` for the fit, `m5_run.py` in the #93 and #94
+  submissions and now `SspDow.fit_forecast` with `level=False`, passes only the six weekday dummies. Monday
+  rows of `Z` are then all zero, so Monday sales never update the states and every Monday forecast is
+  `mean · exp(σ_h² / 2)`: the series' average over all fit days, whatever its recent sales. In the baseline
+  run, all four Monday forecasts of every series equal that value. The "level" drift actually applies to
+  the Tuesday state. `ssp_level_dow` passes the column of ones (see its results above), and so does the
+  default model; `ssp_dow` keeps it out as the baseline.
 - **Totals are forecast too low.** In the baseline run, total sales are 12.7% low on the validation window
   and 9.3% low on the evaluation window, and every level from 1 to 9 is low by a similar amount. The item
   levels (10–12) are not. The missing level state explains only part of it: `ssp_level_dow` lifts the
@@ -650,7 +712,8 @@ drift.
   validation window +0.0066 worse while the full run scored it −0.0308 better (+0.0015 and −0.0358 after the
   #116 fix). On the pre-validation window the sample gets the sign right (−0.0576, full run −0.0897; see
   "Pre-validation window (#125)"), but that is one pair of entries. Enlarge the sample or stratify it by
-  store × department before steering the next model by it.
+  store × department before steering the next model by it (see "Comparing on a sample"); `m5_run.py` has no
+  stratified `--sample-mode` yet.
 - **Hierarchical parameter sharing:** share the weekday drift within department × store groups (70 groups),
   either outright or through a prior that pulls each series toward its group. Most useful for sparse
   series.

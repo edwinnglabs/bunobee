@@ -36,20 +36,22 @@ python playground/m5_prototype/m5_check_weights.py
 cd playground/m5_prototype
 
 # 4. Quick loop: fit 3,000 random series (seed 2026) at the pre-validation origin only, with a
-#    registered model (see Models below), and score them. About 20 s and a ~3.3 GiB peak. --model
-#    defaults to ssp_level_dow_yeojohnson_halfnormal (#118); ssp_dow is the baseline, run it once as
-#    the sample baseline to compare against.
-python m5_run.py --model ssp_dow --n-demo 3000 --origins prevalidation
+#    registered model (see Models below), and score them. About 20 s and a ~3.3 GiB peak. Run it once
+#    without --model, i.e. with the default ssp_level_dow_yeojohnson_halfnormal (#118), as the sample
+#    baseline, then once per candidate.
+python m5_run.py --n-demo 3000 --origins prevalidation
+python m5_run.py --model <candidate> --n-demo 3000 --origins prevalidation
 
 # 5. Compare a run with the sample baseline: overall and per-level WRMSSE and bias deltas for each
-#    window both runs scored. Refuses runs fitted on different series.
+#    window both runs scored. Refuses runs fitted on different series. output/runs.csv lists the runs.
 python m5_compare.py output/<baseline timestamp> output/<timestamp>
 
 # 6. Full run: fit all 30,490 series at all three origins, write submission.csv and score it.
-python m5_run.py --model ssp_dow --n-demo 0
-#    About 8 minutes and a ~23 GiB peak (see below). With less RAM, register an entry that fits
-#    in runs of fewer series, e.g. "ssp_dow_8k": SspDow(fit_chunk=8192) in m5_models.py, and pass
-#    --model ssp_dow_8k.
+python m5_run.py --model <candidate> --n-demo 0
+#    About 14 minutes for the default model (8 for ssp_dow) and a ~23 GiB peak (see below). Its
+#    validation and evaluation scores are read here, once per candidate. With less RAM, register an
+#    entry that fits in runs of fewer series, e.g. "ssp_dow_8k": SspDow(fit_chunk=8192) in
+#    m5_models.py, and pass --model ssp_dow_8k.
 
 # 7. Optional: re-score a submission file on either window.
 python m5_score_submission.py --submission output/<timestamp>/submission.csv --window validation
@@ -68,15 +70,32 @@ kaggle competitions submissions -c m5-forecasting-accuracy | head -3
 python m5_bias.py --model ssp_dow ssp_level_dow
 ```
 
-`--origins prevalidation|validation|evaluation|both|all` (default `all`) picks the forecast origins to
-fit; `both` is validation and evaluation, the two a submission needs. The quick loop fits only the
-pre-validation origin, so it never looks at the two windows Kaggle scores. Choose models on the
-pre-validation score, and read the validation and evaluation scores once per candidate, on its full run
-(see [WORKFLOW.md](WORKFLOW.md), "The experiment loop").
+[WORKFLOW.md](WORKFLOW.md), "The experiment loop", walks through the cycle these steps make up: develop,
+smoke test, quick fit, compare, full run, submit.
 
-`--round` clips the forecasts at 0 and rounds them to the nearest integer before they are plotted, saved,
-submitted and scored. It is off by default, because WRMSSE is a squared error and the best forecast is the
-mean, which is rarely an integer. The results are in [WORKFLOW.md](WORKFLOW.md), "Integer rounding (#117)".
+### `m5_run.py` flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--model NAME` | `ssp_level_dow_yeojohnson_halfnormal` | The registered entry of `MODELS` to fit (see Models below) |
+| `--n-demo N` | 10 | Number of series to fit; 0 fits all 30,490 |
+| `--sample-mode random\|top` | `random` | Draw the `--n-demo` series at random, or take the top ones by total volume |
+| `--seed N` | 2026 | Seed of the random sample |
+| `--origins prevalidation\|validation\|evaluation\|both\|all` | `all` | The forecast origins to fit; `both` is validation and evaluation, the two a submission needs |
+| `--round` | off | Clip the forecasts at 0 and round them to the nearest integer before they are plotted, saved, submitted and scored |
+| `--n-plot-ranked N` | 10 | Series in each ranked section of `forecasts.pdf` per origin; 0 turns the ranked sections off |
+| `--n-plot-random N` | 30 | Series picked at random for `forecasts.pdf` per origin, the same at every origin; 0 = none |
+| `--plots-per-page N` | 5 | Forecast panels per page of `forecasts.pdf` |
+| `--data-dir DIR` | `playground/resource/m5-forecasting-accuracy/` | Directory with `m5_ds.nc` and `sample_submission.csv` |
+| `--output-dir DIR` | `playground/m5_prototype/output/` | Root of the run directories and of `runs.csv` |
+
+The quick loop fits only the pre-validation origin, so it never looks at the two windows Kaggle scores.
+Choose models on the pre-validation score, and read the validation and evaluation scores once per
+candidate, on its full run (see [WORKFLOW.md](WORKFLOW.md), "The holdout rule"). A sample score compares
+only with runs on the same sample (see "Comparing on a sample" there).
+
+`--round` is off by default, because WRMSSE is a squared error and the best forecast is the mean, which is
+rarely an integer. The results are in [WORKFLOW.md](WORKFLOW.md), "Integer rounding (#117)".
 
 ### What a run writes
 
