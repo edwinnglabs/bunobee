@@ -303,6 +303,31 @@ def _read_states_prior(prior: xr.Dataset | SspPrior) -> tuple[np.ndarray, np.nda
     return a_obs, p_obs, state_labels
 
 
+def _resolve_grid(n_states: int, n_rows: int | None, n_cols: int | None) -> tuple[int, int]:
+    """Resolve the subplot grid ``(n_rows, n_cols)`` for ``n_states`` panels.
+
+    With neither given, every state gets its own column in a single row.  With
+    one given, the other is the smallest value that holds every state.
+
+    Raises
+    ------
+    ValueError
+        If a given dimension is non-positive, or ``n_rows * n_cols < n_states``.
+    """
+    for name, value in (("n_rows", n_rows), ("n_cols", n_cols)):
+        if value is not None and value < 1:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if n_rows is None and n_cols is None:
+        return 1, max(n_states, 1)
+    if n_cols is None:
+        n_cols = math.ceil(n_states / n_rows)
+    elif n_rows is None:
+        n_rows = math.ceil(n_states / n_cols)
+    if n_rows * n_cols < n_states:
+        raise ValueError(f"a {n_rows}x{n_cols} grid cannot hold {n_states} states")
+    return n_rows, n_cols
+
+
 def plot_prior_density(
     prior: xr.Dataset | SspPrior,
     *,
@@ -313,6 +338,10 @@ def plot_prior_density(
     mean_color: str = "white",
     anchor_color: str = "cyan",
     title: str | None = None,
+    n_cols: int | None = None,
+    n_rows: int | None = None,
+    figsize: tuple[float, float] | None = None,
+    dpi: float | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     r"""Draw the per-step Gaussian marginal of a states prior as density panels.
 
@@ -354,28 +383,49 @@ def plot_prior_density(
         Colour of the raw-anchor markers, by default ``"cyan"``.
     title : str or None, optional
         Figure suptitle.  Auto-generated when ``None``.
+    n_cols : int or None, optional
+        Number of subplot columns.  When only ``n_rows`` is given the columns
+        are derived from it; when neither is given every state gets its own
+        column in a single row (the default layout).
+    n_rows : int or None, optional
+        Number of subplot rows.  When only ``n_cols`` is given the rows are
+        ``ceil(n_states / n_cols)``.
+    figsize : tuple[float, float] or None, optional
+        Figure ``(width, height)`` in inches.  Defaults to ``(7.0 * n_cols,
+        4.0 * n_rows)``, i.e. ``(7.0 * n_states, 4.0)`` for the default layout.
+    dpi : float or None, optional
+        Figure resolution in dots per inch.  ``None`` keeps the matplotlib
+        default (``rcParams["figure.dpi"]``).
 
     Returns
     -------
     fig : plt.Figure
     axes : np.ndarray
-        Flattened array of the panel ``Axes`` (one per state).
+        Flattened array of all ``Axes`` objects, including any hidden ones that
+        pad the grid beyond the last state.  For the default layout this is one
+        panel per state.
 
     Raises
     ------
     ValueError
-        If ``prior`` lacks the ``a_obs`` / ``P_obs`` disclosure block.
+        If ``prior`` lacks the ``a_obs`` / ``P_obs`` disclosure block, or
+        ``n_rows`` / ``n_cols`` is non-positive or too small to hold every state.
     """
     a_obs, p_obs, state_labels = _read_states_prior(prior)
     n_steps, n_states = a_obs.shape
     x = np.arange(n_steps)
+    n_rows, n_cols = _resolve_grid(n_states, n_rows, n_cols)
 
     # Anchor source: an explicit `anchors` prior, else the prior's own disclosures.
     anchor_a, anchor_p, _ = _read_states_prior(anchors) if anchors is not None else (a_obs, p_obs, state_labels)
     anchor_t = disclosed_idx(anchors if anchors is not None else prior)
 
-    fig, axes = plt.subplots(1, n_states, figsize=(7.0 * n_states, 4.0), squeeze=False)
+    if figsize is None:
+        figsize = (7.0 * n_cols, 4.0 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, dpi=dpi, squeeze=False)
     axes = axes.flatten()
+    for ax in axes[n_states:]:
+        ax.set_visible(False)
 
     colormap = plt.get_cmap(cmap).copy()
     colormap.set_bad(alpha=0.0)
@@ -434,7 +484,8 @@ def plot_prior_density(
         ax.legend(fontsize=7, loc="upper right")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="density")
 
-    axes[0].set_ylabel("state value")
+    for ax in axes[::n_cols][:n_rows]:
+        ax.set_ylabel("state value")
 
     if title is None:
         title = "per-state prior density"
