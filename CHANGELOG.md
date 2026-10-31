@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_regression_summary` in `bunobee.models.dlt` — one row per regressor with `coef_p50`, a credible interval
   (`lower` / `upper`, default `coef_p05` / `coef_p95`), the sign fractions and, given the `RegressionScheme`,
   its `sign`, `loc_prior` and `scale_prior`.
+- `get_forecast_decomposition` in `bunobee.models.dlt` — splits a `make_inference` forecast into `trend`, each
+  regressor (or a named group of regressors via `groups`, e.g. weekday dummies as `seasonality`), the total
+  `regression` and `yhat`, with the median and a credible interval per component and time step.
 
 ## [v0.0.6] - 2026-10-30
 
