@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   total scale constraint (e.g. on marketing spend channels) in one fit instead of a fit-then-refit with
   `scale_prior_i = total * coef_i / sum(coef)`. A non-positive value, or one without any `"+"` regressor, raises
   `ValueError`; the default `None` leaves the model unchanged.
+- `noise_dist` argument on `run_dlt_model` (and `dlt_model`) — `"student_t"` swaps the Normal likelihood for a
+  Student-t one whose degrees of freedom `nu` are sampled from `Uniform(min_nu, max_nu)` (default 5 to 40). The
+  posterior `nu` is returned in `idata`, and `make_inference` / `generate_noise_components` then draw Student-t
+  forecast noise. An unknown `noise_dist`, or bounds outside `0 < min_nu < max_nu`, raise `ValueError`; the default
+  `"normal"` leaves the model unchanged.
 
 ## [v0.0.6] - 2026-10-30
 

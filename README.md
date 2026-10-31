@@ -83,6 +83,17 @@ idata = run_dlt_model(
 )
 ```
 
+`noise_dist="student_t"` is a heavier-tailed backup to the default Normal noise, as in Orbit's DLT, for series whose
+outliers pull the Normal fit around. Its degrees of freedom `nu` get a `Uniform(min_nu, max_nu)` prior (default 5 to
+40) and are sampled with the rest of the model; `idata["nu"]` holds the posterior, and `make_inference` then draws
+Student-t forecast noise:
+
+```python
+idata = run_dlt_model(
+    rng_key, lev_sm=0.5, slp_sm=0.5, theta=0.8, y=y, mcmc_run_args=mcmc_args, noise_dist="student_t",
+)
+```
+
 ### DLT hyper-parameter tuning
 
 `hyper_tuning_dlt_with_wbic` picks `lev_sm`, `slp_sm` and `theta` by Bayesian optimization (`pip install bunobee[tune]`).

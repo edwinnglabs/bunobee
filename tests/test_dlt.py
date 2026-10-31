@@ -558,3 +558,81 @@ class TestPosCoefSumScale:
             )
         with pytest.raises(ValueError, match="'\\+' regressor"):
             run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, pos_coef_sum_scale=0.1)
+
+
+class TestStudentTNoise:
+    """#82: Student-t observation noise as a heavier-tailed backup to the Normal likelihood."""
+
+    def _trace(self, **kwargs):
+        model = numpyro.handlers.substitute(dlt_model, data={"sigma": 1.0, "nu": 7.0})
+        return numpyro.handlers.trace(numpyro.handlers.seed(model, 0)).get_trace(
+            LEV_SM, SLP_SM, THETA, jnp.ones(N_TRAIN), **kwargs
+        )
+
+    @staticmethod
+    def _likelihood(trace):
+        # obs_mask registers the likelihood as a masked distribution at "observations_observed"
+        return trace["observations_observed"]["fn"].base_dist
+
+    def test_likelihood_is_student_t_with_sampled_nu(self):
+        trace = self._trace(noise_dist="student_t", min_nu=3.0, max_nu=30.0)
+        nu_prior = trace["nu"]["fn"]
+        assert isinstance(nu_prior, numpyro.distributions.Uniform)
+        assert (float(nu_prior.low), float(nu_prior.high)) == (3.0, 30.0)
+        obs = self._likelihood(trace)
+        assert isinstance(obs, numpyro.distributions.StudentT)
+        np.testing.assert_allclose(obs.df, 7.0)
+        np.testing.assert_allclose(obs.scale, 1.0)
+
+    def test_default_is_normal(self):
+        trace = self._trace()
+        assert "nu" not in trace
+        assert isinstance(self._likelihood(trace), numpyro.distributions.Normal)
+
+    def test_run_returns_nu_within_prior(self, synthetic_y):
+        idata = run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, noise_dist="student_t")
+        assert idata["nu"].shape == (1, 50)
+        assert float(idata["nu"].min()) >= 5.0 and float(idata["nu"].max()) <= 40.0
+        mae = float(np.mean(np.abs(idata["yhat_p50"].values - synthetic_y)))
+        assert mae < 1.0, f"yhat_p50 MAE too large: {mae:.3f}"
+
+    def test_normal_fit_has_no_nu(self, trained_posteriors):
+        assert "nu" not in trained_posteriors
+
+    def test_student_t_scale_is_robust_to_outlier(self, synthetic_y):
+        y = synthetic_y.copy()
+        y[N_TRAIN // 2] += 20.0
+        args = {**MCMC_ARGS, "num_warmup": 200, "num_samples": 200}
+        normal = run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, y, args)
+        student_t = run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, y, args, noise_dist="student_t")
+        assert float(student_t["sigma"].median()) < float(normal["sigma"].median())
+
+    def test_noise_draws_are_heavy_tailed(self):
+        n, steps = 4000, 50
+        sigma = np.full((1, n), 1.0)
+        normal_idata = xr.Dataset({"sigma": (["chain", "draw"], sigma)})
+        t_idata = normal_idata.assign(nu=(["chain", "draw"], np.full((1, n), 3.0)))
+        normal_eps = np.asarray(generate_noise_components(RNG, normal_idata, steps))
+        t_eps = np.asarray(generate_noise_components(RNG, t_idata, steps))
+        assert t_eps.shape == normal_eps.shape == (n, steps)
+        # P(|T_3| > 4) ~ 0.028 vs P(|N(0, 1)| > 4) ~ 6e-5
+        assert np.mean(np.abs(t_eps) > 4.0) > 0.02
+        assert np.mean(np.abs(normal_eps) > 4.0) < 0.001
+        np.testing.assert_allclose(np.median(np.abs(t_eps)), 0.765, rtol=0.05)
+
+    def test_make_inference_embeds_student_t_noise(self, synthetic_y):
+        idata = run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, noise_dist="student_t")
+        out = make_inference(RNG, idata, LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + 5, noise_embed=True)
+        assert out["forecast_samples"].shape == (50, N_TRAIN + 5)
+        assert np.isfinite(out["forecast_samples"].values).all()
+
+    def test_unknown_noise_dist_raises(self, synthetic_y):
+        with pytest.raises(ValueError, match="noise_dist"):
+            run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, noise_dist="cauchy")
+
+    @pytest.mark.parametrize("min_nu, max_nu", [(0.0, 10.0), (10.0, 10.0), (20.0, 10.0)])
+    def test_bad_nu_bounds_raise(self, synthetic_y, min_nu, max_nu):
+        with pytest.raises(ValueError, match="min_nu"):
+            run_dlt_model(
+                RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, noise_dist="student_t", min_nu=min_nu, max_nu=max_nu
+            )
