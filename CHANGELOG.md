@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_forecast_decomposition` in `bunobee.models.dlt` — splits a `make_inference` forecast into `trend`, each
   regressor (or a named group of regressors via `groups`, e.g. weekday dummies as `seasonality`), the total
   `regression` and `yhat`, with the median and a credible interval per component and time step.
+- `pos_coef_sum_scale` argument on `run_dlt_model` (and `dlt_model`) — a `HalfNormal` constraint on the sum of the
+  positive (`"+"`) coefficients, added as a `pos_coef_sum` factor on top of their own scheme priors. It applies a
+  total scale constraint (e.g. on marketing spend channels) in one fit instead of a fit-then-refit with
+  `scale_prior_i = total * coef_i / sum(coef)`. A non-positive value, or one without any `"+"` regressor, raises
+  `ValueError`; the default `None` leaves the model unchanged.
 
 ## [v0.0.6] - 2026-10-30
 

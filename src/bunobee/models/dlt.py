@@ -80,6 +80,7 @@ def dlt_model(
     theta: float,
     y: jnp.ndarray,
     reg_input: Optional[Dict[str, Any]] = None,
+    pos_coef_sum_scale: Optional[float] = None,
 ):
     """NumPyro probabilistic model for Damped Local Trend (DLT) time series.
 
@@ -99,6 +100,10 @@ def dlt_model(
     reg_input: Optional dict keyed by sign (``"="``, ``"+"``, ``"-"``), each mapping
         to a sub-dict with ``"covariates"`` (array), ``"coef_loc"``, and
         ``"coef_scale"`` for the coefficient prior.
+    pos_coef_sum_scale: Optional scale of a ``HalfNormal`` constraint on the sum of the
+        positive (``"+"``) coefficients, added as a ``pos_coef_sum`` factor on top of
+        their own priors. Requires ``"+"`` regressors in ``reg_input``. See
+        :func:`run_dlt_model`.
     """
     y = jnp.asarray(y, dtype=y.dtype)
     sigma = numpyro.sample("sigma", dist.HalfNormal(5.0))
@@ -144,6 +149,9 @@ def dlt_model(
             )
             coefs.append(pos_coef)
             pos_reg_comp = jnp.sum(pos_covariates * pos_coef, axis=-1)
+            if pos_coef_sum_scale is not None:
+                # joint prior: own TruncatedNormal per coefficient x HalfNormal on their sum
+                numpyro.factor("pos_coef_sum", dist.HalfNormal(pos_coef_sum_scale).log_prob(jnp.sum(pos_coef)))
         # (n_steps, )
         reg_comp = neu_reg_comp + neg_reg_comp + pos_reg_comp
         if coefs:
@@ -184,8 +192,22 @@ def run_dlt_model(
     mcmc_run_args: Dict[str, Any],
     regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: Optional[pd.DataFrame] = None,
+    pos_coef_sum_scale: Optional[float] = None,
 ) -> xr.Dataset:
     """Run NUTS/MCMC on the DLT model and return an inference dataset (``idata``) as an ``xr.Dataset``.
+
+    A total scale constraint on the positive regressors (e.g. the spend channels of a marketing mix model) is
+    applied in the same fit with ``pos_coef_sum_scale``. The joint prior of the positive coefficients becomes
+
+    ``p(coef) ∝ prod_i TruncatedNormal(coef_i; loc_i, scale_i, low=0) * HalfNormal(sum_i coef_i; pos_coef_sum_scale)``
+
+    so the coefficients share one budget for their total size while each keeps its own scheme prior (e.g. a
+    lift-test calibrated ``loc_prior`` / ``scale_prior``). How the total splits across regressors is learned from
+    the data in the same fit, which replaces a two-stage fit that first fits with default priors and then refits
+    with ``scale_prior_i = total_scale * coef_i / sum(coef)``. Set each ``scale_prior`` wide enough not to bind
+    (e.g. the first-stage default) and let ``pos_coef_sum_scale`` shrink the sum. The ``loc_prior`` /
+    ``scale_prior`` reported by :func:`get_regression_summary` are the per-coefficient factors only, not the
+    joint prior.
 
     Args
     ----
@@ -200,6 +222,8 @@ def run_dlt_model(
         coefficient priors.
     covariates_df: Optional DataFrame of covariates, shape ``(n_steps, n_var)``.
         Required when ``regression_scheme`` is provided.
+    pos_coef_sum_scale: Optional scale (``> 0``) of a ``HalfNormal`` constraint on the sum of the
+        positive (``"+"``) coefficients. Default ``None`` leaves the model unchanged.
 
     Returns
     -------
@@ -207,6 +231,11 @@ def run_dlt_model(
         ``dlt_comp``, ``dlt_comp_p50``, ``yhat``, ``yhat_p50``, ``resid``,
         ``resid_p50``, ``reg_comp``, ``sigma``, ``last_lev``, ``last_slp``,
         and (if regression) ``coef``, ``coef_p50``, ``reg_comp_p50``.
+
+    Raises
+    ------
+    ValueError
+        If ``pos_coef_sum_scale`` is not positive, or is given without any ``"+"`` regressor.
     """
     if regression_scheme is not None and covariates_df is not None:
         # extract regressors matrix, coef loc and scale
@@ -237,11 +266,25 @@ def run_dlt_model(
         covariates = None
         reg_input = {}
 
+    if pos_coef_sum_scale is not None:
+        if not pos_coef_sum_scale > 0:
+            raise ValueError(f"pos_coef_sum_scale must be positive, got {pos_coef_sum_scale}")
+        if "+" not in reg_input:
+            raise ValueError("pos_coef_sum_scale needs at least one '+' regressor in regression_scheme")
+
     init_strategy = init_to_median(num_samples=10)
     kernel = NUTS(dlt_model, init_strategy=init_strategy)
     mcmc = MCMC(kernel, **mcmc_run_args)
 
-    mcmc.run(rng_key, lev_sm=lev_sm, slp_sm=slp_sm, theta=theta, y=y, reg_input=reg_input)
+    mcmc.run(
+        rng_key,
+        lev_sm=lev_sm,
+        slp_sm=slp_sm,
+        theta=theta,
+        y=y,
+        reg_input=reg_input,
+        pos_coef_sum_scale=pos_coef_sum_scale,
+    )
 
     posterior_dict = mcmc.get_samples(group_by_chain=True)
 
