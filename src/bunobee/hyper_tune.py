@@ -104,7 +104,14 @@ def compute_log_likelihood(yhat_span, sigma, y):
 
 
 def compute_wbic(loglk: jnp.ndarray) -> float:
-    """Compute Weighted Bayesian Information Criterion (WBIC) from log likelihood.
+    """Compute an approximate Widely applicable Bayesian Information Criterion (WBIC) from log likelihood.
+
+    WBIC is the expected negative log likelihood under the posterior tempered at ``beta = 1 / log(n)``.
+    The draws here come from the ordinary (untempered, ``beta = 1``) posterior, so the score is an
+    approximation of WBIC, good enough to rank hyper-param candidates; a true tempered WBIC is tracked in
+    https://github.com/edwinnglabs/bunobee/issues/135. It also averages rather than sums the log likelihood
+    over observations, so scores stay comparable across series lengths.
+
     Args
     ----
     loglk: array-like, log likelihood per samples per obs; should be with values of shape (n_samples, n_steps, h)
@@ -133,6 +140,8 @@ def run_dlt_model_and_compute_wbic(
     h: int = 12,
 ) -> float:
     """Fit the DLT model with the given hyper-params and return its WBIC over ``h``-step windows.
+
+    The score samples the ordinary posterior, so it is an approximation of WBIC (see ``compute_wbic``).
 
     Args
     ----
@@ -170,6 +179,57 @@ def run_dlt_model_and_compute_wbic(
     return wbic
 
 
+# name -> (low, high, prior); the order is the order of ``params`` in ``run_dlt_model_and_compute_wbic``
+DEFAULT_SEARCH_SPACE = {
+    "lev_sm": (0.0001, 0.1, "log-uniform"),
+    "slp_sm": (0.001, 0.1, "log-uniform"),
+    "theta": (0.0, 1.0, "uniform"),
+}
+SEARCH_SPACE_PRIORS = ("log-uniform", "uniform")
+
+
+def resolve_search_space(
+    search_space: Optional[Dict[str, Tuple]] = None,
+) -> Dict[str, Tuple[float, float, str]]:
+    """Merge a user search space into ``DEFAULT_SEARCH_SPACE``.
+
+    Args
+    ----
+    search_space: ``{name: (low, high)}`` or ``{name: (low, high, prior)}`` with ``prior`` in
+        ``SEARCH_SPACE_PRIORS``. A ``(low, high)`` entry keeps the parameter's default prior; a name left out
+        keeps its default range and prior. ``None`` returns the defaults.
+
+    Returns
+    -------
+    Dict of ``name -> (low, high, prior)`` for every DLT hyper-param, in ``DEFAULT_SEARCH_SPACE`` order.
+
+    Raises
+    ------
+    ValueError: On an unknown parameter name, an entry that is not a 2- or 3-tuple, or an unknown prior.
+    """
+    search_space = search_space or {}
+    unknown = sorted(set(search_space) - set(DEFAULT_SEARCH_SPACE))
+    if unknown:
+        raise ValueError(f"Unknown hyper-param(s) {unknown} in search_space; expected {list(DEFAULT_SEARCH_SPACE)}.")
+
+    resolved = {}
+    for name, (low, high, prior) in DEFAULT_SEARCH_SPACE.items():
+        if name in search_space:
+            spec = tuple(search_space[name])
+            if len(spec) == 2:
+                low, high = spec
+            elif len(spec) == 3:
+                low, high, prior = spec
+            else:
+                raise ValueError(
+                    f"search_space[{name!r}] must be (low, high) or (low, high, prior), got {search_space[name]!r}."
+                )
+            if prior not in SEARCH_SPACE_PRIORS:
+                raise ValueError(f"search_space[{name!r}] prior must be one of {SEARCH_SPACE_PRIORS}, got {prior!r}.")
+        resolved[name] = (low, high, prior)
+    return resolved
+
+
 def hyper_tuning_dlt_with_wbic(
     y: np.ndarray,
     regression_scheme: Optional[RegressionScheme] = None,
@@ -179,10 +239,15 @@ def hyper_tuning_dlt_with_wbic(
     h: int = 12,
     n_calls: int = 15,
     random_state: int = 42,
+    search_space: Optional[Dict[str, Tuple]] = None,
 ) -> Dict[str, Any]:
     """Tune the DLT hyper-params (``lev_sm``, ``slp_sm``, ``theta``) by minimizing WBIC with Bayesian optimization.
 
     Requires ``scikit-optimize`` (``pip install bunobee[tune]``).
+
+    The score samples the ordinary posterior rather than the posterior tempered at ``beta = 1 / log(n)``, so
+    it is an approximation of WBIC; it is used only to rank the candidates. A true tempered WBIC is tracked in
+    https://github.com/edwinnglabs/bunobee/issues/135.
 
     Args
     ----
@@ -193,11 +258,20 @@ def hyper_tuning_dlt_with_wbic(
     h: Forecast horizon of the sliding windows used to score each candidate.
     n_calls: Number of hyper-param candidates evaluated (``skopt`` requires at least 10).
     random_state: Seed for both the optimizer and the MCMC ``rng_key``.
+    search_space: Optional ``{name: (low, high)}`` or ``{name: (low, high, prior)}`` with ``prior``
+        ``"log-uniform"`` or ``"uniform"``. A name left out keeps its default from ``DEFAULT_SEARCH_SPACE``
+        (``lev_sm`` in [0.0001, 0.1] and ``slp_sm`` in [0.001, 0.1] log-uniform, ``theta`` in [0, 1] uniform),
+        as does a prior left out; ``None`` tunes over the defaults.
 
     Returns
     -------
     Dict with ``lev_sm``, ``slp_sm``, ``theta`` and ``result`` (the raw ``skopt`` result).
+
+    Raises
+    ------
+    ValueError: If ``search_space`` names an unknown hyper-param or has a malformed entry.
     """
+    resolved_space = resolve_search_space(search_space)
     logger.info(f"Starting hyperparameter tuning for DLT model using WBIC (h={h}, n_calls={n_calls})")
     try:
         from skopt import gp_minimize
@@ -212,11 +286,7 @@ def hyper_tuning_dlt_with_wbic(
     rng_key = jax.random.PRNGKey(random_state)
 
     # Define the hyperparam space
-    search_space = [
-        Real(0.0001, 0.1, prior="log-uniform", name="lev_sm"),
-        Real(0.001, 0.1, prior="log-uniform", name="slp_sm"),
-        Real(0, 1.0, prior="uniform", name="theta"),
-    ]
+    dimensions = [Real(low, high, prior=prior, name=name) for name, (low, high, prior) in resolved_space.items()]
 
     # Run Bayesian Optimization
     result = gp_minimize(
@@ -229,7 +299,7 @@ def hyper_tuning_dlt_with_wbic(
             covariates_df=covariates_df,
             h=h,
         ),
-        dimensions=search_space,
+        dimensions=dimensions,
         n_calls=n_calls,
         random_state=random_state,
     )

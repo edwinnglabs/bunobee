@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.0.6] - 2026-10-30
+
+Makes the DLT hyper-parameter tuner usable downstream (regressors, a configurable search space, a documented
+WBIC approximation), adds conditional DLT forecasts, pluggable target transforms and sigma priors for the M5
+MAP fitters, and `make_periodic_dummies`.
+
 ### Added
+
+- `search_space` argument on `hyper_tuning_dlt_with_wbic` — `{name: (low, high)}` or `{name: (low, high, prior)}`
+  with prior `"log-uniform"` or `"uniform"`. A name left out keeps its default range and prior, as does a prior
+  left out (`lev_sm` and `slp_sm` log-uniform, `theta` uniform); an unknown name raises `ValueError`. With no
+  search space the tuner searches the same space as before. The defaults are in `DEFAULT_SEARCH_SPACE`, and
+  `resolve_search_space` merges a search space into them.
 
 - `conditional_response` argument on DLT `make_inference` — actuals past the train end update the latent
   level and slope (NaN entries are forecast as usual); length and shape are validated.
@@ -42,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcmc_run_args` instead of a `data` dict, so models with regressors can be tuned. It returns a dict of
   the tuned `lev_sm`, `slp_sm` and `theta`, with the raw `skopt` result under `result`, and logs through
   the `bunobee` logger instead of printing.
+- `hyper_tune` and the README document that the tuner's score samples the ordinary posterior, not the
+  posterior tempered at `beta = 1 / log(n)`, so it is an approximation of WBIC used to rank candidates. A true
+  tempered WBIC is tracked in [#135](https://github.com/edwinnglabs/bunobee/issues/135).
 
 ### Deprecated
 
@@ -162,6 +177,7 @@ consolidates the state-space (SSP) engine work that landed across them.
 
 - Unused `setuptools-scm` from build requirements.
 
-[Unreleased]: https://github.com/edwinnglabs/bunobee/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/edwinnglabs/bunobee/compare/v0.0.6...HEAD
+[v0.0.6]: https://github.com/edwinnglabs/bunobee/compare/v0.0.5...v0.0.6
 [v0.0.5]: https://github.com/edwinnglabs/bunobee/compare/v0.0.4...v0.0.5
 [v0.0.4]: https://github.com/edwinnglabs/bunobee/releases/tag/v0.0.4

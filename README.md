@@ -60,6 +60,25 @@ result = make_inference(rng_key, idata, lev_sm=0.5, slp_sm=0.5, theta=0.8, end_s
 print(result["forecast_samples"].shape)  # (n_samples, 30)
 ```
 
+### DLT hyper-parameter tuning
+
+`hyper_tuning_dlt_with_wbic` picks `lev_sm`, `slp_sm` and `theta` by Bayesian optimization (`pip install bunobee[tune]`).
+Pass `search_space` as `{name: (low, high)}` or `{name: (low, high, prior)}` with prior `"log-uniform"` or
+`"uniform"`; a name left out keeps its default (`lev_sm` in [0.0001, 0.1] and `slp_sm` in [0.001, 0.1]
+log-uniform, `theta` in [0, 1] uniform), and an unknown name raises `ValueError`:
+
+```python
+from bunobee.hyper_tune import hyper_tuning_dlt_with_wbic
+
+tuned = hyper_tuning_dlt_with_wbic(y, h=4, n_calls=15, search_space={"theta": (0.5, 1.0), "lev_sm": (0.01, 0.5)})
+print(tuned["lev_sm"], tuned["slp_sm"], tuned["theta"])
+```
+
+The score is an **approximation** of WBIC: it samples the ordinary posterior, not the posterior tempered at
+`beta = 1 / log(n)` that WBIC is defined on, and averages the log likelihood over observations. It is good
+enough to rank candidates; a true tempered WBIC is tracked in
+[#135](https://github.com/edwinnglabs/bunobee/issues/135).
+
 ### SSP forecast
 
 Fit a multi-series state space model with the extended Kalman filter, then push it past the end of the sample with `forecast_ssp`. The forecast is a posterior replay: it launches from the last filtered state and walks a driftless random walk forward, one process-noise draw per step and per posterior sample, so the predictive interval widens with the horizon:
