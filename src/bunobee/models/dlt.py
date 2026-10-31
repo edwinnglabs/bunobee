@@ -18,6 +18,8 @@ from ..regression import RegressionScheme
 
 logger = logging.getLogger("bunobee")
 
+NOISE_DISTS = ("normal", "student_t")
+
 
 def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: float):
     """Single transition step for the Damped Local Trend (DLT) model, compatible with `lax.scan`.
@@ -81,12 +83,16 @@ def dlt_model(
     y: jnp.ndarray,
     reg_input: Optional[Dict[str, Any]] = None,
     pos_coef_sum_scale: Optional[float] = None,
+    noise_dist: str = "normal",
+    min_nu: float = 5.0,
+    max_nu: float = 40.0,
 ):
     """NumPyro probabilistic model for Damped Local Trend (DLT) time series.
 
     Samples ``sigma`` from a ``HalfNormal`` prior, optionally adds a regression
     component (neutral / negative-constrained / positive-constrained coefficients),
-    runs the DLT recursion via ``lax.scan``, and registers a Normal likelihood.
+    runs the DLT recursion via ``lax.scan``, and registers a Normal likelihood, or a
+    Student-t likelihood with ``noise_dist="student_t"``.
 
     Deterministic sites registered: ``yhat``, ``dlt_comp``, ``reg_comp``,
     ``last_lev``, ``last_slp``, and ``coef`` (when regression is used).
@@ -104,9 +110,16 @@ def dlt_model(
         positive (``"+"``) coefficients, added as a ``pos_coef_sum`` factor on top of
         their own priors. Requires ``"+"`` regressors in ``reg_input``. See
         :func:`run_dlt_model`.
+    noise_dist: Observation noise distribution, ``"normal"`` (default) or ``"student_t"``.
+        With ``"student_t"`` the degrees of freedom ``nu`` are sampled from
+        ``Uniform(min_nu, max_nu)`` and the likelihood is ``StudentT(nu, yhat, sigma)``.
+    min_nu: Lower bound of the ``nu`` prior; used only with ``"student_t"``.
+    max_nu: Upper bound of the ``nu`` prior; used only with ``"student_t"``.
     """
     y = jnp.asarray(y, dtype=y.dtype)
     sigma = numpyro.sample("sigma", dist.HalfNormal(5.0))
+    if noise_dist == "student_t":
+        nu = numpyro.sample("nu", dist.Uniform(min_nu, max_nu))
 
     if reg_input is not None:
         coefs = []
@@ -180,7 +193,11 @@ def dlt_model(
     numpyro.deterministic("last_slp", last_slp)
 
     # likelihood
-    numpyro.sample("observations", dist.Normal(loc=yhat, scale=sigma), obs=y, obs_mask=jnp.isfinite(y))
+    if noise_dist == "student_t":
+        noise = dist.StudentT(df=nu, loc=yhat, scale=sigma)
+    else:
+        noise = dist.Normal(loc=yhat, scale=sigma)
+    numpyro.sample("observations", noise, obs=y, obs_mask=jnp.isfinite(y))
 
 
 def run_dlt_model(
@@ -193,8 +210,16 @@ def run_dlt_model(
     regression_scheme: Optional[RegressionScheme] = None,
     covariates_df: Optional[pd.DataFrame] = None,
     pos_coef_sum_scale: Optional[float] = None,
+    noise_dist: str = "normal",
+    min_nu: float = 5.0,
+    max_nu: float = 40.0,
 ) -> xr.Dataset:
     """Run NUTS/MCMC on the DLT model and return an inference dataset (``idata``) as an ``xr.Dataset``.
+
+    ``noise_dist="student_t"`` swaps the Normal likelihood for a Student-t one, a heavier-tailed backup when
+    outliers pull the Normal fit around (as in Orbit's DLT). Its degrees of freedom ``nu`` get a
+    ``Uniform(min_nu, max_nu)`` prior and are sampled with the rest of the model; the posterior ``nu`` is kept in
+    the returned dataset and :func:`make_inference` then draws Student-t forecast noise.
 
     A total scale constraint on the positive regressors (e.g. the spend channels of a marketing mix model) is
     applied in the same fit with ``pos_coef_sum_scale``. The joint prior of the positive coefficients becomes
@@ -224,19 +249,30 @@ def run_dlt_model(
         Required when ``regression_scheme`` is provided.
     pos_coef_sum_scale: Optional scale (``> 0``) of a ``HalfNormal`` constraint on the sum of the
         positive (``"+"``) coefficients. Default ``None`` leaves the model unchanged.
+    noise_dist: Observation noise distribution, ``"normal"`` (default) or ``"student_t"``.
+    min_nu: Lower bound (``> 0``) of the uniform prior on the Student-t degrees of freedom ``nu``. Default 5.
+        Used only with ``"student_t"``.
+    max_nu: Upper bound (``> min_nu``) of the uniform prior on ``nu``. Default 40. Used only with ``"student_t"``.
 
     Returns
     -------
     xr.Dataset with dimensions ``(chain, draw, time)`` containing:
         ``dlt_comp``, ``dlt_comp_p50``, ``yhat``, ``yhat_p50``, ``resid``,
         ``resid_p50``, ``reg_comp``, ``sigma``, ``last_lev``, ``last_slp``,
-        and (if regression) ``coef``, ``coef_p50``, ``reg_comp_p50``.
+        (if regression) ``coef``, ``coef_p50``, ``reg_comp_p50``, and
+        (if ``noise_dist="student_t"``) ``nu``.
 
     Raises
     ------
     ValueError
-        If ``pos_coef_sum_scale`` is not positive, or is given without any ``"+"`` regressor.
+        If ``pos_coef_sum_scale`` is not positive, or is given without any ``"+"`` regressor; if ``noise_dist`` is
+        not one of ``"normal"`` / ``"student_t"``; or if ``noise_dist="student_t"`` and not ``0 < min_nu < max_nu``.
     """
+    if noise_dist not in NOISE_DISTS:
+        raise ValueError(f"noise_dist must be one of {NOISE_DISTS}, got {noise_dist!r}")
+    if noise_dist == "student_t" and not 0 < min_nu < max_nu:
+        raise ValueError(f"need 0 < min_nu < max_nu, got min_nu={min_nu}, max_nu={max_nu}")
+
     if regression_scheme is not None and covariates_df is not None:
         # extract regressors matrix, coef loc and scale
         # separate three groups of regressors with the sign: "=", "+", "-"
@@ -284,6 +320,9 @@ def run_dlt_model(
         y=y,
         reg_input=reg_input,
         pos_coef_sum_scale=pos_coef_sum_scale,
+        noise_dist=noise_dist,
+        min_nu=min_nu,
+        max_nu=max_nu,
     )
 
     posterior_dict = mcmc.get_samples(group_by_chain=True)
@@ -304,6 +343,8 @@ def run_dlt_model(
         "last_lev": (["chain", "draw"], posterior_dict["last_lev"]),
         "last_slp": (["chain", "draw"], posterior_dict["last_slp"]),
     }
+    if noise_dist == "student_t":
+        data_vars["nu"] = (["chain", "draw"], posterior_dict["nu"])
     coords = {
         "draw": np.arange(n_draws),
         "chain": np.arange(n_chains),
@@ -546,18 +587,27 @@ def generate_noise_components(
     ----
     rng_key: JAX random key.
     idata: ``xr.Dataset`` returned by ``run_dlt_model``, must contain
-        ``sigma`` with dimensions ``(chain, draw)``.
+        ``sigma`` with dimensions ``(chain, draw)``, and ``nu`` when fitted
+        with ``noise_dist="student_t"``.
     steps: Number of time steps to generate noise for.
 
     Returns
     -------
     jnp.ndarray of shape ``(n_samples, steps)`` where each row is an
-    independent draw from ``Normal(0, sigma_i)`` for posterior sample ``i``.
+    independent draw from ``Normal(0, sigma_i)`` for posterior sample ``i``,
+    or from ``StudentT(nu_i, 0, sigma_i)`` when ``idata`` holds ``nu``.
     """
     # (n_samples, )
     sigma = flatten_front_dim(idata["sigma"].to_numpy(), n=2)
+    shape = (sigma.shape[0], steps)
+    if "nu" in idata:
+        # (n_samples, 1) degrees of freedom, broadcast over steps
+        nu = flatten_front_dim(idata["nu"].to_numpy(), n=2)[:, None]
+        std_samples = jax.random.t(rng_key, df=nu, shape=shape)
+    else:
+        std_samples = jax.random.normal(rng_key, shape=shape)
     # samples with broadcasting sigma from (n_samples, ) to (n_samples, steps)
-    eps_samples = jax.random.normal(rng_key, shape=(sigma.shape[0], steps)) * sigma[:, None]
+    eps_samples = std_samples * sigma[:, None]
     return eps_samples
 
 
@@ -595,7 +645,8 @@ def make_inference(
         Column names must match the ``var_name`` coordinate in ``idata``.
     transform_callback: Optional callable applied element-wise to ``forecast_samples``
         (e.g. to reverse a log transform).
-    noise_embed: If ``True``, adds a draw from ``Normal(0, sigma)`` to
+    noise_embed: If ``True``, adds a draw from ``Normal(0, sigma)`` (``StudentT(nu, 0, sigma)``
+        when fitted with ``noise_dist="student_t"``, see :func:`generate_noise_components`) to
         ``forecast_samples`` to represent observation-level uncertainty.  The
         noise is sampled independently from the noise already used inside
         ``generate_dlt_components`` for stochastic state evolution.
