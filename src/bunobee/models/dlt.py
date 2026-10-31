@@ -307,6 +307,94 @@ def run_dlt_model(
     return idata
 
 
+def get_coef_sign_fraction(idata: xr.Dataset) -> pd.DataFrame:
+    """Fraction of posterior coefficient samples above and below zero, per regressor.
+
+    Parameters
+    ----------
+    idata : xr.Dataset
+        Inference dataset from :func:`run_dlt_model` fitted with a regression scheme, i.e. holding ``coef``
+        with dimensions ``(chain, draw, var_name)``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by ``regressor`` (in ``var_name`` order) with columns ``frac_pos`` (fraction of samples ``> 0``)
+        and ``frac_neg`` (fraction ``< 0``). Samples exactly at zero count toward neither, so the two may sum
+        to less than one.
+
+    Raises
+    ------
+    ValueError
+        If ``idata`` has no ``coef`` variable (the model was fitted without regressors).
+    """
+    if "coef" not in idata:
+        raise ValueError("idata has no 'coef' variable; fit run_dlt_model with a regression scheme")
+    # (n_samples, n_var)
+    coef = flatten_front_dim(idata["coef"].to_numpy(), n=2)
+    return pd.DataFrame(
+        {
+            "frac_pos": np.mean(coef > 0, axis=0),
+            "frac_neg": np.mean(coef < 0, axis=0),
+        },
+        index=pd.Index(idata["var_name"].to_numpy(), name="regressor"),
+    )
+
+
+def get_regression_summary(
+    idata: xr.Dataset,
+    regression_scheme: Optional[RegressionScheme] = None,
+    lower: float = 0.05,
+    upper: float = 0.95,
+) -> pd.DataFrame:
+    """Summarise posterior regression coefficients, one row per regressor.
+
+    Parameters
+    ----------
+    idata : xr.Dataset
+        Inference dataset from :func:`run_dlt_model` fitted with a regression scheme.
+    regression_scheme : RegressionScheme, optional
+        The scheme used for the fit. When given, its ``sign``, ``loc_prior`` and ``scale_prior`` columns are
+        joined onto the summary by regressor.
+    lower, upper : float
+        Quantiles in ``[0, 1]`` for the credible interval. Default 0.05 and 0.95.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by ``regressor`` (in ``var_name`` order) with columns ``coef_p50``, ``coef_p<lower>``,
+        ``coef_p<upper>`` (quantile as a percentage, e.g. ``coef_p05`` and ``coef_p95``), ``frac_pos`` and
+        ``frac_neg`` (see :func:`get_coef_sign_fraction`), then ``sign``, ``loc_prior`` and ``scale_prior``
+        when ``regression_scheme`` is given.
+
+    Raises
+    ------
+    ValueError
+        If ``idata`` has no ``coef`` variable, or ``lower`` / ``upper`` are not ordered quantiles in ``[0, 1]``.
+    """
+    if not 0.0 <= lower < upper <= 1.0:
+        raise ValueError(f"need 0 <= lower < upper <= 1, got lower={lower}, upper={upper}")
+    sign_fraction = get_coef_sign_fraction(idata)
+    # (n_samples, n_var)
+    coef = flatten_front_dim(idata["coef"].to_numpy(), n=2)
+    quantiles = np.quantile(coef, [0.5, lower, upper], axis=0)
+    summary = pd.DataFrame(
+        {
+            "coef_p50": quantiles[0],
+            f"coef_p{lower * 100:02g}": quantiles[1],
+            f"coef_p{upper * 100:02g}": quantiles[2],
+        },
+        index=sign_fraction.index,
+    ).join(sign_fraction)
+    if regression_scheme is not None:
+        # priors are object dtype when the scheme was built from an empty frame
+        scheme = regression_scheme.get_scheme()[["sign", "loc_prior", "scale_prior"]].astype(
+            {"loc_prior": float, "scale_prior": float}
+        )
+        summary = summary.join(scheme)
+    return summary
+
+
 def generate_dlt_components(
     rng_key: jnp.ndarray,
     idata: xr.Dataset,

@@ -12,9 +12,12 @@ from bunobee.models.dlt import (
     dlt_transition_step,
     generate_dlt_components,
     generate_noise_components,
+    get_coef_sign_fraction,
+    get_regression_summary,
     make_inference,
     run_dlt_model,
 )
+from bunobee.regression import RegressionScheme
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -328,3 +331,71 @@ class TestConditionalResponse:
             make_inference(
                 RNG, self._idata(), LEV_SM, SLP_SM, THETA, end_step=N_TRAIN, conditional_response=np.zeros(N_TRAIN)
             )
+
+
+class TestRegressionSummary:
+    """#83: coefficient sign fraction and regression summary dataframe."""
+
+    def _idata(self):
+        # x1 all positive, x2 three negative / one zero, x3 split 2 positive / 2 negative
+        coef = np.array([[[1.0, -1.0, 2.0], [2.0, -2.0, 1.0], [3.0, -3.0, -1.0], [4.0, 0.0, -2.0]]])
+        return xr.Dataset(
+            {"coef": (["chain", "draw", "var_name"], coef)},
+            coords={"var_name": ["x1", "x2", "x3"]},
+        )
+
+    def test_sign_fraction(self):
+        out = get_coef_sign_fraction(self._idata())
+        assert out.index.name == "regressor"
+        assert out.index.tolist() == ["x1", "x2", "x3"]
+        np.testing.assert_allclose(out["frac_pos"], [1.0, 0.0, 0.5])
+        np.testing.assert_allclose(out["frac_neg"], [0.0, 0.75, 0.5])
+
+    def test_sign_fraction_pools_chains(self):
+        idata = xr.Dataset(
+            {"coef": (["chain", "draw", "var_name"], np.array([[[1.0], [1.0]], [[-1.0], [1.0]]]))},
+            coords={"var_name": ["x"]},
+        )
+        out = get_coef_sign_fraction(idata)
+        assert out.loc["x", "frac_pos"] == 0.75
+        assert out.loc["x", "frac_neg"] == 0.25
+
+    def test_no_coef_raises(self, trained_posteriors):
+        with pytest.raises(ValueError, match="no 'coef'"):
+            get_coef_sign_fraction(trained_posteriors)
+        with pytest.raises(ValueError, match="no 'coef'"):
+            get_regression_summary(trained_posteriors)
+
+    def test_summary_quantiles(self):
+        idata = self._idata()
+        out = get_regression_summary(idata)
+        coef = idata["coef"].to_numpy()[0]
+        assert out.columns.tolist() == ["coef_p50", "coef_p05", "coef_p95", "frac_pos", "frac_neg"]
+        np.testing.assert_allclose(out["coef_p50"], np.median(coef, axis=0))
+        np.testing.assert_allclose(out["coef_p05"], np.quantile(coef, 0.05, axis=0))
+        np.testing.assert_allclose(out["coef_p95"], np.quantile(coef, 0.95, axis=0))
+
+    def test_summary_custom_interval(self):
+        out = get_regression_summary(self._idata(), lower=0.025, upper=0.975)
+        assert {"coef_p2.5", "coef_p97.5"}.issubset(out.columns)
+
+    @pytest.mark.parametrize("lower, upper", [(0.9, 0.1), (-0.1, 0.9), (0.1, 1.1)])
+    def test_summary_bad_interval_raises(self, lower, upper):
+        with pytest.raises(ValueError, match="lower < upper"):
+            get_regression_summary(self._idata(), lower=lower, upper=upper)
+
+    def test_summary_with_fitted_scheme(self, synthetic_y):
+        rng = np.random.default_rng(0)
+        cov = pd.DataFrame({"neu": rng.normal(size=N_TRAIN), "pos": rng.normal(size=N_TRAIN)})
+        scheme = RegressionScheme()
+        scheme.add_regressors(["neu", "pos"], coef_sign=["=", "+"], loc_prior=0.0, scale_prior=[1.0, 0.5])
+        idata = run_dlt_model(
+            RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, regression_scheme=scheme, covariates_df=cov
+        )
+        out = get_regression_summary(idata, regression_scheme=scheme)
+        assert out.index.tolist() == ["neu", "pos"]
+        assert out.loc["pos", "frac_pos"] == 1.0  # truncated at zero
+        assert out.loc["pos", "frac_neg"] == 0.0
+        assert out["sign"].tolist() == ["=", "+"]
+        np.testing.assert_allclose(out["scale_prior"], [1.0, 0.5])
+        np.testing.assert_allclose(out["coef_p50"], idata["coef_p50"].to_numpy())
