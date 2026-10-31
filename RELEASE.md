@@ -43,8 +43,8 @@ This gives a natural test-before-promote flow for a final version, e.g. `0.0.5`:
    GitHub release, using the matching `## [vX.Y.Z]` section of `CHANGELOG.md` as the notes
    (falling back to GitHub's generated notes if that section is missing). It no-ops if the
    release already exists. Keep the changelog section written before you bump the version.
-6. Once the GitHub release exists, bump `main` to the next dev version (see
-   [After a release](#after-a-release)).
+6. **Required:** once the GitHub release exists, bump `main` to the next dev version (see
+   [After a release](#after-a-release)). Do not leave `main` at the final version.
 
 ## Idempotency
 
@@ -69,3 +69,18 @@ the `pypi` job and leaves a "Waiting" run that needs approval or cancelling. To 
 `pyproject.toml` to the next dev version as soon as the GitHub release for `vX.Y.Z` exists:
 `X.Y.(Z+1).dev0` (for example `0.0.5` -> `0.0.6.dev0`). Pushes then publish to Test PyPI only,
 unattended, until the next final version is bumped in.
+
+### Why this step is not optional
+
+PyPI never accepts the same version twice, so which commit gets published is decided by whichever
+`pypi` run you approve first. After `0.0.6` was released `main` stayed at `0.0.6`, so every merged PR
+(#134, #137, #138, #139, #140) queued another "Waiting" `pypi` run. The run for the release commit
+`b2f9216` was never approved; the run for a later commit `ad0b994` was, so PyPI `0.0.6` and the `v0.0.6`
+tag point at `ad0b994`, not the release commit. Later approvals were no-ops (`skip-existing`).
+
+Checklist when releasing `X.Y.Z`:
+
+1. Merge the release PR (version `X.Y.Z`, changelog section `## [vX.Y.Z]`) and approve only that run.
+2. Wait for `github-release` to succeed.
+3. Immediately merge a `chore: bump main to X.Y.(Z+1).dev0` PR, and cancel any other "Waiting" `pypi` runs.
+4. Use the canonical PEP 440 spelling `X.Y.Z.devN` (with the dot).

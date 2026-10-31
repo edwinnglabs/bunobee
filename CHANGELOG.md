@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Note:** the `0.0.6` build on PyPI (and the `v0.0.6` tag) was cut from commit `ad0b994`, not the release
+> commit `b2f9216`, because `main` was not bumped to a dev version after the release. It therefore already
+> includes the `get_coef_sign_fraction`, `get_regression_summary` and `get_forecast_decomposition` additions below.
+
 ### Added
 
 - `get_coef_sign_fraction` in `bunobee.models.dlt` — per-regressor fraction of posterior coefficient samples
