@@ -60,6 +60,17 @@ result = make_inference(rng_key, idata, lev_sm=0.5, slp_sm=0.5, theta=0.8, end_s
 print(result["forecast_samples"].shape)  # (n_samples, 30)
 ```
 
+`get_forecast_decomposition` breaks the forecast into components for diagnostics: a DataFrame indexed by `time`
+with `<component>_p50`, `_p05` and `_p95` columns for `trend`, each regressor, `regression` and `yhat`. Pass
+`groups` to sum regressors into one component, e.g. `groups={"seasonality": ["dow_1", "dow_2"]}`:
+
+```python
+from bunobee.models.dlt import get_forecast_decomposition
+
+decomp = get_forecast_decomposition(result)
+print(decomp[["trend_p50", "yhat_p50"]].tail())
+```
+
 ### DLT hyper-parameter tuning
 
 `hyper_tuning_dlt_with_wbic` picks `lev_sm`, `slp_sm` and `theta` by Bayesian optimization (`pip install bunobee[tune]`).

@@ -11,7 +11,7 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_median
 import xarray as xr
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
@@ -661,3 +661,85 @@ def make_inference(
     result = xr.Dataset(data_vars=data_vars, coords=coords)
 
     return result
+
+
+def get_forecast_decomposition(
+    inference: xr.Dataset,
+    groups: Optional[Dict[str, List[str]]] = None,
+    lower: float = 0.05,
+    upper: float = 0.95,
+) -> pd.DataFrame:
+    """Decompose a DLT forecast into trend and regression components, summarised per time step.
+
+    Components are additive in model space, so per posterior sample ``yhat = trend + regression`` and
+    ``regression`` is the sum of the regressor components. Quantiles are taken per component over samples, so the
+    component medians need not add up to the ``yhat`` median.
+
+    Parameters
+    ----------
+    inference : xr.Dataset
+        Output of :func:`make_inference`, holding ``dlt_comp_samples`` and, when fitted with regressors,
+        ``reg_comp_samples`` with dimensions ``(sample, time, var_name)``. Use ``end_step`` equal to the train length
+        for an in-sample decomposition.
+    groups : dict of str to list of str, optional
+        Named groups of regressors summed into one component, e.g. ``{"seasonality": ["dow_1", ..., "dow_6"]}``.
+        Regressors left out of every group are reported on their own.
+    lower, upper : float
+        Quantiles in ``[0, 1]`` for the credible interval. Default 0.05 and 0.95.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by ``time`` with columns ``<component>_p50``, ``<component>_p<lower>`` and ``<component>_p<upper>``
+        (quantile as a percentage, e.g. ``trend_p05``) for the components ``trend``, then each regressor or group in
+        ``var_name`` order of its first regressor, then ``regression``, then ``yhat``. Without regressors only
+        ``trend`` and ``yhat`` are reported. ``yhat`` excludes observation noise and any ``transform_callback``, so
+        it equals ``forecast_samples`` only when :func:`make_inference` ran with neither.
+
+    Raises
+    ------
+    ValueError
+        If ``lower`` / ``upper`` are not ordered quantiles in ``[0, 1]``, ``groups`` is given without regression
+        components, a group names an unknown regressor or shares a regressor with another group, or a component name
+        clashes with an ungrouped regressor or a reserved name (``trend``, ``regression``, ``yhat``).
+    """
+    if not 0.0 <= lower < upper <= 1.0:
+        raise ValueError(f"need 0 <= lower < upper <= 1, got lower={lower}, upper={upper}")
+    groups = groups or {}
+    reserved = {"trend", "regression", "yhat"}
+    # (n_samples, n_steps)
+    trend = np.asarray(inference["dlt_comp_samples"])
+    components = {"trend": trend}
+    if "reg_comp_samples" in inference:
+        var_names = [str(v) for v in inference["var_name"].values]
+        grouped = [v for members in groups.values() for v in members]
+        unknown = sorted(set(grouped) - set(var_names))
+        if unknown:
+            raise ValueError(f"groups name unknown regressors: {unknown}")
+        shared = sorted({v for v in grouped if grouped.count(v) > 1})
+        if shared:
+            raise ValueError(f"regressors in more than one group: {shared}")
+        ungrouped = set(var_names) - set(grouped)
+        clashes = sorted(((set(groups) | ungrouped) & reserved) | (set(groups) & ungrouped))
+        if clashes:
+            raise ValueError(f"component names clash with an ungrouped regressor or a reserved name: {clashes}")
+        component_of = {v: name for name, members in groups.items() for v in members}
+        # (n_samples, n_steps, n_var)
+        reg_comp = np.asarray(inference["reg_comp_samples"])
+        for name in dict.fromkeys(component_of.get(v, v) for v in var_names):
+            idx = [i for i, v in enumerate(var_names) if component_of.get(v, v) == name]
+            components[name] = reg_comp[..., idx].sum(axis=-1)
+        components["regression"] = reg_comp.sum(axis=-1)
+        components["yhat"] = trend + components["regression"]
+    else:
+        if groups:
+            raise ValueError("groups given but inference has no 'reg_comp_samples'; fit with a regression scheme")
+        components["yhat"] = trend
+
+    columns = {}
+    for name, samples in components.items():
+        quantiles = np.quantile(samples, [0.5, lower, upper], axis=0)
+        columns[f"{name}_p50"] = quantiles[0]
+        columns[f"{name}_p{lower * 100:02g}"] = quantiles[1]
+        columns[f"{name}_p{upper * 100:02g}"] = quantiles[2]
+    return pd.DataFrame(columns, index=pd.Index(inference["time"].to_numpy(), name="time"))

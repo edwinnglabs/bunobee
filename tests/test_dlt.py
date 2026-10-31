@@ -13,6 +13,7 @@ from bunobee.models.dlt import (
     generate_dlt_components,
     generate_noise_components,
     get_coef_sign_fraction,
+    get_forecast_decomposition,
     get_regression_summary,
     make_inference,
     run_dlt_model,
@@ -399,3 +400,89 @@ class TestRegressionSummary:
         assert out["sign"].tolist() == ["=", "+"]
         np.testing.assert_allclose(out["scale_prior"], [1.0, 0.5])
         np.testing.assert_allclose(out["coef_p50"], idata["coef_p50"].to_numpy())
+
+
+class TestForecastDecomposition:
+    """#80: forecast decomposed into trend and regression components."""
+
+    N_SAMPLES = 40
+    H = 4
+
+    def _inference(self):
+        """make_inference output with regressors: two weekday dummies and a price covariate."""
+        rng = np.random.default_rng(1)
+        n_total = N_TRAIN + self.H
+        idata = xr.Dataset(
+            {
+                "dlt_comp": (
+                    ["chain", "draw", "time"],
+                    np.tile(np.linspace(10.0, 12.0, N_TRAIN), (1, self.N_SAMPLES, 1)),
+                ),
+                "sigma": (["chain", "draw"], np.full((1, self.N_SAMPLES), 0.5)),
+                "last_lev": (["chain", "draw"], np.full((1, self.N_SAMPLES), 12.0)),
+                "last_slp": (["chain", "draw"], np.full((1, self.N_SAMPLES), 0.1)),
+                "coef": (["chain", "draw", "var_name"], rng.normal([1.0, -1.0, 0.5], 0.1, size=(1, self.N_SAMPLES, 3))),
+            },
+            coords={"var_name": ["dow_1", "price", "dow_2"]},
+        )
+        cov = pd.DataFrame(
+            {
+                "dow_1": np.arange(n_total) % 2 == 0,
+                "price": rng.normal(size=n_total),
+                "dow_2": np.arange(n_total) % 2 == 1,
+            }
+        ).astype(float)
+        return make_inference(RNG, idata, LEV_SM, SLP_SM, THETA, covariates_df=cov)
+
+    def test_components_without_groups(self):
+        inference = self._inference()
+        out = get_forecast_decomposition(inference)
+        components = [c[: -len("_p50")] for c in out.columns if c.endswith("_p50")]
+        assert components == ["trend", "dow_1", "price", "dow_2", "regression", "yhat"]
+        assert out.index.name == "time"
+        assert len(out) == N_TRAIN + self.H
+        trend = inference["dlt_comp_samples"].to_numpy()
+        reg = inference["reg_comp_samples"].to_numpy()
+        np.testing.assert_allclose(out["trend_p50"], np.median(trend, axis=0))
+        np.testing.assert_allclose(out["price_p05"], np.quantile(reg[..., 1], 0.05, axis=0))
+        np.testing.assert_allclose(out["regression_p95"], np.quantile(reg.sum(axis=-1), 0.95, axis=0))
+        # yhat is summarised per sample, and matches forecast_samples without noise or transform
+        np.testing.assert_allclose(out["yhat_p50"], np.median(inference["forecast_samples"].to_numpy(), axis=0))
+
+    def test_groups_sum_regressors(self):
+        inference = self._inference()
+        out = get_forecast_decomposition(inference, groups={"seasonality": ["dow_1", "dow_2"]})
+        components = [c[: -len("_p50")] for c in out.columns if c.endswith("_p50")]
+        assert components == ["trend", "seasonality", "price", "regression", "yhat"]
+        reg = inference["reg_comp_samples"].to_numpy()
+        np.testing.assert_allclose(out["seasonality_p50"], np.median(reg[..., [0, 2]].sum(axis=-1), axis=0))
+
+    def test_without_regression(self, trained_posteriors):
+        inference = make_inference(RNG, trained_posteriors, LEV_SM, SLP_SM, THETA, end_step=N_TRAIN + self.H)
+        out = get_forecast_decomposition(inference, lower=0.1, upper=0.9)
+        assert out.columns.tolist() == ["trend_p50", "trend_p10", "trend_p90", "yhat_p50", "yhat_p10", "yhat_p90"]
+        np.testing.assert_allclose(out["yhat_p50"], out["trend_p50"])
+        assert (out["trend_p10"] <= out["trend_p90"]).all()
+
+    @pytest.mark.parametrize(
+        "groups, match",
+        [
+            ({"seasonality": ["dow_1", "dow_9"]}, "unknown regressors"),
+            ({"a": ["dow_1"], "b": ["dow_1", "dow_2"]}, "more than one group"),
+            ({"price": ["dow_1", "dow_2"]}, "clash"),
+            ({"trend": ["dow_1"]}, "clash"),
+        ],
+        ids=["unknown", "shared", "clash_regressor", "clash_reserved"],
+    )
+    def test_bad_groups_raise(self, groups, match):
+        with pytest.raises(ValueError, match=match):
+            get_forecast_decomposition(self._inference(), groups=groups)
+
+    def test_groups_without_regression_raises(self, trained_posteriors):
+        inference = make_inference(RNG, trained_posteriors, LEV_SM, SLP_SM, THETA, end_step=N_TRAIN)
+        with pytest.raises(ValueError, match="no 'reg_comp_samples'"):
+            get_forecast_decomposition(inference, groups={"seasonality": ["x"]})
+
+    def test_bad_interval_raises(self):
+        with pytest.raises(ValueError, match="lower < upper"):
+            get_forecast_decomposition(self._inference(), lower=0.9, upper=0.1)
