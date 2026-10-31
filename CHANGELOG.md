@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `get_coef_sign_fraction` in `bunobee.models.dlt` — per-regressor fraction of posterior coefficient samples
+  above (`frac_pos`) and below (`frac_neg`) zero, pooled over chains.
+- `get_regression_summary` in `bunobee.models.dlt` — one row per regressor with `coef_p50`, a credible interval
+  (`lower` / `upper`, default `coef_p05` / `coef_p95`), the sign fractions and, given the `RegressionScheme`,
+  its `sign`, `loc_prior` and `scale_prior`.
+
 ## [v0.0.6] - 2026-10-30
 
 Makes the DLT hyper-parameter tuner usable downstream (regressors, a configurable search space, a documented
