@@ -71,6 +71,18 @@ decomp = get_forecast_decomposition(result)
 print(decomp[["trend_p50", "yhat_p50"]].tail())
 ```
 
+`pos_coef_sum_scale` puts a total scale constraint on the positive (`"+"`) regressors, e.g. the spend channels of a
+marketing mix model, in a single fit. A `HalfNormal(pos_coef_sum_scale)` factor on the sum of their coefficients is
+added on top of each coefficient's own scheme prior, so the total is shrunk while the split across regressors is
+learned from the data, which removes the need for a first fit to weight each channel's prior:
+
+```python
+idata = run_dlt_model(
+    rng_key, lev_sm=0.5, slp_sm=0.5, theta=0.8, y=y, mcmc_run_args=mcmc_args,
+    regression_scheme=scheme, covariates_df=covariates_df, pos_coef_sum_scale=0.3,
+)
+```
+
 ### DLT hyper-parameter tuning
 
 `hyper_tuning_dlt_with_wbic` picks `lev_sm`, `slp_sm` and `theta` by Bayesian optimization (`pip install bunobee[tune]`).

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import numpyro
 import pandas as pd
 import pytest
 import xarray as xr
@@ -9,6 +10,7 @@ from jax import lax
 jax.config.update("jax_enable_x64", True)
 
 from bunobee.models.dlt import (
+    dlt_model,
     dlt_transition_step,
     generate_dlt_components,
     generate_noise_components,
@@ -486,3 +488,73 @@ class TestForecastDecomposition:
     def test_bad_interval_raises(self):
         with pytest.raises(ValueError, match="lower < upper"):
             get_forecast_decomposition(self._inference(), lower=0.9, upper=0.1)
+
+
+class TestPosCoefSumScale:
+    """#81: total scale constraint on the positive coefficients, applied in a single fit."""
+
+    @pytest.fixture(scope="class")
+    @staticmethod
+    def regression_data():
+        """Two positive spend regressors (true coef 0.5 each) and one neutral control."""
+        rng = np.random.default_rng(3)
+        cov = pd.DataFrame(np.abs(rng.normal(size=(N_TRAIN, 3))), columns=["s1", "s2", "ctrl"])
+        y = np.linspace(10.0, 12.0, N_TRAIN) + cov[["s1", "s2"]].to_numpy() @ [0.5, 0.5] + rng.normal(0, 0.1, N_TRAIN)
+        scheme = RegressionScheme()
+        scheme.add_regressors(["s1", "s2", "ctrl"], coef_sign=["+", "+", "="], loc_prior=0.0, scale_prior=1.0)
+        return y, cov, scheme
+
+    def _fit(self, regression_data, **kwargs):
+        y, cov, scheme = regression_data
+        return run_dlt_model(
+            RNG, LEV_SM, SLP_SM, THETA, y, MCMC_ARGS, regression_scheme=scheme, covariates_df=cov, **kwargs
+        )
+
+    def test_factor_is_half_normal_on_sum(self):
+        pos_coef = jnp.array([0.2, 0.3])
+        reg_input = {"+": {"covariates": jnp.ones((N_TRAIN, 2)), "coef_loc": jnp.zeros(2), "coef_scale": jnp.ones(2)}}
+        model = numpyro.handlers.substitute(dlt_model, data={"pos_coef": pos_coef, "sigma": 1.0})
+        trace = numpyro.handlers.trace(numpyro.handlers.seed(model, 0)).get_trace(
+            LEV_SM, SLP_SM, THETA, jnp.ones(N_TRAIN), reg_input=reg_input, pos_coef_sum_scale=0.1
+        )
+        expected = numpyro.distributions.HalfNormal(0.1).log_prob(0.5)
+        np.testing.assert_allclose(trace["pos_coef_sum"]["fn"].log_factor, expected)
+
+    def test_no_factor_by_default(self):
+        reg_input = {"+": {"covariates": jnp.ones((N_TRAIN, 1)), "coef_loc": jnp.zeros(1), "coef_scale": jnp.ones(1)}}
+        trace = numpyro.handlers.trace(numpyro.handlers.seed(dlt_model, 0)).get_trace(
+            LEV_SM, SLP_SM, THETA, jnp.ones(N_TRAIN), reg_input=reg_input
+        )
+        assert "pos_coef_sum" not in trace
+
+    def test_constraint_shrinks_positive_sum_in_one_fit(self, regression_data):
+        free = self._fit(regression_data)
+        constrained = self._fit(regression_data, pos_coef_sum_scale=0.05)
+        free_sum = free["coef"].sel(var_name=["s1", "s2"]).sum("var_name")
+        constrained_sum = constrained["coef"].sel(var_name=["s1", "s2"]).sum("var_name")
+        assert float(constrained_sum.median()) < 0.5 * float(free_sum.median())
+        assert (constrained["coef"].sel(var_name=["s1", "s2"]) >= 0).all()
+
+    @pytest.mark.parametrize("scale", [0.0, -1.0])
+    def test_non_positive_scale_raises(self, regression_data, scale):
+        with pytest.raises(ValueError, match="must be positive"):
+            self._fit(regression_data, pos_coef_sum_scale=scale)
+
+    def test_without_positive_regressor_raises(self, synthetic_y):
+        cov = pd.DataFrame({"ctrl": np.ones(N_TRAIN)})
+        scheme = RegressionScheme()
+        scheme.add_regressors(["ctrl"], coef_sign="=")
+        with pytest.raises(ValueError, match="'\\+' regressor"):
+            run_dlt_model(
+                RNG,
+                LEV_SM,
+                SLP_SM,
+                THETA,
+                synthetic_y,
+                MCMC_ARGS,
+                regression_scheme=scheme,
+                covariates_df=cov,
+                pos_coef_sum_scale=0.1,
+            )
+        with pytest.raises(ValueError, match="'\\+' regressor"):
+            run_dlt_model(RNG, LEV_SM, SLP_SM, THETA, synthetic_y, MCMC_ARGS, pos_coef_sum_scale=0.1)
