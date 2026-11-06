@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from bunobee.models.ssp import plot_prior_density
+from bunobee.models.ssp import plot_prior_cross_sections, plot_prior_density
 from bunobee.models.ssp.prior import extend_states_prior_smoothed
 
 
@@ -140,3 +140,86 @@ def test_grid_too_small_or_non_positive_raises():
         plot_prior_density(prior, n_rows=2, n_cols=2)
     with pytest.raises(ValueError, match="positive"):
         plot_prior_density(prior, n_cols=0)
+
+
+def _cross_section_priors() -> dict[str, xr.Dataset]:
+    """A raw two-state prior with several anchors, alongside its smoothed extension."""
+    prior = _multi_state_prior()
+    return {"raw": prior, "smoothed": extend_states_prior_smoothed(prior, Q=0.02)}
+
+
+def test_cross_sections_draw_a_normalised_bell_at_the_marginal_mean():
+    prior = _wide_prior(1)
+    state = str(prior["state"].values[0])
+
+    fig, axes = plot_prior_cross_sections({"raw": prior}, state, [2])
+
+    x, y = axes[0].get_lines()[0].get_data()
+    assert x[np.argmax(y)] == pytest.approx(0.4, abs=0.01)
+    assert np.sum((y[1:] + y[:-1]) / 2 * np.diff(x)) == pytest.approx(1.0, abs=1e-3)
+    plt.close(fig)
+
+
+def test_cross_sections_overlay_every_prior_and_skip_undisclosed_steps():
+    priors = _cross_section_priors()
+    state = str(priors["raw"]["state"].values[0])
+    t_anchor = int(np.flatnonzero(np.isfinite(priors["raw"]["P_obs"].values[:, 0]))[0])
+    t_gap = int(np.flatnonzero(np.isinf(priors["raw"]["P_obs"].values[:, 0]))[0])
+
+    fig, axes = plot_prior_cross_sections(priors, state, [t_anchor, t_gap])
+
+    assert [line.get_label() for line in axes[0].get_lines()] == ["raw", "smoothed"]
+    assert [line.get_label() for line in axes[1].get_lines()] == ["smoothed"]
+    plt.close(fig)
+
+
+def test_cross_sections_panel_with_nothing_disclosed_stays_empty():
+    prior = _wide_prior(1)
+    state = str(prior["state"].values[0])
+
+    fig, axes = plot_prior_cross_sections({"raw": prior}, state, [0])
+
+    assert axes[0].get_lines() == []
+    plt.close(fig)
+
+
+def test_cross_sections_colors_follow_each_prior():
+    priors = _cross_section_priors()
+    state = str(priors["raw"]["state"].values[0])
+    t_anchor = int(np.flatnonzero(np.isfinite(priors["raw"]["P_obs"].values[:, 0]))[0])
+
+    fig, axes = plot_prior_cross_sections(priors, state, [t_anchor], colors={"smoothed": "crimson"})
+
+    assert axes[0].get_lines()[1].get_color() == "crimson"
+    plt.close(fig)
+
+
+def test_cross_sections_layout_wraps_and_hides_unused_axes():
+    prior = _wide_prior(1)
+    state = str(prior["state"].values[0])
+
+    fig, axes = plot_prior_cross_sections({"raw": prior}, state, [2, 2, 2], n_cols=2)
+
+    assert axes.shape == (4,)
+    assert [ax.get_visible() for ax in axes] == [True, True, True, False]
+    plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "priors_empty, state, times, colors, match",
+    [
+        (True, None, [2], None, "at least one prior"),
+        (False, None, [], None, "at least one timestep"),
+        (False, "nope", [2], None, "not in prior"),
+        (False, None, [99], None, "outside prior"),
+        (False, None, [-1], None, "outside prior"),
+        (False, None, [2], [], "colours"),
+    ],
+)
+def test_cross_sections_rejects_bad_arguments(priors_empty, state, times, colors, match):
+    prior = _wide_prior(1)
+    state = state or str(prior["state"].values[0])
+    priors = {} if priors_empty else {"raw": prior}
+
+    with pytest.raises(ValueError, match=match):
+        plot_prior_cross_sections(priors, state, times, colors=colors)

@@ -71,13 +71,14 @@ Three self-contained chapters on the prior data structure and its extension / fu
 own data and can be read on their own once `ssp_02`/`ssp_03` have introduced time-point priors.
 
 - **`ssp_07_extend_states_prior` — Extending State Anchors via a Two-Sided Random Walk**
-  (`extend_states_prior_nearest`): (1) builds a disclosed prior with `construct_states_prior`, (2) extends the sparse
-  anchors along the two-sided random walk, and (3) overlays the **anchors-only** vs. **random-walk-extended** prior in
-  a single `plot_states` figure — the extension shows up as a continuous variance cone that pinches to each anchor and
-  widens with lag, while the anchorless intercept stays `inf`.
+  (`extend_states_prior_nearest`): covers the single-anchor case. (1) builds a prior disclosed at one time point with
+  `construct_states_prior`, (2) extends the anchor along the two-sided random walk, (3) overlays the **anchors-only**
+  vs. **random-walk-extended** prior in a single `plot_states` figure — the extension shows up as a continuous variance
+  cone that pinches to the anchor and widens with lag, while the anchorless intercept stays `inf` — and (4) shows
+  sampling, the nearest-anchor formula and the KF + RTS smoother side by side, which are equal with one anchor.
 - **`ssp_08_multi_anchor_prior_extension` — Multi-Anchor Extension: Nearest-Anchor Heuristic vs. a KF + RTS Smoother**
-  (`extend_states_prior_smoothed`): checks where the nearest-anchor heuristic of `ssp_07` stops being exact, and builds
-  out the principled multi-anchor alternative.
+  (`extend_states_prior_smoothed`): shows why the nearest-anchor heuristic of `ssp_07` becomes a problem with several
+  anchors, since it never resolves them into one continuous prior, and builds out the principled alternative.
 - **`ssp_09_combine_states_priors` — The `SspPrior` Contract, and Fusing Independent Priors**: two demos in one
   notebook. First, what `SspPrior` actually validates and exposes — its read-only facade over the wrapped dataset,
   and the two documented gotchas (`xr.merge` rejects the wrapper; ordinary xarray ops like `.isel()` don't preserve
