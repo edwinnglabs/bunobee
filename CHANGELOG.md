@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plot_prior_cross_sections` in `bunobee.models.ssp` — one state's Gaussian marginals at chosen timesteps as bell
+  curves, overlaying several priors in each panel.
 - `get_coef_sign_fraction` in `bunobee.models.dlt` — per-regressor fraction of posterior coefficient samples
   above (`frac_pos`) and below (`frac_neg`) zero, pooled over chains.
 - `get_regression_summary` in `bunobee.models.dlt` — one row per regressor with `coef_p50`, a credible interval

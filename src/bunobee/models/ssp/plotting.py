@@ -493,3 +493,140 @@ def plot_prior_density(
     plt.tight_layout()
 
     return fig, axes
+
+
+def plot_prior_cross_sections(
+    priors: Mapping[str, xr.Dataset | SspPrior],
+    state: str,
+    times: Sequence[int],
+    *,
+    colors: dict[str, str] | Sequence[str] | None = None,
+    n_grid: int = 400,
+    pad: float = 3.5,
+    title: str | None = None,
+    n_cols: int | None = None,
+    n_rows: int | None = None,
+    figsize: tuple[float, float] | None = None,
+    dpi: float | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    r"""Draw one state's Gaussian marginals at chosen timesteps as bell curves.
+
+    Companion to :func:`plot_prior_density`, which shows one prior across the
+    whole horizon.  This slices the marginal ``N(a_obs[t], P_obs[t])`` at a few
+    timesteps, one panel per timestep, and overlays several priors in each panel
+    so their means and variances can be compared directly (e.g. a raw disclosure
+    against its smoothed extension).
+
+    A prior that is undisclosed at a step (``P_obs`` is ``inf``) has no marginal
+    to draw there, so it is left out of that panel.
+
+    Parameters
+    ----------
+    priors : mapping[str, xr.Dataset or SspPrior]
+        Priors to overlay, keyed by legend label.  Each carries ``a_obs`` and
+        ``P_obs`` over dims ``(time, state)``.
+    state : str
+        Label of the state to slice; must be present in every prior.
+    times : sequence of int
+        Timestep indices to slice, one panel each.
+    colors : dict[str, str] or sequence of str or None, optional
+        Per-prior colours: a dict keyed like ``priors``, or a sequence in the
+        same order.  Priors missing from a dict, and every prior when ``None``,
+        use the ``tab10`` cycle.
+    n_grid : int, optional
+        Number of points on each panel's value grid, by default 400.
+    pad : float, optional
+        Grid half-width in standard deviations around the outermost bell, by
+        default 3.5.
+    title : str or None, optional
+        Figure suptitle.  Auto-generated when ``None``.
+    n_cols : int or None, optional
+        Number of subplot columns.  When neither ``n_cols`` nor ``n_rows`` is
+        given, every timestep gets its own column in a single row.
+    n_rows : int or None, optional
+        Number of subplot rows.  When only ``n_cols`` is given the rows are
+        ``ceil(len(times) / n_cols)``.
+    figsize : tuple[float, float] or None, optional
+        Figure ``(width, height)`` in inches.  Defaults to ``(4.7 * n_cols,
+        3.6 * n_rows)``.
+    dpi : float or None, optional
+        Figure resolution in dots per inch.  ``None`` keeps the matplotlib
+        default (``rcParams["figure.dpi"]``).
+
+    Returns
+    -------
+    fig : plt.Figure
+    axes : np.ndarray
+        Flattened array of all ``Axes`` objects, including any hidden ones that
+        pad the grid beyond the last timestep.
+
+    Raises
+    ------
+    ValueError
+        If ``priors`` or ``times`` is empty, ``state`` is missing from a prior, a
+        timestep is outside a prior's range, ``colors`` is too short, or
+        ``n_rows`` / ``n_cols`` is non-positive or too small to hold every panel.
+    """
+    if not priors:
+        raise ValueError("priors must contain at least one prior")
+    times = [int(t) for t in times]
+    if not times:
+        raise ValueError("times must contain at least one timestep")
+
+    names = list(priors)
+    default_colors = plt.get_cmap("tab10").colors
+    if colors is None:
+        palette = [default_colors[i % len(default_colors)] for i in range(len(names))]
+    elif isinstance(colors, dict):
+        palette = [colors.get(k, default_colors[i % len(default_colors)]) for i, k in enumerate(names)]
+    else:
+        palette = list(colors)
+        if len(palette) < len(names):
+            raise ValueError(f"need at least {len(names)} colours for {len(names)} priors, got {len(palette)}")
+
+    marginals = {}
+    for name in names:
+        a_obs, p_obs, state_labels = _read_states_prior(priors[name])
+        if state not in state_labels:
+            raise ValueError(f"state {state!r} not in prior {name!r}; available: {state_labels}")
+        out_of_range = [t for t in times if not 0 <= t < a_obs.shape[0]]
+        if out_of_range:
+            raise ValueError(f"times {out_of_range} outside prior {name!r} with {a_obs.shape[0]} steps")
+        s = state_labels.index(state)
+        marginals[name] = (a_obs[:, s], p_obs[:, s])
+
+    n_rows, n_cols = _resolve_grid(len(times), n_rows, n_cols)
+    if figsize is None:
+        figsize = (4.7 * n_cols, 3.6 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, dpi=dpi, squeeze=False)
+    axes = axes.flatten()
+    for ax in axes[len(times) :]:
+        ax.set_visible(False)
+
+    for ax, t in zip(axes, times):
+        drawn = [
+            (name, color, marginals[name][0][t], marginals[name][1][t])
+            for name, color in zip(names, palette)
+            if np.isfinite(marginals[name][1][t]) and np.isfinite(marginals[name][0][t]) and marginals[name][1][t] > 0
+        ]
+        if drawn:
+            lo = min(a - pad * np.sqrt(p) for _, _, a, p in drawn)
+            hi = max(a + pad * np.sqrt(p) for _, _, a, p in drawn)
+            y = np.linspace(lo, hi, n_grid)
+            for name, color, a, p in drawn:
+                pdf = _gaussian_pdf(y, a, p)
+                ax.plot(y, pdf, color=color, label=name)
+                ax.fill_between(y, pdf, color=color, alpha=0.15)
+            ax.legend(fontsize=7)
+        ax.set_title(f"{state} @ t={t}", fontsize=9)
+        ax.set_xlabel("state value")
+
+    for ax in axes[::n_cols][:n_rows]:
+        ax.set_ylabel("density")
+
+    if title is None:
+        title = f"{state}: prior cross-sections"
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+
+    return fig, axes
