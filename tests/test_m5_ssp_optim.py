@@ -31,6 +31,10 @@ SigmaPrior = m5_ssp_optim.SigmaPrior
 # four series and both drifts at 0.1 for the first three.
 N_FIT = 140
 LEVELS = np.array([0.2, 0.7, 1.5, 4.0, 15.0])
+SOFT_PRIORS = {
+    "sigma_h_prior": SigmaPrior("half_normal", (1.0,)),
+    "sigma_q_prior": SigmaPrior("half_normal", (0.05,)),
+}
 
 
 @pytest.fixture(scope="module")
@@ -61,11 +65,11 @@ def _loss(sales, Z, sigma_h, sigma_q, sigma_h_prior, sigma_q_prior) -> np.ndarra
         logp=True,
         chunk_size=4096,
     )
-    log_prior = (
-        sigma_h_prior.distribution.log_prob(jnp.asarray(sigma_h))
-        + sigma_q_prior.distribution.log_prob(jnp.asarray(sigma_q[:, 0]))
-        + sigma_q_prior.distribution.log_prob(jnp.asarray(sigma_q[:, 1]))
+    log_prior = sigma_h_prior.distribution.log_prob(jnp.asarray(sigma_h)) + sigma_q_prior.distribution.log_prob(
+        jnp.asarray(sigma_q[:, 0])
     )
+    if n_states > 1:
+        log_prior += sigma_q_prior.distribution.log_prob(jnp.asarray(sigma_q[:, 1]))
     return np.asarray(-(log_p + log_prior))
 
 
@@ -128,6 +132,25 @@ class TestBestParams:
 
         loss = _loss(sales, Z, result["sigma_h"], result["sigma_q"], *priors.values())
         np.testing.assert_allclose(loss, result["final_loss"], rtol=1e-6)
+
+    def test_batch_one_state_loss_has_no_shared_drift_prior(self, sales):
+        # A soft prior moves with the unused parameter it would score, so the term would shift the loss and the step
+        # kept as the best. The loss at the returned sigmas holds only the priors of the noise and the one drift.
+        level = jnp.ones((N_FIT, 1), dtype=jnp.float32)
+        result = m5_ssp_optim.fit_batch_series_opt(sales, n_iter=100, Z=level, **SOFT_PRIORS)
+
+        assert result["sigma_q"].shape == (LEVELS.size, 1)
+        loss = _loss(sales, level, result["sigma_h"], result["sigma_q"], *SOFT_PRIORS.values())
+        np.testing.assert_allclose(loss, result["final_loss"], rtol=1e-6)
+
+    def test_single_series_one_state_loss_has_no_shared_drift_prior(self, sales):
+        level = jnp.ones((N_FIT, 1), dtype=jnp.float32)
+        result = m5_ssp_optim.fit_one_series_opt(sales[0], n_iter=100, Z=level, **SOFT_PRIORS)
+
+        assert result["sigma_q"].shape == (1,)
+        sigma_h = np.array([result["sigma_h"]], dtype=np.float32)
+        loss = _loss(sales[:1], level, sigma_h, result["sigma_q"][None], *SOFT_PRIORS.values())
+        np.testing.assert_allclose(loss, [result["final_loss"]], rtol=1e-6)
 
 
 class TestPriors:

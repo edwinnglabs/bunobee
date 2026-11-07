@@ -281,6 +281,21 @@ class TestPriorBoundShares:
             "any",
         }
 
+    def test_one_state_fit_has_no_shared_drift(self):
+        # A level-only fit has one drift, so sigma_q has one column and there is no sigma_q_rest to report.
+        fitted = {"sigma_h": np.array([0.3, 0.3]), "sigma_q": np.array([[0.05], [0.098]])}
+        model = m5_models.SspDow(level=True, dow=False)
+
+        assert m5_bias.prior_bound_shares(fitted, model) == pytest.approx(
+            {
+                "sigma_h_low": 0.0,
+                "sigma_h_high": 0.0,
+                "sigma_q_first_low": 0.0,
+                "sigma_q_first_high": 0.5,
+                "any": 0.5,
+            }
+        )
+
     def test_empty_without_the_ssp_sigmas_or_priors(self):
         model = m5_models.MODELS["ssp_dow"]
         assert m5_bias.prior_bound_shares({"sigma_h": np.array([0.3])}, model) == {}

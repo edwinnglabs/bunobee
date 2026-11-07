@@ -397,10 +397,10 @@ def prior_bound_shares(fitted: dict[str, np.ndarray], model: object) -> dict[str
     -------
     dict of str to float
         For each of ``sigma_h``, ``sigma_q_first`` (the first state's drift) and ``sigma_q_rest`` (the shared
-        drift) with a uniform prior, the share of series with it on the lower and on the upper bound of its prior,
-        under the keys ``<sigma>_low`` and ``<sigma>_high``. Last, ``any``: the share of series with any of them
-        on a bound. Empty if ``fitted`` has no ``sigma_h`` or no ``sigma_q``, if ``model`` has no priors, or if
-        none of them is uniform.
+        drift, if there is more than one state) with a uniform prior, the share of series with it on the lower and
+        on the upper bound of its prior, under the keys ``<sigma>_low`` and ``<sigma>_high``. Last, ``any``: the
+        share of series with any of them on a bound. Empty if ``fitted`` has no ``sigma_h`` or no ``sigma_q``, if
+        ``model`` has no priors, or if none of them is uniform.
     """
     priors = [getattr(model, name, None) for name in ("sigma_h_prior", "sigma_q_prior")]
     if "sigma_h" not in fitted or "sigma_q" not in fitted or None in priors:
@@ -410,8 +410,9 @@ def prior_bound_shares(fitted: dict[str, np.ndarray], model: object) -> dict[str
     sigmas = {
         "sigma_h": (np.asarray(fitted["sigma_h"]), sigma_h_prior.bounds),
         "sigma_q_first": (sigma_q[:, 0], sigma_q_prior.bounds),
-        "sigma_q_rest": (sigma_q[:, 1], sigma_q_prior.bounds),
     }
+    if sigma_q.shape[1] > 1:  # A one-state fit has no shared drift.
+        sigmas["sigma_q_rest"] = (sigma_q[:, 1], sigma_q_prior.bounds)
     shares: dict[str, float] = {}
     on_any = np.zeros(sigma_q.shape[0], dtype=bool)
     for name, (values, bounds) in sigmas.items():

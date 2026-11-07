@@ -632,6 +632,60 @@ after it. A dash means the forecasts were not submitted.
 It wins on the sample, on all three full-run windows and on both Kaggle leaderboards. `ssp_dow` stays registered as
 the baseline that runs are compared with.
 
+### Day-of-week ablation (#145)
+
+Every entry before this one had weekday dummies, so their contribution had never been measured. The nearest pair,
+`ssp_dow` and `ssp_level_dow`, differs by the level state. `SspDow` now has a `dow` field, on by default, and
+`ssp_level_yeojohnson_halfnormal` is the default entry with `dow=False`: the level is its only state, with the same
+Yeo-Johnson target and half-normal priors, so its forecast is flat over the 28 days.
+
+Both full runs fit all 30,490 series at all three origins. The default is `20261017_201617` (#118), not re-fitted: on
+the 3,000-series sample at commit `4ac6eb9`, it reproduces its logged forecasts (`20261017_221204`) exactly. The
+level-only entry is `20261106_203840`, at commit `4ac6eb9` with a clean tree, and was run once. The change after that
+commit is documentation only. That run was made in a temporary worktree, so its directory and row are not in the main
+checkout's `output/`; `python m5_run.py --model ssp_level_yeojohnson_halfnormal --n-demo 0` refits it.
+
+Per level on the pre-validation window, which decides, with a delta of level-only minus default:
+
+| Level | Default | Level-only | Delta |
+|---|---|---|---|
+| 1 Total | 0.5793 | 1.3089 | +0.7296 |
+| 2 State | 0.6463 | 1.2831 | +0.6368 |
+| 3 Store | 0.7024 | 1.2575 | +0.5551 |
+| 4 Category | 0.6704 | 1.3327 | +0.6623 |
+| 5 Department | 0.8856 | 1.4594 | +0.5738 |
+| 6 State × category | 0.7209 | 1.2862 | +0.5653 |
+| 7 State × department | 0.8744 | 1.3717 | +0.4973 |
+| 8 Store × category | 0.7776 | 1.2555 | +0.4779 |
+| 9 Store × department | 0.8903 | 1.2998 | +0.4095 |
+| 10 Item | 0.9558 | 1.0885 | +0.1326 |
+| 11 Item × state | 0.9350 | 1.0124 | +0.0774 |
+| 12 Item × store | 0.9096 | 0.9469 | +0.0373 |
+| WRMSSE | **0.79563** | 1.24187 | **+0.44624** |
+| Bias of the total | +4.4% | +7.3% | +3.0 points |
+
+The other windows, read once as the final check:
+
+| Window | Default | Level-only | Delta |
+|---|---|---|---|
+| Validation (public) | 0.70891 | 1.09152 | +0.38261 |
+| Evaluation (private) | 0.79394 | 1.08516 | +0.29122 |
+
+- **Day-of-week is worth 0.44624 on the pre-validation window.** Removing it is worse at every level and on all
+  three windows. The loss is largest on the totals (level 1: +0.7296) and smallest on the item levels (level 12:
+  +0.0373).
+- **The sample got the sign right:** +0.34695 on 3,000 series (0.82376 and 1.17071), against +0.44624 on the full run.
+- **Removing it raises every total:** the bias of the total goes from +4.4% to +7.3% on pre-validation, from −1.3% to
+  +1.5% on validation and from +5.1% to +8.0% on evaluation.
+- **Cost:** the full run fits in 374 s against 799 s, at a 13.0 GiB peak against 22.9 GiB.
+- **A one-state fit exposed a fitter bug:** `fit_batch_series_opt` and `fit_one_series_opt` added the prior of the
+  shared drift to the loss even with no shared drift, which changed the step kept as the best. On the sample that
+  moved 1,112 of 3,000 series by more than 1e-4 and the score from 1.170908 to 1.170709. The scores above are after
+  the fix, which leaves designs with two or more states unchanged.
+
+**Decision:** the default stays `ssp_level_dow_yeojohnson_halfnormal`, and later stages keep day-of-week on unless
+their pre-validation score says otherwise. The level-only entry stays registered as the ablation baseline.
+
 ## Working on the model
 
 ### Where the code is
@@ -640,7 +694,7 @@ the baseline that runs are compared with.
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, loss and optimizer. `SigmaPrior`: the priors of the noise and the drifts, which the fitter takes as arguments (by default `SIGMA_H_PRIOR` and `SIGMA_Q_PRIOR`). `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
 | `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction), `LogTransform`, the default, and `PowerTransform`, a Box-Cox or Yeo-Johnson power fitted per series. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
-| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `transform`, `sigma_h_prior`, `sigma_q_prior`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
+| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `level`, `dow`, `transform`, `sigma_h_prior`, `sigma_q_prior`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
 | `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 

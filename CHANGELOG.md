@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forecast noise. An unknown `noise_dist`, or bounds outside `0 < min_nu < max_nu`, raise `ValueError`; the default
   `"normal"` leaves the model unchanged.
 
+### Fixed
+
+- `fit_one_series_opt` and `fit_batch_series_opt` no longer add the prior of the shared drift to the loss of a one-state
+  design, which has no shared drift. The term changed which step's parameters were kept. Designs with two or more
+  states are unchanged.
+
 ## [v0.0.6] - 2026-10-30
 
 Makes the DLT hyper-parameter tuner usable downstream (regressors, a configurable search space, a documented
