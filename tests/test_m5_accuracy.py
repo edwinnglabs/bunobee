@@ -21,6 +21,10 @@ zero-inflated, and MAPE on a series that spends half its life at zero means noth
 in the thousands of units per day with no zeros anywhere, which the grid checks below assert rather than
 assume.
 
+The panel also carries the calendar covariates of stage 1 of #143 and a fixed-basket price index (issue #147), so a
+notebook can read them without the raw dump. The harnesses below ignore them and score ``sales`` only. The builder's
+docstring defines the index, and :class:`TestFixtureProvenance` and :class:`TestPriceIndexDefinition` check it.
+
 :class:`TestFixtureProvenance` mirrors the class of the same name in ``tests/test_ssp_forecast_e2e.py``:
 the grid checks always run, and the re-derivation check rebuilds the aggregate from the raw dump
 whenever a working copy has it, so the committed copy cannot silently drift.
@@ -60,7 +64,7 @@ import xarray as xr
 
 from bunobee.datasets import M5_AGGREGATE_PATH, load_m5_aggregate
 from bunobee.models.ssp import build_forecast_design, forecast_ssp, transform_to_ekf_st
-from bunobee.regression import RegressionScheme, make_periodic_dummies
+from bunobee.regression import RegressionScheme, make_fourier_series, make_periodic_dummies
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +97,30 @@ SERIES = [
 ]
 N_SERIES = len(SERIES)
 
-# SHA-256 of the committed fixture, as printed by the builder on 2026-09-03. Pinning it makes a
+COLUMNS = [
+    "date",
+    "series_id",
+    "sales",
+    "price_index",
+    "annual_sin_1",
+    "annual_cos_1",
+    "event_name_1",
+    "event_name_2",
+    "month_of_year",
+    "day_of_month",
+]
+#: The columns that describe the day, so they hold one value per date.
+CALENDAR_COLUMNS = COLUMNS[4:]
+
+# The annual Fourier terms are phased as in the stage 1 design: step 0 is the first day of the M5 calendar.
+M5_FIRST_DATE = pd.Timestamp("2011-01-29")
+ANNUAL_PERIOD = 365.25
+FLOAT_DECIMALS = 6
+N_EVENT_NAMES = 30
+
+# SHA-256 of the committed fixture, as printed by the builder on 2026-11-06. Pinning it makes a
 # hand-edited value fail everywhere, not only where the raw dump is on hand to re-derive against.
-FIXTURE_SHA256 = "afadf2e1f47b171767c2a7c2e8de80c9d812ec1b0347a36f2495a28af7cb0d35"
+FIXTURE_SHA256 = "218bf77d6301a05ac6edcb2d2328c0f505d15f382f434f374b55ec8ea84a6843"
 
 # The fixture is a committed test asset, not a data release; keep it small enough to stay one.
 MAX_FIXTURE_BYTES = 500_000
@@ -214,7 +239,7 @@ def _read_panel() -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Columns ``date`` (datetime64), ``series_id`` (str), ``sales`` (int).
+        Columns :data:`COLUMNS`, among them ``date`` (datetime64), ``series_id`` (str), ``sales`` (int).
     """
     return load_m5_aggregate()
 
@@ -223,7 +248,7 @@ class TestFixtureProvenance:
     def test_panel_has_the_expected_grid(self):
         panel = _read_panel()
 
-        assert list(panel.columns) == ["date", "series_id", "sales"]
+        assert list(panel.columns) == COLUMNS
         assert sorted(panel["series_id"].unique()) == SERIES
         assert panel["date"].nunique() == N_DATES
         assert len(panel) == N_DATES * N_SERIES
@@ -269,6 +294,166 @@ class TestFixtureProvenance:
         committed = _read_panel()
 
         pd.testing.assert_frame_equal(committed, expected, check_dtype=False)
+
+    def test_calendar_columns_hold_one_value_per_date(self):
+        by_date = _read_panel().groupby("date")[CALENDAR_COLUMNS].nunique()
+
+        assert (by_date == 1).all().all()
+
+    def test_month_and_day_follow_the_date(self):
+        panel = _read_panel()
+
+        np.testing.assert_array_equal(panel["month_of_year"], panel["date"].dt.month)
+        np.testing.assert_array_equal(panel["day_of_month"], panel["date"].dt.day)
+
+    def test_annual_terms_are_phased_at_the_first_day_of_the_m5_calendar(self):
+        # Phased at the first day of this window instead, they would not be the stage 1 columns: the coefficients a
+        # notebook reads off them could not be compared with those of the M5 runner.
+        panel = _read_panel().drop_duplicates("date")
+        first_step = (panel["date"].iloc[0] - M5_FIRST_DATE).days
+        expected = make_fourier_series(first_step + N_DATES, period=ANNUAL_PERIOD, order=1)[first_step:]
+
+        np.testing.assert_allclose(
+            panel[["annual_sin_1", "annual_cos_1"]].to_numpy(), expected, rtol=0, atol=10.0**-FLOAT_DECIMALS
+        )
+
+    def test_events_are_names_and_a_day_without_one_is_empty(self):
+        days = _read_panel().drop_duplicates("date").set_index("date")
+
+        assert days.loc["2014-12-25", "event_name_1"] == "Christmas"
+        assert days.loc["2015-02-01", "event_name_1"] == "SuperBowl"
+        assert days.loc[["2014-06-15"], ["event_name_1", "event_name_2"]].iloc[0].tolist() == [
+            "NBAFinalsEnd",
+            "Father's day",
+        ]
+        assert days.loc["2014-04-28", "event_name_1"] == ""
+        assert days["event_name_2"].eq("").sum() == N_DATES - 1
+        # Every M5 event of the calendar falls in these two years.
+        assert days["event_name_1"].nunique() == N_EVENT_NAMES + 1  # with ""
+
+    def test_price_index_is_a_price_measure_of_each_series(self):
+        prices = _read_panel().pivot(index="date", columns="series_id", values="price_index").reindex(columns=SERIES)
+
+        # Near 1 over the days that fix the basket, and it moves on every series, so it is a covariate.
+        np.testing.assert_allclose(prices.iloc[:N_STEPS].mean(), 1.0, atol=0.001)
+        assert prices.min().min() > 0.9
+        assert prices.max().max() < 1.1
+        assert (prices.std() > 0.001).all()
+
+
+class TestPriceIndexDefinition:
+    """``price_index`` of the builder on a small panel: the module docstring's formula, value by value."""
+
+    DATES = pd.date_range("2015-01-05", periods=4)
+    REFERENCE = DATES[:2]
+
+    # Day 2 and 3 are after the reference days.
+    SALES = {
+        "a": [1.0, 3.0, 100.0, 100.0],  # 4 units, listed on every day
+        "b": [2.0, 2.0, 0.0, 0.0],  # 4 units, listed on two days only
+        "c": [0.0, 0.0, 5.0, 5.0],  # no unit in the reference days, and listed only after them
+        "d": [1.0, 1.0, 1.0, 1.0],  # 2 units, the other aggregate
+    }
+    PRICES = {
+        "a": [10.0, 10.0, 11.0, 12.0],  # mean 10
+        "b": [np.nan, 4.0, 4.0, np.nan],  # mean 4
+        "c": [np.nan, np.nan, 3.0, 3.0],
+        "d": [2.0, 2.0, 2.0, 4.0],  # mean 2
+    }
+    STATES = ["CA", "CA", "CA", "TX"]
+
+    def _dataset(self, sales: dict | None = None, prices: dict | None = None) -> xr.Dataset:
+        sales = self.SALES if sales is None else sales
+        prices = self.PRICES if prices is None else prices
+        return xr.Dataset(
+            {
+                "sales": (("series_id", "date"), np.array(list(sales.values()))),
+                "sell_price": (("series_id", "date"), np.array(list(prices.values()))),
+            },
+            coords={
+                "series_id": list(sales),
+                "date": self.DATES,
+                "state_id": ("series_id", self.STATES),
+                "cat_id": ("series_id", ["FOODS"] * 4),
+            },
+        )
+
+    def _index(self, ds: xr.Dataset) -> pd.DataFrame:
+        return _load_builder().price_index(ds, self.DATES, self.REFERENCE)
+
+    def test_matches_the_formula(self):
+        index = self._index(self._dataset())
+
+        assert list(index.columns) == ["CA_FOODS", "TOTAL", "TX_FOODS"]
+        # q = (a 4, b 4, d 2), p = (a 10, b 4, d 2). Each day counts the series listed on it: b not on day 0 or 3.
+        np.testing.assert_allclose(index["CA_FOODS"], [1.0, 1.0, (44 + 16) / (40 + 16), 48 / 40], atol=1e-6)
+        np.testing.assert_allclose(index["TX_FOODS"], [1.0, 1.0, 1.0, 2.0], atol=1e-6)
+        np.testing.assert_allclose(
+            index["TOTAL"], [1.0, 1.0, (44 + 16 + 4) / (40 + 16 + 4), (48 + 8) / (40 + 4)], atol=1e-6
+        )
+
+    def test_a_listing_starting_or_ending_does_not_move_the_index(self):
+        # Series b leaves between days 2 and 3 with its price unchanged. With a at a constant price the index stays 1.
+        prices = {**self.PRICES, "a": [10.0] * 4}
+
+        np.testing.assert_allclose(self._index(self._dataset(prices=prices))["CA_FOODS"], 1.0, atol=1e-6)
+
+    def test_sales_after_the_reference_days_do_not_reach_it(self):
+        sales = {name: [*units[:2], 7.0, 9.0] for name, units in self.SALES.items()}
+
+        pd.testing.assert_frame_equal(self._index(self._dataset(sales=sales)), self._index(self._dataset()))
+
+    def test_units_sold_without_a_listed_price_raise(self):
+        prices = {**self.PRICES, "d": [np.nan, np.nan, 2.0, 4.0]}
+
+        with pytest.raises(ValueError, match="without a listed price"):
+            self._index(self._dataset(prices=prices))
+
+    def test_an_aggregate_without_a_basket_raises(self):
+        sales = {**self.SALES, "d": [0.0, 0.0, 1.0, 1.0]}
+
+        with pytest.raises(ValueError, match="no basket"):
+            self._index(self._dataset(sales=sales))
+
+
+class TestCalendarCovariates:
+    """``calendar_covariates`` of the builder on a small calendar."""
+
+    def _dataset(self, no_event: object) -> xr.Dataset:
+        dates = pd.date_range(M5_FIRST_DATE, periods=3)
+        return xr.Dataset(
+            {
+                "month_of_year": ("date", dates.month.astype(np.int8)),
+                "day_of_month": ("date", dates.day.astype(np.int8)),
+            },
+            coords={
+                "date": dates,
+                "event_name_1": ("date", np.array([no_event, "SuperBowl", no_event], dtype=object)),
+                "event_name_2": ("date", np.array([no_event, no_event, "Easter"], dtype=object)),
+            },
+        )
+
+    @pytest.mark.parametrize("no_event", ["", np.nan])
+    def test_a_day_without_an_event_is_empty_in_either_form_of_the_dataset(self, no_event: object):
+        # m5_ds.nc holds "", and a dataset fresh from build_m5_dataset, as the builder reads it, holds NaN.
+        frame = _load_builder().calendar_covariates(self._dataset(no_event))
+
+        assert frame["event_name_1"].tolist() == ["", "SuperBowl", ""]
+        assert frame["event_name_2"].tolist() == ["", "", "Easter"]
+
+    def test_columns_are_those_of_the_panel(self):
+        frame = _load_builder().calendar_covariates(self._dataset(""))
+
+        assert list(frame.columns) == CALENDAR_COLUMNS
+        assert frame.index.name == "date"
+        assert frame["month_of_year"].tolist() == [1, 1, 1]
+        assert frame["day_of_month"].tolist() == [29, 30, 31]
+        np.testing.assert_allclose(
+            frame[["annual_sin_1", "annual_cos_1"]],
+            make_fourier_series(3, period=ANNUAL_PERIOD, order=1),
+            rtol=0,
+            atol=10.0**-FLOAT_DECIMALS,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `load_m5_aggregate()` returns more columns alongside `date`, `series_id` and `sales`, so a notebook can use them
+  without the raw M5 download: the calendar covariates of the M5 stage 1 entries (`annual_sin_1`, `annual_cos_1`,
+  `event_name_1`, `event_name_2`, `month_of_year`, `day_of_month`) and a fixed-basket `price_index`, which
+  `playground/m5_prototype/m5_make_accuracy_fixture.py` defines. `sales` is unchanged.
 - `fixed_states` argument on `fit_one_series_opt` and `fit_batch_series_opt` — a boolean mask of states whose drift is
   0, for covariates with fixed coefficients. A drift no state uses has no term in the loss. The default `None` leaves
   the fit unchanged.

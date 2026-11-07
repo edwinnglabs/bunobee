@@ -29,12 +29,38 @@ repaired in place with the same-weekday average of the surrounding weeks — ``(
 2``, rounded to the nearest unit. The repair is deterministic and is re-applied by the provenance
 test, so the committed copy still cannot drift.
 
+Calendar covariates
+-------------------
+Stage 1 of #143 (``m5_models.CALENDAR_COVARIATES``) in columns a demo can read without the raw dump, one value per
+date, repeated on each of its rows:
+
+- ``annual_sin_1``, ``annual_cos_1``: the annual Fourier terms, ``make_fourier_series`` columns for the stage 1 period
+  and order. Step 0 is the first day of the M5 calendar, 2011-01-29, as in the stage 1 design, not the first day of
+  this window.
+- ``event_name_1``, ``event_name_2``: the M5 event names, ``""`` on a day without one. They stay names, because one
+  0/1 column per event would not fit the file's size budget.
+- ``month_of_year`` (1-12), ``day_of_month`` (1-31).
+
+Price index
+-----------
+``price_index`` is a fixed-basket (Lowe) price index of each aggregate: what the units the aggregate sold in the first
+``N_STEPS`` days of the window would cost at the day's prices, over what they cost at their mean listed price in those
+days. With ``q_i`` the item-store's units in those days and ``p_i`` its mean listed price in them,
+
+    price_index[t] = sum_i(q_i * price_i[t]) / sum_i(q_i * p_i)
+
+over the item-store series in the aggregate that are listed on day ``t``, so a listing starting or ending does not move
+the index by itself. A fixed basket is what makes it a price measure: the basket does not move with the day's sales, so
+a shift in the sales mix cannot read as a price change, and the index is near 1 over the ``N_STEPS`` days. The basket
+and the mean prices stop at ``N_STEPS``, so the last ``HORIZON`` days' sales stay out of it; those days' prices are in
+it, since M5 publishes prices ahead of the sales. The units are the raw ones, before the Christmas repair. The values
+are rounded to 6 decimals, as are the Fourier terms.
+
 Usage
 -----
     python playground/m5_prototype/m5_make_accuracy_fixture.py
 
-Writes the CSV (long format ``date,series_id,sales``, sorted by ``(date, series_id)``) and prints its
-SHA-256.
+Writes the CSV (long format, sorted by ``(date, series_id)``, columns :data:`PANEL_COLUMNS`) and prints its SHA-256.
 """
 
 from __future__ import annotations
@@ -49,6 +75,8 @@ from types import ModuleType
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from bunobee.regression import make_fourier_series
 
 _HERE = Path(__file__).resolve().parent
 
@@ -100,6 +128,40 @@ PERIOD = 7  # weekly cycle, used to repair the Christmas closure
 # Splits carrying observed sales; d_1942+ ("test") is NaN in the competition files.
 _OBSERVED_SPLITS = ("train", "validation")
 
+_EVENT_COLUMNS = ("event_name_1", "event_name_2")
+_DECIMALS = 6  # of the float columns: enough for a covariate, and a platform's last bits cannot reach the digest
+
+#: The file's columns, in order. ``annual_*`` follows ``m5_models.CALENDAR_COVARIATES``.
+PANEL_COLUMNS = (
+    "date",
+    "series_id",
+    "sales",
+    "price_index",
+    "annual_sin_1",
+    "annual_cos_1",
+    *_EVENT_COLUMNS,
+    "month_of_year",
+    "day_of_month",
+)
+
+
+def _aggregate_labels(ds: xr.Dataset) -> np.ndarray:
+    """Name the ``state_id x cat_id`` aggregate of every item-store series.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        M5 dataset with ``state_id`` and ``cat_id`` coords on ``series_id``.
+
+    Returns
+    -------
+    np.ndarray
+        Aggregate names such as ``"CA_FOODS"``, one per series.
+    """
+    states = np.asarray(ds["state_id"].values, dtype=str)
+    categories = np.asarray(ds["cat_id"].values, dtype=str)
+    return np.char.add(np.char.add(states, "_"), categories)
+
 
 def aggregate_state_cat(ds: xr.Dataset) -> pd.DataFrame:
     """Sum item-store sales into the 9 ``state_id x cat_id`` series plus a national total.
@@ -119,9 +181,7 @@ def aggregate_state_cat(ds: xr.Dataset) -> pd.DataFrame:
     sales = np.asarray(ds["sales"].values, dtype=np.float64)[:, observed]
     dates = pd.DatetimeIndex(np.asarray(ds["date"].values)[observed])
 
-    states = np.asarray(ds["state_id"].values, dtype=str)
-    categories = np.asarray(ds["cat_id"].values, dtype=str)
-    labels = np.char.add(np.char.add(states, "_"), categories)
+    labels = _aggregate_labels(ds)
     groups = sorted(np.unique(labels))
     stacked = np.stack([sales[labels == name].sum(axis=0) for name in groups])
 
@@ -193,6 +253,86 @@ def repair_closures(wide: pd.DataFrame) -> pd.DataFrame:
     return repaired
 
 
+def price_index(ds: xr.Dataset, dates: pd.DatetimeIndex, reference_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """Compute the fixed-basket price index of every aggregate, defined in the module docstring.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        M5 dataset with ``sales`` and ``sell_price`` on ``(series_id, date)`` (``sell_price`` NaN where a series is not
+        listed) and ``state_id`` / ``cat_id`` coords on ``series_id``.
+    dates : pd.DatetimeIndex
+        Days to compute the index on.
+    reference_dates : pd.DatetimeIndex
+        Days whose units and mean listed prices fix the basket.
+
+    Returns
+    -------
+    pd.DataFrame
+        Wide panel indexed by ``dates`` with one column per aggregate plus :data:`TOTAL_SERIES`, sorted by name, rounded
+        to 6 decimals.
+
+    Raises
+    ------
+    ValueError
+        If a series sold units in ``reference_dates`` without being listed in any of them, or if an aggregate has no
+        basket on a day, so that its index is undefined.
+    """
+    reference_prices = np.asarray(ds["sell_price"].sel(date=reference_dates).values, dtype=np.float64)
+    units = np.nansum(np.asarray(ds["sales"].sel(date=reference_dates).values, dtype=np.float64), axis=1)
+    days_listed = np.isfinite(reference_prices).sum(axis=1)
+    unpriced = (units > 0) & (days_listed == 0)
+    if unpriced.any():
+        raise ValueError(f"{int(unpriced.sum())} series sold units without a listed price in the reference days")
+    reference_cost = units * np.nansum(reference_prices, axis=1) / np.maximum(days_listed, 1)
+
+    prices = np.asarray(ds["sell_price"].sel(date=dates).values, dtype=np.float64)
+    # Only the series with a basket count: one not sold in the reference days has no mean price to measure against.
+    listed = np.isfinite(prices) & (units > 0)[:, None]
+    cost = np.where(listed, units[:, None] * prices, 0.0)
+    cost_at_reference = np.where(listed, reference_cost[:, None], 0.0)
+
+    labels = _aggregate_labels(ds)
+    members = {name: labels == name for name in np.unique(labels)} | {TOTAL_SERIES: np.ones(labels.size, dtype=bool)}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        index = {name: cost[mask].sum(axis=0) / cost_at_reference[mask].sum(axis=0) for name, mask in members.items()}
+
+    wide = pd.DataFrame(index, index=dates)[sorted(members)].round(_DECIMALS)
+    wide.index.name = "date"
+    if not np.isfinite(wide.to_numpy()).all():
+        raise ValueError("an aggregate has no basket on some day, so its price index is undefined")
+    return wide
+
+
+def calendar_covariates(ds: xr.Dataset) -> pd.DataFrame:
+    """Collect the calendar columns of the panel over every day of the dataset.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        M5 dataset from the first day of the M5 calendar, with ``event_name_1`` and ``event_name_2`` (``""`` or NaN on a
+        day without an event), ``month_of_year`` and ``day_of_month`` along ``date``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Frame indexed by ``date``, with the calendar columns of :data:`PANEL_COLUMNS`.
+    """
+    stage_1 = _load_sibling("m5_models").CALENDAR_COVARIATES
+    terms = make_fourier_series(ds.sizes["date"], period=stage_1.annual_period, order=stage_1.annual_order)
+    columns = {
+        f"annual_{kind}_{k}": np.round(terms[:, offset + k - 1], _DECIMALS)
+        for offset, kind in ((0, "sin"), (stage_1.annual_order, "cos"))
+        for k in range(1, stage_1.annual_order + 1)
+    }
+    for name in _EVENT_COLUMNS:
+        values = ds[name].values
+        columns[name] = np.where(pd.isna(values), "", values.astype(str))
+    for name in ("month_of_year", "day_of_month"):
+        columns[name] = ds[name].values.astype(np.int64)
+    return pd.DataFrame(columns, index=pd.DatetimeIndex(ds["date"].values, name="date"))
+
+
 def build_m5_aggregate(data_dir: Path | str = _DEFAULT_DATA_DIR) -> pd.DataFrame:
     """Build the committed fixture's contents from the raw M5 dump.
 
@@ -204,15 +344,19 @@ def build_m5_aggregate(data_dir: Path | str = _DEFAULT_DATA_DIR) -> pd.DataFrame
     Returns
     -------
     pd.DataFrame
-        Long panel with columns ``date`` (datetime64), ``series_id`` (str), ``sales`` (int64),
-        sorted by ``(date, series_id)``, covering the last ``N_DATES`` observed days.
+        Long panel with columns :data:`PANEL_COLUMNS`: ``date`` (datetime64), ``series_id`` (str), ``sales`` (int64),
+        ``price_index`` (float64), and the calendar columns of :func:`calendar_covariates`, sorted by
+        ``(date, series_id)``, covering the last ``N_DATES`` observed days.
     """
-    build_m5_dataset = _load_sibling("m5_preprocess").build_m5_dataset
-    wide = repair_closures(aggregate_state_cat(build_m5_dataset(data_dir))).iloc[-N_DATES:]
+    ds = _load_sibling("m5_preprocess").build_m5_dataset(data_dir)
+    wide = repair_closures(aggregate_state_cat(ds)).iloc[-N_DATES:]
 
     long = wide.stack().rename("sales").reset_index()
     long.columns = ["date", "series_id", "sales"]
-    return long.sort_values(["date", "series_id"]).reset_index(drop=True)
+    prices = price_index(ds, wide.index, wide.index[:N_STEPS]).stack().rename("price_index").reset_index()
+    prices.columns = ["date", "series_id", "price_index"]
+    panel = long.merge(prices, on=["date", "series_id"]).merge(calendar_covariates(ds).reset_index(), on="date")
+    return panel[list(PANEL_COLUMNS)].sort_values(["date", "series_id"]).reset_index(drop=True)
 
 
 def write_fixture(panel: pd.DataFrame, output_path: Path | str = _DEFAULT_OUTPUT) -> str:
@@ -251,6 +395,7 @@ def main() -> None:
     print(f"dates       : {dates.nunique()} ({dates.min().date()} … {dates.max().date()})")
     print(f"rows        : {len(panel)}")
     print(f"min sales   : {panel['sales'].min()}")
+    print(f"price index : {panel['price_index'].min():.6f} … {panel['price_index'].max():.6f}")
     print(f"file        : {args.output} ({args.output.stat().st_size / 1e3:.0f} KB)")
     print(f"sha256      : {digest}")
 
