@@ -8,18 +8,22 @@ One test (class) per acceptance criterion of issue #31:
    (``median(exp(a_last @ Z_future.T + eps) * response_norm)``).
 3. The deprecated MAP predictors keep their closed-form output bit-for-bit and carry
    a replacement note pointing at ``forecast_ssp``.
+
+Issue #146: a MAP fit with fixed annual Fourier states carries the annual shape into the forecast days.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from bunobee.models.m5 import m5_ssp_mcmc
 from bunobee.models.m5.m5_ssp_mcmc import predict_one_series
-from bunobee.regression import make_periodic_dummies
+from bunobee.models.ssp import build_forecast_design
+from bunobee.regression import make_fourier_series, make_periodic_dummies
 
 try:
     from bunobee.models.m5 import m5_ssp_optim
@@ -207,6 +211,43 @@ class TestDeprecatedMapPredictors:
         doc = fn.__doc__ or ""
         assert ".. deprecated::" in doc
         assert "forecast_ssp" in doc
+
+
+@requires_m5_extra
+class TestAnnualTermsInTheForecast:
+    """Issue #146: fixed annual Fourier states carry the annual shape past the end of the fit days."""
+
+    N_FIT = 3 * 365
+    HORIZON = 90
+
+    def _forecasts(self, annual: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Forecasts of series with an annual cycle whose fit days end at its peak, and their true means."""
+        days = np.arange(self.N_FIT + self.HORIZON)
+        cycle = 0.6 * np.cos(2 * np.pi * (days - self.N_FIT) / 365.25)  # The peak falls on the first forecast day.
+        mean = 20.0 * np.exp(cycle)
+        sales = np.random.default_rng(0).poisson(mean[: self.N_FIT], size=(4, self.N_FIT)).astype(np.float32)
+
+        Z = np.ones((self.N_FIT, 1), dtype=np.float32)
+        fixed = None
+        Z_future = np.ones((self.HORIZON, 1), dtype=np.float32)
+        if annual:
+            terms = make_fourier_series(self.N_FIT, period=365.25, order=1).astype(np.float32)
+            Z = np.concatenate([Z, terms], axis=1)
+            fixed = np.array([False, True, True])
+            Z_future = build_forecast_design(
+                Z, self.HORIZON, fourier={"columns": [1, 2], "period": 365.25, "order": 1}
+            )[:, 0]
+        result = m5_ssp_optim.fit_batch_series_opt(sales, n_iter=50, Z=jnp.asarray(Z), fixed_states=fixed)
+        return predict_batch_series_opt(result, Z_future=Z_future), mean[self.N_FIT :]
+
+    def test_annual_terms_track_the_fall_a_flat_forecast_misses(self):
+        flat, truth = self._forecasts(annual=False)
+        annual, _ = self._forecasts(annual=True)
+
+        np.testing.assert_allclose(flat, np.broadcast_to(flat[:, [0]], flat.shape), rtol=1e-6)
+        last_week, first_week = annual[:, -7:].mean(axis=1), annual[:, :7].mean(axis=1)
+        assert np.all(last_week < 0.8 * first_week)
+        assert np.mean((annual - truth) ** 2) < 0.5 * np.mean((flat - truth) ** 2)
 
 
 class TestStyle:

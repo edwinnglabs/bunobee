@@ -8,6 +8,8 @@ One test (class) per acceptance criterion of issue #27:
 3. ``covariates_future`` of the wrong length raises ``ValueError``.
 4. The output round-trips through ``forecast_ssp`` (shape-compatible).
 5. Exported from ``ssp/__init__.py``; NumPy-style docstring; lines <= 120 chars.
+
+Issue #146 adds Fourier blocks, continued as ``make_fourier_series(n_steps + horizon, period, order)[n_steps:]``.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import xarray as xr
 import bunobee.models.ssp as ssp
 from bunobee.models.ssp import build_forecast_design, forecast_ssp
 from bunobee.models.ssp import forecast as forecast_mod
-from bunobee.regression import make_periodic_dummies
+from bunobee.regression import make_fourier_series, make_periodic_dummies
 
 N_STEPS = 30
 HORIZON = 14
@@ -118,6 +120,74 @@ class TestPeriodicContinuation:
 # ---------------------------------------------------------------------------
 # Criterion 2 — constant / intercept columns carry forward
 # ---------------------------------------------------------------------------
+
+
+class TestFourierContinuation:
+    """Fourier blocks continue past the training window, whatever the period (issue #146)."""
+
+    ANNUAL = {"columns": slice(1, 7), "period": 365.25, "order": 3}
+
+    def _z_train(self) -> np.ndarray:
+        terms = make_fourier_series(N_STEPS, period=365.25, order=3)
+        return np.concatenate([np.ones((N_STEPS, 1)), terms], axis=1)
+
+    def test_block_matches_long_array_slice(self):
+        out = build_forecast_design(self._z_train(), HORIZON, fourier=self.ANNUAL)
+        expected = make_fourier_series(N_STEPS + HORIZON, period=365.25, order=3)[N_STEPS:]
+        np.testing.assert_allclose(out[:, 0, 1:], expected, atol=0, rtol=0)
+        np.testing.assert_array_equal(out[:, 0, 0], 1.0)
+
+    def test_float32_training_rows_are_accepted(self):
+        out = build_forecast_design(self._z_train().astype(np.float32), HORIZON, fourier=self.ANNUAL)
+        assert out.shape == (HORIZON, 1, 7)
+
+    def test_multi_series_shares_the_block(self):
+        z_train = np.repeat(self._z_train()[:, None, :], 3, axis=1)
+        out = build_forecast_design(z_train, HORIZON, fourier=self.ANNUAL)
+        assert out.shape == (HORIZON, 3, 7)
+        np.testing.assert_array_equal(out[:, 0], out[:, 2])
+
+    def test_combines_with_periodic_blocks_and_covariates(self):
+        dummies = make_periodic_dummies(N_STEPS + HORIZON, PERIOD)
+        terms = make_fourier_series(N_STEPS + HORIZON, period=365.25, order=1)
+        covariate = np.arange(N_STEPS + HORIZON, dtype=float)[:, None]
+        z_train = np.concatenate([dummies, terms, covariate], axis=1)[:N_STEPS]
+        out = build_forecast_design(
+            z_train,
+            HORIZON,
+            periodic={"columns": slice(0, 6), "period": PERIOD},
+            fourier={"columns": [6, 7], "period": 365.25, "order": 1},
+            covariates_future=covariate[N_STEPS:],
+        )
+        np.testing.assert_allclose(out[:, 0], np.concatenate([dummies, terms, covariate], axis=1)[N_STEPS:])
+
+    def test_multiple_blocks(self):
+        terms = [make_fourier_series(N_STEPS + HORIZON, period=p, order=1) for p in (365.25, 30.5)]
+        out = build_forecast_design(
+            np.concatenate(terms, axis=1)[:N_STEPS],
+            HORIZON,
+            fourier=[
+                {"columns": [0, 1], "period": 365.25, "order": 1},
+                {"columns": [2, 3], "period": 30.5, "order": 1},
+            ],
+        )
+        np.testing.assert_allclose(out[:, 0], np.concatenate(terms, axis=1)[N_STEPS:])
+
+    def test_block_width_mismatch_raises(self):
+        with pytest.raises(ValueError, match="order 2 needs 4 columns"):
+            build_forecast_design(self._z_train(), HORIZON, fourier={**self.ANNUAL, "order": 2})
+
+    def test_wrong_period_raises(self):
+        with pytest.raises(ValueError, match="do not match Fourier terms"):
+            build_forecast_design(self._z_train(), HORIZON, fourier={**self.ANNUAL, "period": 7.0})
+
+    def test_without_the_block_the_terms_are_unknown(self):
+        with pytest.raises(ValueError, match="neither periodic, Fourier nor supplied"):
+            build_forecast_design(self._z_train(), HORIZON)
+
+    def test_bad_type_raises(self):
+        with pytest.raises(TypeError, match="fourier must be"):
+            build_forecast_design(self._z_train(), HORIZON, fourier=3)
 
 
 class TestConstantColumns:

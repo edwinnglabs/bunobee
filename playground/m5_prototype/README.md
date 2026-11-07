@@ -151,6 +151,8 @@ model, add an entry; `m5_run.py` needs no change.
 | `ssp_level_dow_yeojohnson_lognormal` | The same with soft log-normal priors | `sigma_h_prior=SigmaPrior("log_normal", (log(0.8), 0.5))`, `sigma_q_prior=SigmaPrior("log_normal", (log(0.02), 1.0))` |
 | `ssp_level_dow_halfnormal` | `ssp_level_dow` with the half-normal priors: on the log target it forecasts 23% high | As `ssp_level_dow_yeojohnson_halfnormal`, with the log transform |
 | `ssp_level_yeojohnson_halfnormal` | The default without weekday dummies: the level is its only state, so its forecast is flat. The day-of-week ablation (#145): 1.24187 on the full-run pre-validation window against the default's 0.79563 | `dow=False`, otherwise as `ssp_level_dow_yeojohnson_halfnormal` |
+| `ssp_level_dow_yeojohnson_halfnormal_calendar` | The default with annual Fourier terms of order 1, all events, month and day of month, 80 states. The covariates' coefficients are per series, zero-centered and fixed. Stage 1 of #143 (#146): 0.86564 on the full-run pre-validation window against the default's 0.79563, so it does not win | `covariates=CalendarCovariates(annual_order=1)`, `fit_chunk=1024`, otherwise as `ssp_level_dow_yeojohnson_halfnormal` |
+| `ssp_level_yeojohnson_halfnormal_calendar` | The same without weekday dummies, the day-of-week switch of that stage: 1.25187 on the 3,000-series sample, against 0.94682 with them | `dow=False`, otherwise as `ssp_level_dow_yeojohnson_halfnormal_calendar` |
 
 ## Reference results
 

@@ -12,7 +12,8 @@ are ``ssp_dow`` and ``ssp_level_dow`` with a Box-Cox or Yeo-Johnson transform; n
 An entry picks the priors of its noise and drifts with its ``sigma_h_prior`` and ``sigma_q_prior`` fields (issue
 #116); the prior entries are their base entries with other priors, and every other entry keeps the default ones.
 An entry turns the weekday dummies on or off with its ``dow`` field (issue #145): the level-only entry is the default
-entry without them.
+entry without them. An entry adds annual Fourier terms, events, month and day of month with its ``covariates`` field
+(issue #146): the calendar entries are the default and level-only entries with them.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -30,6 +31,7 @@ from types import ModuleType
 
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -70,7 +72,8 @@ m5_models = _load_script("m5_models")
 
 from bunobee.models.m5.transforms import LogTransform, PowerTransform  # noqa: E402
 from bunobee.models.ssp.kalman_1d import kalman_filter_1d  # noqa: E402
-from bunobee.regression import make_periodic_dummies  # noqa: E402
+from bunobee.models.ssp import build_forecast_design  # noqa: E402
+from bunobee.regression import make_fourier_series, make_periodic_dummies  # noqa: E402
 
 # Calendar: 8 fit weeks, then one 28-day forecast window. Day 0 is a Saturday (Mon=0), as d_1 is in M5.
 N_SERIES = 4
@@ -83,6 +86,16 @@ FORECAST_MASK = ~FIT_MASK
 
 # The default entry without its weekday dummies (issue #145).
 LEVEL_ONLY = "ssp_level_yeojohnson_halfnormal"
+
+# The default and level-only entries with the calendar covariates (issue #146).
+CALENDAR = "ssp_level_dow_yeojohnson_halfnormal_calendar"
+LEVEL_CALENDAR = "ssp_level_yeojohnson_halfnormal_calendar"
+
+# The calendar of the synthetic dataset starts on M5's d_1, so the fit days run to late March and the forecast days to
+# late April. Two distinct events fall on one day, and one event falls in the forecast days only.
+DATES = pd.date_range("2011-01-29", periods=N_DATES)
+EVENTS_1 = {"2011-02-06": "SuperBowl", "2011-02-14": "ValentinesDay", "2011-04-10": "Easter"}
+EVENTS_2 = {"2011-02-14": "SuperBowl"}
 
 
 @dataclass(frozen=True)
@@ -114,8 +127,14 @@ def ds() -> xr.Dataset:
         {
             "sales": (("series_id", "date"), sales),
             "day_of_week": ("date", dow.astype(np.int8)),
+            "day_of_month": ("date", DATES.day.to_numpy().astype(np.int8)),
+            "month_of_year": ("date", DATES.month.to_numpy().astype(np.int8)),
         },
-        coords={"series_id": [f"S_{i}" for i in range(N_SERIES)]},
+        coords={
+            "series_id": [f"S_{i}" for i in range(N_SERIES)],
+            "event_name_1": ("date", [EVENTS_1.get(str(day.date()), "") for day in DATES]),
+            "event_name_2": ("date", [EVENTS_2.get(str(day.date()), "") for day in DATES]),
+        },
     )
 
 
@@ -251,7 +270,10 @@ DEFAULT_PRIORS = {"sigma_h_prior": m5_models.SIGMA_H_PRIOR, "sigma_q_prior": m5_
 class TestPriors:
     """An entry picks the priors of its noise and drifts with its fields, by default the fitter's uniform priors."""
 
-    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in {*PRIOR_ENTRIES, LEVEL_ONLY}])
+    @pytest.mark.parametrize(
+        "name",
+        [name for name in m5_models.MODELS if name not in {*PRIOR_ENTRIES, LEVEL_ONLY, CALENDAR, LEVEL_CALENDAR}],
+    )
     def test_other_entries_keep_the_default_priors(self, name):
         model = m5_models.MODELS[name]
         assert (model.sigma_h_prior, model.sigma_q_prior) == tuple(DEFAULT_PRIORS.values())
@@ -365,7 +387,7 @@ class TestDayOfWeekSwitch:
         assert not model.dow
         assert replace(model, dow=True) == m5_models.MODELS[m5_models.DEFAULT_MODEL]
 
-    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name != LEVEL_ONLY])
+    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in {LEVEL_ONLY, LEVEL_CALENDAR}])
     def test_every_other_entry_keeps_the_weekday_dummies(self, name):
         assert m5_models.MODELS[name].dow
 
@@ -407,6 +429,173 @@ class TestDayOfWeekSwitch:
             series = {key: value[i] for key, value in fitted.items()}
             expected = transform.inverse(y - np.asarray(vt)[:, 0], np.asarray(Ft)[:, 0], series)
             np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
+
+
+class TestCalendarCovariates:
+    """The columns of ``CalendarCovariates``: annual Fourier terms, then events, then month and day of month."""
+
+    def test_columns_in_the_order_of_the_fields(self, ds):
+        design = m5_models.CalendarCovariates(annual_order=2).design(ds)
+        assert design.dtype == np.float32
+        assert design.shape == (N_DATES, 4 + 3 + 11 + 30)
+
+    def test_annual_terms_have_period_365_25_and_run_over_the_forecast_days(self, ds):
+        covariates = m5_models.CalendarCovariates(annual_order=2)
+        assert covariates.annual_period == 365.25
+        expected = make_fourier_series(N_DATES, period=365.25, order=2)
+        np.testing.assert_allclose(covariates.design(ds)[:, :4], expected, rtol=1e-6, atol=1e-7)
+
+    def test_annual_terms_continue_as_build_forecast_design_continues_them(self, ds):
+        design = m5_models.CalendarCovariates(annual_order=3, events=False, month=False, day_of_month=False).design(ds)
+        spec = {"columns": slice(None), "period": 365.25, "order": 3}
+        continued = build_forecast_design(design[FIT_MASK], HORIZON, fourier=spec)
+        np.testing.assert_allclose(design[FORECAST_MASK], continued[:, 0], rtol=1e-6, atol=1e-7)
+
+    def test_one_event_column_per_distinct_name_of_either_field(self, ds):
+        events = m5_models.CalendarCovariates(annual_order=0, month=False, day_of_month=False).design(ds)
+        assert events.shape == (N_DATES, 3)
+        by_name = dict(zip(("Easter", "SuperBowl", "ValentinesDay"), events.T))  # Sorted by name.
+        for name, column in by_name.items():
+            days = {day for day, event in (*EVENTS_1.items(), *EVENTS_2.items()) if event == name}
+            assert set(DATES[column == 1].strftime("%Y-%m-%d")) == days
+
+    def test_a_forecast_day_event_is_on_in_the_forecast_design(self, ds):
+        events = m5_models.CalendarCovariates(annual_order=0, month=False, day_of_month=False).design(ds)
+        assert events[FORECAST_MASK, 0].sum() == 1 and events[FIT_MASK, 0].sum() == 0
+
+    def test_fresh_dataset_nan_blanks_are_not_an_event(self, ds):
+        # m5_ds.nc holds "" on a day without an event, a dataset fresh from build_m5_dataset holds NaN.
+        nans = ds.assign_coords(
+            event_name_1=("date", np.array([name or np.nan for name in ds["event_name_1"].values], dtype=object)),
+            event_name_2=("date", np.array([name or np.nan for name in ds["event_name_2"].values], dtype=object)),
+        )
+        covariates = m5_models.CalendarCovariates(annual_order=0, month=False, day_of_month=False)
+        np.testing.assert_array_equal(covariates.design(nans), covariates.design(ds))
+
+    def test_month_columns_drop_january(self, ds):
+        month = m5_models.CalendarCovariates(annual_order=0, events=False, day_of_month=False).design(ds)
+        assert month.shape == (N_DATES, 11)
+        np.testing.assert_array_equal(month.sum(axis=1), (DATES.month != 1).astype(float))
+        np.testing.assert_array_equal(np.flatnonzero(month[DATES.month == 3][0]), [1])  # March is the second column.
+
+    def test_day_of_month_columns_drop_day_one(self, ds):
+        day = m5_models.CalendarCovariates(annual_order=0, events=False, month=False).design(ds)
+        assert day.shape == (N_DATES, 30)
+        np.testing.assert_array_equal(day.sum(axis=1), (DATES.day != 1).astype(float))
+        np.testing.assert_array_equal(np.flatnonzero(day[DATES.day == 31][0]), [29])
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"annual_order": -1}, {"annual_order": 0, "events": False, "month": False, "day_of_month": False}],
+    )
+    def test_invalid_settings_are_rejected(self, kwargs):
+        with pytest.raises(ValueError, match="annual_order|at least one"):
+            m5_models.CalendarCovariates(**kwargs)
+
+
+@pytest.fixture(scope="module", params=[CALENDAR, LEVEL_CALENDAR])
+def entry_fit(request, ds) -> tuple:
+    """A calendar entry, then its forecasts and fitted arrays of every synthetic series."""
+    model = replace(m5_models.MODELS[request.param], n_iter=20)
+    return (model, *model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK))
+
+
+class TestCalendarEntries:
+    """The calendar entries are the default and level-only entries with covariates that do not drift (issue #146)."""
+
+    @staticmethod
+    def _refilter(ds, fitted, model) -> tuple[np.ndarray, list[tuple]]:
+        """The full design of ``model`` and each series' ``(y, *kalman_filter_1d outputs)`` over the fit days."""
+        base = (
+            make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW, intercept=True)
+            if model.dow
+            else np.ones((N_DATES, 1), dtype=np.float32)
+        )
+        design = np.concatenate([base, model.covariates.design(ds)], axis=1)
+        Z = jnp.asarray(design[FIT_MASK])
+        sigma_q = np.zeros((N_SERIES, design.shape[1]), dtype=np.float32)
+        sigma_q[:, : fitted["sigma_q"].shape[1]] = fitted["sigma_q"]
+        sales = ds["sales"].values[:, FIT_MASK]
+        runs = []
+        for i in range(N_SERIES):
+            y = model.transform.forward(sales[i], {key: value[i] for key, value in fitted.items()})
+            outputs = kalman_filter_1d(
+                a0=jnp.zeros(Z.shape[1]),
+                P0=jnp.ones(Z.shape[1]),
+                Z=Z,
+                sigma_h=fitted["sigma_h"][i],
+                sigma_q=sigma_q[i],
+                y=jnp.asarray(y),
+            )
+            runs.append((y, *outputs))
+        return design, runs
+
+    def test_entries_differ_from_their_base_only_by_the_covariates(self):
+        for name, base in ((CALENDAR, m5_models.DEFAULT_MODEL), (LEVEL_CALENDAR, LEVEL_ONLY)):
+            model = m5_models.MODELS[name]
+            assert isinstance(model.covariates, m5_models.CalendarCovariates)
+            assert replace(model, covariates=None, fit_chunk=None) == m5_models.MODELS[base]
+
+    def test_the_two_entries_differ_only_by_the_switch(self):
+        assert m5_models.MODELS[CALENDAR].dow
+        assert not m5_models.MODELS[LEVEL_CALENDAR].dow
+        assert replace(m5_models.MODELS[CALENDAR], dow=False) == m5_models.MODELS[LEVEL_CALENDAR]
+
+    def test_entries_use_every_group_with_annual_terms_of_period_365_25(self):
+        covariates = m5_models.MODELS[CALENDAR].covariates
+        assert covariates.annual_order > 0 and covariates.annual_period == 365.25
+        assert covariates.events and covariates.month and covariates.day_of_month
+
+    def test_settings_record_the_covariates(self):
+        settings = json.loads(json.dumps(asdict(m5_models.MODELS[CALENDAR])))
+        assert settings["covariates"] == asdict(m5_models.MODELS[CALENDAR].covariates)
+        assert json.loads(json.dumps(asdict(m5_models.MODELS["ssp_dow"])))["covariates"] is None
+
+    def test_other_entries_have_no_covariates(self):
+        for name, model in m5_models.MODELS.items():
+            if name not in {CALENDAR, LEVEL_CALENDAR}:
+                assert model.covariates is None, name
+
+    def test_fitted_sigma_q_holds_the_drifting_states_only(self, entry_fit):
+        model, _, fitted = entry_fit
+        assert fitted["sigma_q"].shape == (N_SERIES, 7 if model.dow else 1)
+        assert np.all(fitted["sigma_q"] > 0)
+
+    def test_forecast_is_the_filtered_states_on_the_future_design(self, ds, entry_fit):
+        # Rerunning the filter with no drift on the covariates reproduces the forecast, so they are fixed in the fit
+        # and the forecast uses their columns over the forecast days.
+        model, forecasts, fitted = entry_fit
+        design, runs = self._refilter(ds, fitted, model)
+        for i, (_, _, at, Pt, _, _, _) in enumerate(runs):
+            mu = design[FORECAST_MASK] @ np.asarray(at)[-1]
+            var = design[FORECAST_MASK] ** 2 @ np.asarray(Pt)[-1] + fitted["sigma_h"][i] ** 2
+            series = {key: value[i] for key, value in fitted.items()}
+            np.testing.assert_allclose(forecasts[i], model.transform.inverse(mu, var, series), rtol=1e-3)
+
+    def test_insample_fit_is_the_filters_one_step_ahead_prediction(self, ds, entry_fit):
+        model, _, fitted = entry_fit
+        _, runs = self._refilter(ds, fitted, model)
+        for i, (y, _, _, _, vt, Ft, _) in enumerate(runs):
+            series = {key: value[i] for key, value in fitted.items()}
+            expected = model.transform.inverse(y - np.asarray(vt)[:, 0], np.asarray(Ft)[:, 0], series)
+            np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-3)
+
+    def test_coefficients_differ_per_series(self, ds, entry_fit):
+        model, _, fitted = entry_fit
+        _, runs = self._refilter(ds, fitted, model)
+        first_covariate = 7 if model.dow else 1
+        coefficients = np.stack([np.asarray(at)[-1, first_covariate:] for _, _, at, _, _, _, _ in runs])
+        assert np.unique(np.round(coefficients[:, 0], 4)).size == N_SERIES
+
+    def test_level_entry_forecast_is_not_flat(self, entry_fit):
+        # Without weekday dummies the level-only forecast is flat (issue #145), and the covariates are what moves it.
+        _, forecasts, _ = entry_fit
+        assert not np.allclose(forecasts, forecasts[:, [0]], rtol=1e-3)
+
+    def test_fit_chunk_changes_only_rounding(self, ds, entry_fit):
+        model, forecasts, _ = entry_fit
+        chunked, _ = replace(model, fit_chunk=3).fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        np.testing.assert_allclose(chunked, forecasts, rtol=1e-2)
 
 
 class TestInsample:

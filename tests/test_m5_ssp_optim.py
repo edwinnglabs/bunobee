@@ -8,6 +8,8 @@ series whose noise and drifts the default priors hold at a bound.
 
 The priors are a fitter argument, ``SigmaPrior``: the defaults are today's uniform bounds, and a half-normal or
 log-normal prior has no bound. The fit starts each sigma at its prior's mean.
+
+``fixed_states`` (issue #146) gives the states it names no drift, for covariates whose coefficients are fixed.
 """
 
 from __future__ import annotations
@@ -68,7 +70,7 @@ def _loss(sales, Z, sigma_h, sigma_q, sigma_h_prior, sigma_q_prior) -> np.ndarra
     log_prior = sigma_h_prior.distribution.log_prob(jnp.asarray(sigma_h)) + sigma_q_prior.distribution.log_prob(
         jnp.asarray(sigma_q[:, 0])
     )
-    if n_states > 1:
+    if n_states > 1 and np.any(sigma_q[:, 1:]):  # Without a state that uses it, the shared drift has no prior term.
         log_prior += sigma_q_prior.distribution.log_prob(jnp.asarray(sigma_q[:, 1]))
     return np.asarray(-(log_p + log_prior))
 
@@ -218,3 +220,77 @@ class TestPriors:
 
         _assert_inside(np.array([result["sigma_h"]]), priors["sigma_h_prior"])
         _assert_inside(result["sigma_q"], priors["sigma_q_prior"])
+
+
+# The level, one covariate that is on every other day, and one that is never on: the covariates do not drift.
+FIXED = np.array([False, True, True])
+
+
+@pytest.fixture(scope="module")
+def design() -> jnp.ndarray:
+    """The design of ``FIXED``, shape (N_FIT, 3)."""
+    return jnp.asarray(np.stack([np.ones(N_FIT), np.arange(N_FIT) % 2, np.zeros(N_FIT)], axis=1), dtype=jnp.float32)
+
+
+@pytest.fixture(scope="module")
+def result(sales, design) -> dict:
+    """A batch fit of the fixed series on ``design`` with its covariates fixed."""
+    return m5_ssp_optim.fit_batch_series_opt(sales, n_iter=50, Z=design, fixed_states=FIXED, **SOFT_PRIORS)
+
+
+class TestFixedStates:
+    """``fixed_states`` sets a state's drift to 0: its coefficient is per series, zero-centered and does not drift."""
+
+    def test_fixed_states_have_no_drift(self, result):
+        assert result["sigma_q"].shape == (LEVELS.size, 3)
+        assert np.all(result["sigma_q"][:, 0] > 0)
+        np.testing.assert_array_equal(result["sigma_q"][:, 1:], 0.0)
+
+    def test_fixed_state_variance_never_grows(self, result):
+        # With no drift the filter only ever shrinks the variance. A drifting state's would grow on its off days.
+        assert np.all(np.diff(result["Pt"][:, :, 1], axis=1) <= 0)
+
+    def test_coefficients_are_per_series_and_start_at_zero(self, result):
+        np.testing.assert_array_equal(result["a0"], 0.0)
+        np.testing.assert_array_equal(result["P0"], 1.0)
+        assert result["at"].shape == (LEVELS.size, N_FIT, 3)
+        assert np.unique(np.round(result["at"][:, -1, 1], 4)).size == LEVELS.size
+
+    def test_state_never_on_keeps_its_prior(self, result):
+        np.testing.assert_array_equal(result["at"][:, :, 2], 0.0)
+        np.testing.assert_array_equal(result["Pt"][:, :, 2], 1.0)
+
+    def test_no_fixed_state_is_the_default(self, sales, Z):
+        default = m5_ssp_optim.fit_batch_series_opt(sales, n_iter=20, Z=Z)
+        explicit = m5_ssp_optim.fit_batch_series_opt(sales, n_iter=20, Z=Z, fixed_states=np.zeros(7, dtype=bool))
+        for key in ("at", "Pt", "sigma_h", "sigma_q", "final_loss"):
+            np.testing.assert_array_equal(default[key], explicit[key])
+
+    def test_batch_loss_has_no_prior_for_a_drift_no_state_uses(self, sales, design, result):
+        # Only the level drifts here, so the shared drift has no state, as in a one-state fit: its parameter must not
+        # enter the loss, or it would change the step kept as the best.
+        loss = _loss(sales, design, result["sigma_h"], result["sigma_q"], *SOFT_PRIORS.values())
+        np.testing.assert_allclose(loss, result["final_loss"], rtol=1e-6)
+
+    def test_single_series_loss_has_no_prior_for_a_drift_no_state_uses(self, sales, design):
+        result = m5_ssp_optim.fit_one_series_opt(sales[0], n_iter=50, Z=design, fixed_states=FIXED, **SOFT_PRIORS)
+        np.testing.assert_array_equal(result["sigma_q"][1:], 0.0)
+        sigma_h = np.array([result["sigma_h"]], dtype=np.float32)
+        loss = _loss(sales[:1], design, sigma_h, result["sigma_q"][None], *SOFT_PRIORS.values())
+        np.testing.assert_allclose(loss, [result["final_loss"]], rtol=1e-6)
+
+    def test_a_shared_drift_with_fixed_states_keeps_its_prior(self, sales, Z):
+        # The weekdays still share a drift when covariates are added, so both drift priors stay in the loss.
+        design = jnp.concatenate([Z, jnp.ones((N_FIT, 1), dtype=jnp.float32)], axis=1)
+        fixed = np.array([False] * 7 + [True])
+        result = m5_ssp_optim.fit_batch_series_opt(sales, n_iter=50, Z=design, fixed_states=fixed, **SOFT_PRIORS)
+        assert np.all(result["sigma_q"][:, 1:7] > 0)
+        np.testing.assert_array_equal(result["sigma_q"][:, 7], 0.0)
+        loss = _loss(sales, design, result["sigma_h"], result["sigma_q"], *SOFT_PRIORS.values())
+        np.testing.assert_allclose(loss, result["final_loss"], rtol=1e-6)
+
+    @pytest.mark.parametrize("fit", ["fit_batch_series_opt", "fit_one_series_opt"])
+    def test_wrong_mask_shape_raises(self, sales, design, fit):
+        series = sales if fit == "fit_batch_series_opt" else sales[0]
+        with pytest.raises(ValueError, match=r"fixed_states must have shape \(3,\)"):
+            getattr(m5_ssp_optim, fit)(series, n_iter=1, Z=design, fixed_states=np.zeros(2, dtype=bool))

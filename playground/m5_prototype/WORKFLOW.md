@@ -686,6 +686,97 @@ The other windows, read once as the final check:
 **Decision:** the default stays `ssp_level_dow_yeojohnson_halfnormal`, and later stages keep day-of-week on unless
 their pre-validation score says otherwise. The level-only entry stays registered as the ablation baseline.
 
+### Annual and calendar covariates (#146)
+
+Stage 1 of the staged study in #143. `SspDow` has a new `covariates` field, a `CalendarCovariates`, which appends these
+columns to the level and weekday columns of `Z`:
+
+- **Annual Fourier terms:** period 365.25 days, `2 * annual_order` columns, from `make_fourier_series`. The columns
+  are built over the whole calendar, so they continue into the forecast days of every origin.
+  `build_forecast_design` now continues them too, through its `fourier` argument, and a test checks the two agree.
+- **Events:** one 0/1 column for each of the 30 distinct names in `event_name_1` and `event_name_2`.
+- **Month and day of month:** 0/1 columns with January and day 1 dropped, 11 and 30 columns.
+
+These columns are the same for every series, so one shared `Z` is enough. Each series still gets its own coefficients,
+which start at 0 under the filter's existing `N(0, 1)` prior. Their drift is 0: `fit_batch_series_opt` and
+`fit_one_series_opt` take a `fixed_states` mask, and a drift no state uses has no term in the loss. The level and weekday
+states drift as before. Two entries are registered, the default and the level-only entry with these covariates:
+`ssp_level_dow_yeojohnson_halfnormal_calendar` and `ssp_level_yeojohnson_halfnormal_calendar`. The `dow` field is the
+day-of-week switch.
+
+**The Fourier order is 1,** the best of six on the 3,000-series sample at the pre-validation origin. Every order scored
+worse than the default:
+
+| Annual order | States | Pre-validation WRMSSE, sample | Bias of the total |
+|---|---|---|---|
+| Default, no covariates | 7 | 0.82376 | +3.9% |
+| 0 | 78 | 0.99257 | +12.0% |
+| **1** | **80** | **0.94682** | **+10.4%** |
+| 2 | 82 | 0.97853 | +9.9% |
+| 3 | 84 | 1.11211 | +13.4% |
+| 5 | 88 | 1.20246 | +17.6% |
+| 10 | 98 | 1.12443 | +14.4% |
+
+Without day-of-week, the order 1 entry scores 1.25187 on the sample, against 1.17071 for the level-only entry.
+
+The full run of the order 1 entry, `20261106_220346`, fit all 30,490 series at all three origins and was run once. It was
+made at commit `2dbdcf4` with a clean tree; the changes after that commit are comments and documentation. That commit was
+squashed away and the run was made in a temporary worktree, so its directory and row are not in the main checkout's
+`output/`. `python m5_run.py --model ssp_level_dow_yeojohnson_halfnormal_calendar --n-demo 0` refits it. The default is
+`20261017_201617` (#118), not re-fitted: on the 3,000-series sample at commit `cbbac6d`, it reproduces its logged forecasts
+(`20261017_221204`) exactly.
+
+Per level on the pre-validation window, which decides, with a delta of the calendar entry minus the default
+(`m5_compare.py`):
+
+| Level | Default | Calendar | Delta |
+|---|---|---|---|
+| 1 Total | 0.5793 | 0.7637 | +0.1844 |
+| 2 State | 0.6463 | 0.7399 | +0.0936 |
+| 3 Store | 0.7024 | 0.8117 | +0.1093 |
+| 4 Category | 0.6704 | 0.8143 | +0.1439 |
+| 5 Department | 0.8856 | 0.8579 | −0.0277 |
+| 6 State × category | 0.7209 | 0.7960 | +0.0751 |
+| 7 State × department | 0.8744 | 0.8547 | −0.0197 |
+| 8 Store × category | 0.7776 | 0.8514 | +0.0738 |
+| 9 Store × department | 0.8903 | 0.9081 | +0.0178 |
+| 10 Item | 0.9558 | 1.0369 | +0.0811 |
+| 11 Item × state | 0.9350 | 0.9951 | +0.0600 |
+| 12 Item × store | 0.9096 | 0.9579 | +0.0483 |
+| WRMSSE | **0.79563** | 0.86564 | **+0.07000** |
+| Bias of the total | +4.4% | +9.3% | +4.9 points |
+
+The other windows, read once as the final check:
+
+| Window | Default | Calendar | Delta | Bias of the total |
+|---|---|---|---|---|
+| Validation (public) | 0.70891 | 0.75661 | +0.04770 | −1.3% to +4.7% |
+| Evaluation (private) | 0.79394 | 1.22796 | +0.43402 | +5.1% to +16.7% |
+
+- **The stage does not win:** +0.07000 on the pre-validation window. Departments (level 5) and state × department
+  (level 7) improve there, and every other level gets worse. On the validation and evaluation windows, every level gets
+  worse.
+- **The covariates raise the forecast totals:** by 4.9, 6.0 and 11.6 points on the three windows, on top of a default
+  that already runs high on two of them. Why they do is not established.
+- **The sample got the sign right:** +0.12307 on 3,000 series (0.82376 and 0.94682), against +0.07000 on the full run.
+- **Every group hurts on its own.** On the sample, against 0.82376: events alone score 0.87426, month 0.87880, day of
+  month 0.88752, and order 3 Fourier terms 1.36890. Events cost 0.05 even though the pre-validation forecast days hold
+  no event. The last fit day, d_1885, is Easter, which may be why: with its own state, Easter pulls the level down less.
+  The events-only total forecast is about 2% higher on every forecast day.
+- **Fixing the event, month and day-of-month coefficients is not what loses:** with order 1 Fourier terms fixed and those
+  three groups sharing the weekday drift, the sample scores 0.95484, against 0.94682 with all of them fixed.
+- **The diagonal filter explains part of it.** `kalman_filter_1d` keeps no covariance between states, so it cannot
+  separate a slow annual term from the level. A throwaway full-covariance filter, not committed, using the sigmas of the
+  default's fit, scored order 3 Fourier terms alone at 0.87065 on the sample, against the diagonal filter's 1.36890. It
+  did not rescue the covariates: all groups scored 1.00523 at order 1 and 1.02474 at order 3, against 0.82422 with none.
+  So stronger regularization (stage 4) has to address more than the filter's approximation. Its sigmas were not refitted,
+  so treat these numbers as a direction only.
+- **Cost:** the full run fits in 4,435 s against 799 s (about 1,480 s per origin), at an 11.5 GiB peak against 22.9 GiB,
+  because these entries fit in runs of `fit_chunk=1024` series.
+
+**Decision:** the default stays `ssp_level_dow_yeojohnson_halfnormal`. The two calendar entries stay registered as the
+baselines for the stage 2 notebook. Nothing was submitted to Kaggle.
+
 ## Working on the model
 
 ### Where the code is
@@ -694,8 +785,8 @@ their pre-validation score says otherwise. The level-only entry stays registered
 |---|---|
 | `src/bunobee/models/m5/m5_ssp_optim.py` | `fit_batch_series_opt`: the parameters, loss and optimizer. `SigmaPrior`: the priors of the noise and the drifts, which the fitter takes as arguments (by default `SIGMA_H_PRIOR` and `SIGMA_Q_PRIOR`). `predict_batch_series_opt`: the forecast, back-transformed by the fit's transform |
 | `src/bunobee/models/m5/transforms.py` | The target transforms: the `Transform` protocol (`fit` per-series parameters on the fit days, `forward`, and `inverse` with its bias correction), `LogTransform`, the default, and `PowerTransform`, a Box-Cox or Yeo-Johnson power fitted per series. A new transform goes here; an entry picks it with its `transform` field, without an edit of the fitter |
-| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `level`, `dow`, `transform`, `sigma_h_prior`, `sigma_q_prior`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
-| `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, the models' only inputs today |
+| `playground/m5_prototype/m5_models.py` | The registry `MODELS`. An entry's `fit_forecast` builds the model's inputs for one cutoff day (`SspDow` calls `make_periodic_dummies`) and calls the model. Settings such as `level`, `dow`, `transform`, `sigma_h_prior`, `sigma_q_prior`, `covariates`, `n_iter`, `lr` and `fit_chunk` are the entry's fields |
+| `src/bunobee/regression.py` | `make_periodic_dummies`, which builds the weekday dummies and the column of ones, and `make_fourier_series`, which builds the annual terms of `CalendarCovariates` |
 | `src/bunobee/models/ssp/kalman_1d.py` | `kalman_filter_1d`, the filter inside the loss |
 
 An entry's `fit_forecast(ds, series_idx, fit_mask, forecast_mask)` gets the whole dataset, the series to
@@ -754,9 +845,11 @@ drift.
   is +6 to +13% on validation and +24 to +48% on evaluation, and the item level scores 1.1193 on evaluation. On
   the sample the bias splits by volume: the low-volume tercile runs about 30% low and the high-volume one 9% high
   (see "Sigma priors and best-parameter tracking (#116)").
-- **Unused data:** `sell_price`, `snap`, events, day of month and month are in `m5_ds.nc` but not in `Z`.
-  New inputs are new columns of `Z`, so each becomes a state; `fit_batch_series_opt` gives every column
-  after the first the shared drift.
+- **Unused data:** `sell_price` and `snap` are in `m5_ds.nc` but not in `Z`, and events, day of month and month are
+  in `Z` only for the `_calendar` entries. New inputs are new columns of `Z`, so each becomes a state;
+  `fit_batch_series_opt` gives every column after the first the shared drift, unless `fixed_states` fixes it.
+- **Calendar covariates raise the totals:** the `_calendar` entries lose to the default on all three windows, and their
+  totals run 5 to 12 points higher (see "Annual and calendar covariates (#146)"). The cause is not established.
 - **No sharing between series:** each series is fitted on its own, which leaves sparse series with noisy
   parameters.
 
