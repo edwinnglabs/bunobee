@@ -8,7 +8,8 @@ function's deprecation note for the migration path.
 The fitters take the target transform as an argument (see :mod:`bunobee.models.m5.transforms`), by default
 :class:`~bunobee.models.m5.transforms.LogTransform`, and the predictors invert the transform a fit used. They take
 the priors of the noise and the drifts as arguments too (see :class:`SigmaPrior`), by default the uniform priors
-:data:`SIGMA_H_PRIOR` and :data:`SIGMA_Q_PRIOR`, and return the parameters of the lowest loss over their steps.
+:data:`SIGMA_H_PRIOR` and :data:`SIGMA_Q_PRIOR`, and return the parameters of the lowest loss over their steps. Their
+``fixed_states`` argument gives the states it names no drift, for covariates with fixed coefficients.
 
 This module drives the optimization-mode demo and is the only part of ``bunobee`` that
 needs ``optax`` and ``tqdm``. Those live behind the optional ``m5`` extra, so importing
@@ -114,6 +115,55 @@ def _softplus_inv(v: float) -> float:
     return float(np.log(np.expm1(float(v)) + 1e-12))
 
 
+def _drift_mask(n_states: int, fixed_states: np.ndarray | None) -> np.ndarray:
+    """Which states of a design drift, from the ``fixed_states`` argument of the MAP fitters.
+
+    Parameters
+    ----------
+    n_states : int
+        Number of states of the design.
+    fixed_states : np.ndarray | None
+        Boolean mask of shape ``(n_states,)``, True where a state's drift is 0. ``None`` fixes no state.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of shape ``(n_states,)``, True where a state drifts.
+
+    Raises
+    ------
+    ValueError
+        If ``fixed_states`` does not have shape ``(n_states,)``.
+    """
+    if fixed_states is None:
+        return np.ones(n_states, dtype=bool)
+    fixed = np.asarray(fixed_states, dtype=bool)
+    if fixed.shape != (n_states,):
+        raise ValueError(f"fixed_states must have shape ({n_states},), got {fixed.shape}")
+    return ~fixed
+
+
+def _state_drifts(sigma_q_first: jnp.ndarray, sigma_q_rest: jnp.ndarray, drifts: np.ndarray) -> jnp.ndarray:
+    """Per-state drifts: the first state's, then the one the other states share, and 0 on the fixed states.
+
+    Parameters
+    ----------
+    sigma_q_first, sigma_q_rest : jnp.ndarray
+        The two drifts, of shape ``()`` or ``(B,)``.
+    drifts : np.ndarray
+        Boolean mask of the states that drift (:func:`_drift_mask`), of shape ``(n_states,)``.
+
+    Returns
+    -------
+    jnp.ndarray
+        The drifts of shape ``(n_states,)`` or ``(B, n_states)``.
+    """
+    sigma_q = jnp.concatenate(
+        [sigma_q_first[..., None], jnp.repeat(sigma_q_rest[..., None], drifts.size - 1, axis=-1)], axis=-1
+    )
+    return sigma_q * drifts
+
+
 def fit_one_series_opt(
     sales: np.ndarray,
     n_iter: int = 500,
@@ -125,6 +175,7 @@ def fit_one_series_opt(
     transform: Transform = LogTransform(),
     sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR,
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
+    fixed_states: np.ndarray | None = None,
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model via MAP (Adam optimiser).
 
@@ -161,7 +212,11 @@ def fit_one_series_opt(
     sigma_q_prior : SigmaPrior
         Prior of each of the two drifts: the first state's and the one the other
         states share (with one state, of its drift alone). By default
-        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
+        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1). A drift no state uses has no prior term.
+    fixed_states : np.ndarray | None
+        Boolean mask of shape (n_states,), True for a state whose drift is 0: a fixed
+        coefficient, zero-centered by its ``a0 = 0``, ``P0 = 1`` Gaussian prior and
+        updated by the filter only. ``None``, the default, fixes no state.
 
     Returns
     -------
@@ -177,6 +232,7 @@ def fit_one_series_opt(
     y = jnp.array(transform.forward(sales, transform_params))
 
     n_states = Z.shape[1]
+    drifts = _drift_mask(n_states, fixed_states)
 
     a0 = jnp.zeros(n_states)
     P0 = jnp.ones(n_states)
@@ -185,12 +241,7 @@ def fit_one_series_opt(
         sigma_h = _softplus(params[0])
         sigma_q_level = _softplus(params[1])
         sigma_q_seas = _softplus(params[2])
-        sigma_q = jnp.concatenate(
-            [
-                sigma_q_level[None],
-                jnp.repeat(sigma_q_seas[None], n_states - 1),
-            ]
-        )
+        sigma_q = _state_drifts(sigma_q_level, sigma_q_seas, drifts)
 
         lp, _, _, _, _, _ = kalman_filter_1d(
             a0=a0,
@@ -202,8 +253,11 @@ def fit_one_series_opt(
             logp=True,
         )
 
-        log_prior = sigma_h_prior.distribution.log_prob(sigma_h) + sigma_q_prior.distribution.log_prob(sigma_q_level)
-        if n_states > 1:  # With one state there is no shared drift, so its parameter must not enter the loss.
+        log_prior = sigma_h_prior.distribution.log_prob(sigma_h)
+        # A drift no state uses must not enter the loss: the term would change which step is kept as the best.
+        if drifts[0]:
+            log_prior += sigma_q_prior.distribution.log_prob(sigma_q_level)
+        if drifts[1:].any():
             log_prior += sigma_q_prior.distribution.log_prob(sigma_q_seas)
         return -(lp + log_prior)
 
@@ -254,14 +308,7 @@ def fit_one_series_opt(
                 break
 
     sigma_h = float(_softplus(best_params[0]))
-    sigma_q_level = float(_softplus(best_params[1]))
-    sigma_q_seas = float(_softplus(best_params[2]))
-    sigma_q = jnp.concatenate(
-        [
-            jnp.array([sigma_q_level]),
-            jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1),
-        ]
-    )
+    sigma_q = _state_drifts(_softplus(best_params[1]), _softplus(best_params[2]), drifts)
 
     _, at, Pt, _, _, _ = kalman_filter_1d(
         a0=a0,
@@ -357,6 +404,7 @@ def fit_batch_series_opt(
     transform: Transform = LogTransform(),
     sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR,
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
+    fixed_states: np.ndarray | None = None,
 ) -> dict:
     """Fit a local-level + weekly-seasonality SSP model for B series in parallel.
 
@@ -392,7 +440,11 @@ def fit_batch_series_opt(
     sigma_q_prior : SigmaPrior
         Prior of each of the two drifts: the first state's and the one the other
         states share (with one state, of its drift alone). By default
-        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
+        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1). A drift no state uses has no prior term.
+    fixed_states : np.ndarray | None
+        Boolean mask of shape (n_states,), True for a state whose drift is 0: a fixed
+        coefficient, zero-centered by its ``a0 = 0``, ``P0 = 1`` Gaussian prior and
+        updated by the filter only. ``None``, the default, fixes no state.
 
     Returns
     -------
@@ -409,6 +461,7 @@ def fit_batch_series_opt(
     y = jnp.array(transform.forward(sales_matrix, transform_params))  # (B, n_steps)
 
     n_states = Z.shape[1]
+    drifts = _drift_mask(n_states, fixed_states)
     a0 = jnp.zeros(n_states)
     P0 = jnp.ones(n_states)
 
@@ -432,13 +485,7 @@ def fit_batch_series_opt(
         sigma_h = _softplus(params[:, 0])  # (B,)
         sigma_q_level = _softplus(params[:, 1])  # (B,)
         sigma_q_seas = _softplus(params[:, 2])  # (B,)
-        sigma_q = jnp.concatenate(
-            [
-                sigma_q_level[:, None],
-                jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
-            ],
-            axis=1,
-        )  # (B, n_states)
+        sigma_q = _state_drifts(sigma_q_level, sigma_q_seas, drifts)  # (B, n_states)
 
         log_p, _, _, _, _, _ = kalman_filter_1d_batch(
             a0=a0,
@@ -451,10 +498,11 @@ def fit_batch_series_opt(
             chunk_size=chunk_size,
         )
 
-        log_prior = sigma_h_prior.distribution.log_prob(sigma_h) + sigma_q_prior.distribution.log_prob(
-            sigma_q_level
-        )  # (B,)
-        if n_states > 1:  # With one state there is no shared drift, so its parameter must not enter the loss.
+        log_prior = sigma_h_prior.distribution.log_prob(sigma_h)  # (B,)
+        # A drift no state uses must not enter the loss: the term would change which step is kept as the best.
+        if drifts[0]:
+            log_prior += sigma_q_prior.distribution.log_prob(sigma_q_level)
+        if drifts[1:].any():
             log_prior += sigma_q_prior.distribution.log_prob(sigma_q_seas)
 
         per_series = -(log_p + log_prior)  # (B,)
@@ -493,15 +541,7 @@ def fit_batch_series_opt(
 
     # Recover MAP estimates from best params
     sigma_h = jnp.asarray(_softplus(best_params[:, 0]))
-    sigma_q_level = _softplus(best_params[:, 1])
-    sigma_q_seas = _softplus(best_params[:, 2])
-    sigma_q = jnp.concatenate(
-        [
-            sigma_q_level[:, None],
-            jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1),
-        ],
-        axis=1,
-    )
+    sigma_q = _state_drifts(_softplus(best_params[:, 1]), _softplus(best_params[:, 2]), drifts)
 
     # Final forward pass to get filtered states and diagonal covariances
     _, at, Pt, _, _, _ = kalman_filter_1d_batch(

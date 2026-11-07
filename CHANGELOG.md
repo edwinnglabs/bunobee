@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fixed_states` argument on `fit_one_series_opt` and `fit_batch_series_opt` — a boolean mask of states whose drift is
+  0, for covariates with fixed coefficients. A drift no state uses has no term in the loss. The default `None` leaves
+  the fit unchanged.
+- `fourier` argument on `build_forecast_design` — continues Fourier columns, as built by `make_fourier_series`, past
+  the training window. The block's width and training rows are validated as a `periodic` block's are.
 - `plot_prior_cross_sections` in `bunobee.models.ssp` — one state's Gaussian marginals at chosen timesteps as bell
   curves, overlaying several priors in each panel.
 - `get_coef_sign_fraction` in `bunobee.models.dlt` — per-regressor fraction of posterior coefficient samples

@@ -26,6 +26,8 @@ Coordinates on date
     event_name_1, event_type_1, event_name_2, event_type_2,
     snap_CA, snap_TX, snap_WI, split
 
+    The event fields hold "" in m5_ds.nc on a day without an event (NaN before the save).
+
     split : str — "train" (d_1–d_1913), "validation" (d_1914–d_1941),
                   "test"  (d_1942–d_1969)
 

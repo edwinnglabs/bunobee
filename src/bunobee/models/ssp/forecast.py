@@ -11,7 +11,7 @@ import xarray as xr
 from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.models.ssp.posterior import a_to_lam
-from bunobee.regression import make_periodic_dummies
+from bunobee.regression import make_fourier_series, make_periodic_dummies
 from bunobee.utils import flatten_front_dim
 
 logger = logging.getLogger("bunobee")
@@ -447,15 +447,15 @@ def _normalize_columns(columns, n_states: int) -> np.ndarray:
     return idx.astype(int)
 
 
-def _periodic_specs(periodic) -> list[Mapping]:
-    """Normalize the ``periodic`` argument into a list of block specs."""
-    if periodic is None:
+def _block_specs(blocks, name: str = "periodic") -> list[Mapping]:
+    """Normalize a ``periodic`` or ``fourier`` argument, named ``name``, into a list of block specs."""
+    if blocks is None:
         return []
-    if isinstance(periodic, Mapping):
-        return [periodic]
-    if isinstance(periodic, Sequence):
-        return list(periodic)
-    raise TypeError(f"periodic must be a mapping or a sequence of mappings; got {type(periodic).__name__}")
+    if isinstance(blocks, Mapping):
+        return [blocks]
+    if isinstance(blocks, Sequence):
+        return list(blocks)
+    raise TypeError(f"{name} must be a mapping or a sequence of mappings; got {type(blocks).__name__}")
 
 
 def _covariate_items(covariates_future, n_states: int) -> dict[int, np.ndarray]:
@@ -484,19 +484,23 @@ def build_forecast_design(
     horizon: int,
     *,
     periodic: Mapping | Sequence[Mapping] | None = None,
+    fourier: Mapping | Sequence[Mapping] | None = None,
     covariates_future: Mapping[int, np.ndarray] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Continue a training design matrix ``horizon`` steps past the end of the sample.
 
     Builds the ``Z_future`` argument that :func:`forecast_ssp` consumes. Every state
-    column of ``Z_train`` is resolved by exactly one of three rules:
+    column of ``Z_train`` is resolved by exactly one of four rules:
 
     1. **Periodic** — columns named by a ``periodic`` block are regenerated with
        ``make_periodic_dummies(n_steps + horizon, period)[n_steps:]``, so the cycle
        phase continues unbroken from the training window.
-    2. **Covariate** — columns supplied through ``covariates_future`` take the given
+    2. **Fourier** — columns named by a ``fourier`` block are regenerated with
+       ``make_fourier_series(n_steps + horizon, period, order)[n_steps:]``, so the terms
+       continue unbroken from the training window.
+    3. **Covariate** — columns supplied through ``covariates_future`` take the given
        future values.
-    3. **Constant** — any remaining column must be constant over training time (an
+    4. **Constant** — any remaining column must be constant over training time (an
        intercept, a per-series indicator, a static control); its value is carried
        forward. A remaining column that varies over time raises ``ValueError``,
        since its future path cannot be known.
@@ -524,6 +528,18 @@ def build_forecast_design(
         The block width must equal ``period - int(drop_first)`` and the training rows
         of the block must match the dummies implied by the spec, otherwise
         ``ValueError`` is raised.
+    fourier : mapping or sequence of mappings or None, optional
+        One spec per Fourier block, as built by ``make_fourier_series``. Keys:
+
+        ``"columns"``
+            Slice, integer sequence, or boolean mask selecting the block's columns.
+        ``"period"``
+            Cycle length, which need not be whole (e.g. 365.25 for annual terms on daily data).
+        ``"order"``
+            Number of harmonics. The block holds the ``order`` sines, then the ``order`` cosines.
+
+        The block width must equal ``2 * order`` and the training rows of the block must
+        match the terms implied by the spec, otherwise ``ValueError`` is raised.
     covariates_future : mapping or np.ndarray or None, optional
         Future values for time-varying non-periodic columns. As a mapping, keys are
         column positions and values broadcast to ``(horizon, n_series)``. As a plain
@@ -564,7 +580,7 @@ def build_forecast_design(
     Z_future = np.zeros((horizon, n_series, n_states), dtype=float)
     resolved = np.zeros(n_states, dtype=bool)
 
-    for spec in _periodic_specs(periodic):
+    for spec in _block_specs(periodic):
         period = int(spec["period"])
         drop_first = bool(spec.get("drop_first", True))
         cols = _normalize_columns(spec["columns"], n_states)
@@ -585,6 +601,20 @@ def build_forecast_design(
         Z_future[:, :, cols] = dummies[n_steps:][:, None, :]
         resolved[cols] = True
 
+    for spec in _block_specs(fourier, "fourier"):
+        period, order = float(spec["period"]), int(spec["order"])
+        cols = _normalize_columns(spec["columns"], n_states)
+        if cols.size != 2 * order:
+            raise ValueError(f"fourier block with order {order} needs {2 * order} columns; got {cols.size}")
+        terms = make_fourier_series(n_steps + horizon, period=period, order=order)
+        if not np.allclose(Z_train[:, :, cols], terms[:n_steps][:, None, :]):
+            raise ValueError(
+                f"columns {cols.tolist()} of Z_train do not match Fourier terms with period {period} and order "
+                f"{order}; check the column selection and the phase"
+            )
+        Z_future[:, :, cols] = terms[n_steps:][:, None, :]
+        resolved[cols] = True
+
     for col, values in _covariate_items(covariates_future, n_states).items():
         values = np.asarray(values, dtype=float)
         if values.ndim == 0 or values.shape[0] != horizon:
@@ -603,7 +633,7 @@ def build_forecast_design(
         block = Z_train[:, :, col]
         if not np.allclose(block, block[0]):
             raise ValueError(
-                f"column {col} of Z_train varies over time but is neither periodic nor supplied through "
+                f"column {col} of Z_train varies over time but is neither periodic, Fourier nor supplied through "
                 "covariates_future; its future path is unknown"
             )
         Z_future[:, :, col] = block[0]

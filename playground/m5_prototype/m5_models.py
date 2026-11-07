@@ -14,7 +14,9 @@ noise and drifts the same way, with its ``sigma_h_prior`` and ``sigma_q_prior`` 
 ``bunobee.models.m5.m5_ssp_optim.SigmaPrior`` each): the ``*_wide``, ``*_halfnormal`` and ``*_lognormal`` entries
 swap the default uniform priors, set for the log target, for wider or soft ones (issue #116). It turns the weekday
 dummies on or off with its ``dow`` field: ``ssp_level_yeojohnson_halfnormal`` is the default entry without them
-(issue #145).
+(issue #145). It adds annual Fourier terms, events, month and day of month with its ``covariates`` field (a
+:class:`CalendarCovariates`): the ``*_calendar`` entries are the default entry and the level-only entry with them
+(issue #146).
 """
 
 from __future__ import annotations
@@ -36,13 +38,16 @@ from bunobee.models.m5.m5_ssp_optim import (
     predict_batch_series_opt,
 )
 from bunobee.models.m5.transforms import LogTransform, PowerTransform, Transform
-from bunobee.regression import make_periodic_dummies
+from bunobee.regression import make_fourier_series, make_periodic_dummies
 
 logger = logging.getLogger(__name__)
 
 #: Optional key of a model's ``fitted`` output: its in-sample fit of every fit day, in units, of shape
 #: ``(len(series_idx), fit_mask.sum())``. ``m5_run.py`` draws it in ``forecasts.pdf`` instead of saving it.
 INSAMPLE_KEY = "insample"
+
+#: Period of the annual Fourier terms, in days.
+ANNUAL_PERIOD = 365.25
 
 
 class Model(Protocol):
@@ -119,6 +124,93 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
 
 
 @dataclass(frozen=True)
+class CalendarCovariates:
+    """Calendar columns of an SSP design: annual Fourier terms, events, month and day of month.
+
+    Every series shares these columns, so the design matrix ``Z`` holds them for all series, and each series gets its
+    own coefficients. :class:`SspDow` fixes those coefficients: they do not drift, and their prior is the filter's
+    ``N(0, 1)``, zero-centered. All columns are known in advance over the forecast days, so nothing here looks ahead:
+    the same columns are built from the whole calendar at every forecast origin.
+
+    Parameters
+    ----------
+    annual_order : int
+        Harmonics of the annual Fourier terms, which take ``2 * annual_order`` columns. 0 leaves them out.
+    annual_period : float
+        Period of the annual Fourier terms in days, by default :data:`ANNUAL_PERIOD`.
+    events : bool
+        Include one 0/1 column per distinct name in ``event_name_1`` and ``event_name_2``, by default True. A day with
+        two events is 1 in both columns.
+    month : bool
+        Include 0/1 columns for February to December, with January dropped, by default True.
+    day_of_month : bool
+        Include 0/1 columns for days 2 to 31 of the month, with day 1 dropped, by default True.
+
+    Raises
+    ------
+    ValueError
+        If ``annual_order`` is negative or no column is left.
+    """
+
+    annual_order: int
+    annual_period: float = ANNUAL_PERIOD
+    events: bool = True
+    month: bool = True
+    day_of_month: bool = True
+
+    def __post_init__(self) -> None:
+        if self.annual_order < 0:
+            raise ValueError(f"annual_order must be non-negative, got {self.annual_order}")
+        if not (self.annual_order or self.events or self.month or self.day_of_month):
+            raise ValueError("CalendarCovariates needs at least one group of columns.")
+
+    def design(self, ds: xr.Dataset) -> np.ndarray:
+        """Build the columns over every day of the dataset, in the order of the fields.
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            The preprocessed M5 dataset.
+
+        Returns
+        -------
+        np.ndarray
+            Float32 array of shape ``(n_dates, n_covariates)``.
+        """
+        n_dates = ds.sizes["date"]
+        blocks = []
+        if self.annual_order:
+            # Step 0 is the first day of the calendar, so the terms carry on over the forecast days of every origin.
+            blocks.append(make_fourier_series(n_dates, period=self.annual_period, order=self.annual_order))
+        if self.events:
+            blocks.append(_event_columns(ds))
+        if self.month:
+            blocks.append(np.eye(12)[ds["month_of_year"].values.astype(int) - 1][:, 1:])
+        if self.day_of_month:
+            blocks.append(np.eye(31)[ds["day_of_month"].values.astype(int) - 1][:, 1:])
+        return np.concatenate(blocks, axis=1).astype(np.float32)
+
+
+def _event_columns(ds: xr.Dataset) -> np.ndarray:
+    """One 0/1 column per distinct event name of the calendar, in sorted order of the names.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset with ``event_name_1`` and ``event_name_2`` along ``date``. A day without an event holds ``""``, as
+        ``m5_ds.nc`` does, or NaN, as a dataset fresh from ``m5_preprocess.build_m5_dataset`` does.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array of shape ``(n_dates, n_events)``.
+    """
+    first, second = (ds[name].values.astype(str) for name in ("event_name_1", "event_name_2"))
+    names = np.setdiff1d(np.concatenate([first, second]), ["", "nan"])
+    return np.stack([(first == name) | (second == name) for name in names], axis=1)
+
+
+@dataclass(frozen=True)
 class SspDow:
     """Weekday-dummy SSP fitted by MAP: ``fit_batch_series_opt`` with ``predict_batch_series_opt``.
 
@@ -129,7 +221,9 @@ class SspDow:
     series' fit-window mean (see ``WORKFLOW.md``, "Known problems"). With ``level`` a column of ones leads
     the matrix: its state is the local level, which ``fit_batch_series_opt`` gives its own drift, and the
     weekday states are offsets from Monday that share the other drift. Without ``dow`` the weekday columns are
-    left out, so the level is the only state and a series' forecast is the same on every forecast day.
+    left out, so the level is the only state and a series' forecast is the same on every forecast day. With
+    ``covariates`` their columns close the matrix, each a state with no drift, so ``fit_batch_series_opt`` updates
+    it by the filter alone. The series' forecast then moves with them over the forecast days, with or without ``dow``.
 
     Parameters
     ----------
@@ -145,6 +239,8 @@ class SspDow:
         Prior of the noise ``sigma_h``, by default ``SIGMA_H_PRIOR``, U(0.1, 0.5), set for the log target.
     sigma_q_prior : SigmaPrior
         Prior of each drift, by default ``SIGMA_Q_PRIOR``, U(0.01, 0.1), set for the log target.
+    covariates : CalendarCovariates | None
+        Calendar columns to add to the design matrix, by default None.
     n_iter : int
         Adam optimisation steps per fit run, by default 100.
     lr : float
@@ -167,6 +263,7 @@ class SspDow:
     transform: Transform = LogTransform()
     sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR
+    covariates: CalendarCovariates | None = None
     n_iter: int = 100
     lr: float = 3e-2
     chunk_size: int | None = 4096
@@ -200,7 +297,8 @@ class SspDow:
 
         See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds the outputs of
         ``fit_batch_series_opt`` but the :attr:`DROPPED_KEYS` and, under :data:`INSAMPLE_KEY`, the
-        one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`).
+        one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`). Its ``sigma_q`` holds the drifting
+        states only: the level and the weekdays, whatever the ``covariates``.
         """
         weekday = ds["day_of_week"].values
         if self.dow:
@@ -209,7 +307,13 @@ class SspDow:
             design = make_periodic_dummies(weekday.size, period=7, phase=int(weekday[0]), intercept=self.level)
         else:
             design = np.ones((weekday.size, 1), dtype=np.float32)  # __post_init__ ensures this is the level
-        Z = jnp.asarray(design[fit_mask])  # (n_fit_steps, n_states): 6 states, 7 with the level, or the level alone
+        fixed_states = None
+        n_drifting = design.shape[1]  # 6 states, 7 with the level, or the level alone
+        if self.covariates is not None:
+            columns = self.covariates.design(ds)
+            design = np.concatenate([design, columns], axis=1)
+            fixed_states = np.arange(design.shape[1]) >= n_drifting
+        Z = jnp.asarray(design[fit_mask])  # (n_fit_steps, n_states)
         Z_future = jnp.asarray(design[forecast_mask])  # (horizon, n_states)
         sales = ds["sales"].values[series_idx][:, fit_mask]  # (n_series, n_fit_steps)
 
@@ -233,7 +337,9 @@ class SspDow:
                 transform=self.transform,
                 sigma_h_prior=self.sigma_h_prior,
                 sigma_q_prior=self.sigma_q_prior,
+                fixed_states=fixed_states,
             )
+            result["sigma_q"] = result["sigma_q"][:, :n_drifting]
             forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
             for key, value in result.items():
                 if key not in self.DROPPED_KEYS:
@@ -259,11 +365,18 @@ LOG_NORMAL_PRIORS = {
     "sigma_q_prior": SigmaPrior("log_normal", (math.log(0.02), 1.0)),
 }
 
+#: The stage 1 covariates of #143 (issue #146). ``annual_order`` is the Fourier order chosen on the 3,000-series sample
+#: (see ``WORKFLOW.md``, "Annual and calendar covariates (#146)"). A design this wide needs ``fit_chunk`` to bound the
+#: memory of the backward pass, which grows with the number of states.
+CALENDAR_COVARIATES = CalendarCovariates(annual_order=1)
+CALENDAR_FIT_CHUNK = 1024
+
 #: Registered models by name, the choices of ``m5_run.py --model``. The power-transform entries fit Box-Cox of
 #: ``sales + 0.5`` (``boxcox_shift``), Box-Cox of ``max(sales, 0.1)`` (``boxcox_floor``) and Yeo-Johnson, which on
 #: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state. The ``_wide``,
 #: ``_halfnormal`` and ``_lognormal`` entries swap the default sigma priors for those above.
 #: ``ssp_level_yeojohnson_halfnormal`` is the default entry without its weekday dummies: the day-of-week ablation.
+#: The ``_calendar`` entries are the default and level-only entries with ``CALENDAR_COVARIATES``.
 MODELS: dict[str, Model] = {
     "ssp_dow": SspDow(),
     "ssp_level_dow": SspDow(level=True),
@@ -283,6 +396,21 @@ MODELS: dict[str, Model] = {
     "ssp_level_dow_halfnormal": SspDow(level=True, **HALF_NORMAL_PRIORS),
     "ssp_level_yeojohnson_halfnormal": SspDow(
         level=True, dow=False, transform=PowerTransform("yeo-johnson"), **HALF_NORMAL_PRIORS
+    ),
+    "ssp_level_dow_yeojohnson_halfnormal_calendar": SspDow(
+        level=True,
+        transform=PowerTransform("yeo-johnson"),
+        covariates=CALENDAR_COVARIATES,
+        fit_chunk=CALENDAR_FIT_CHUNK,
+        **HALF_NORMAL_PRIORS,
+    ),
+    "ssp_level_yeojohnson_halfnormal_calendar": SspDow(
+        level=True,
+        dow=False,
+        transform=PowerTransform("yeo-johnson"),
+        covariates=CALENDAR_COVARIATES,
+        fit_chunk=CALENDAR_FIT_CHUNK,
+        **HALF_NORMAL_PRIORS,
     ),
 }
 
