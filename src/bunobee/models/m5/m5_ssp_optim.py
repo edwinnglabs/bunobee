@@ -160,7 +160,8 @@ def fit_one_series_opt(
         U(0.1, 0.5).
     sigma_q_prior : SigmaPrior
         Prior of each of the two drifts: the first state's and the one the other
-        states share. By default :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
+        states share (with one state, of its drift alone). By default
+        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
 
     Returns
     -------
@@ -201,11 +202,9 @@ def fit_one_series_opt(
             logp=True,
         )
 
-        log_prior = (
-            sigma_h_prior.distribution.log_prob(sigma_h)
-            + sigma_q_prior.distribution.log_prob(sigma_q_level)
-            + sigma_q_prior.distribution.log_prob(sigma_q_seas)
-        )
+        log_prior = sigma_h_prior.distribution.log_prob(sigma_h) + sigma_q_prior.distribution.log_prob(sigma_q_level)
+        if n_states > 1:  # With one state there is no shared drift, so its parameter must not enter the loss.
+            log_prior += sigma_q_prior.distribution.log_prob(sigma_q_seas)
         return -(lp + log_prior)
 
     # Each sigma starts at its prior's mean: for the default priors, the midpoints of U(0.1, 0.5) and U(0.01, 0.1).
@@ -392,7 +391,8 @@ def fit_batch_series_opt(
         U(0.1, 0.5).
     sigma_q_prior : SigmaPrior
         Prior of each of the two drifts: the first state's and the one the other
-        states share. By default :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
+        states share (with one state, of its drift alone). By default
+        :data:`SIGMA_Q_PRIOR`, U(0.01, 0.1).
 
     Returns
     -------
@@ -451,11 +451,11 @@ def fit_batch_series_opt(
             chunk_size=chunk_size,
         )
 
-        log_prior = (
-            sigma_h_prior.distribution.log_prob(sigma_h)
-            + sigma_q_prior.distribution.log_prob(sigma_q_level)
-            + sigma_q_prior.distribution.log_prob(sigma_q_seas)
+        log_prior = sigma_h_prior.distribution.log_prob(sigma_h) + sigma_q_prior.distribution.log_prob(
+            sigma_q_level
         )  # (B,)
+        if n_states > 1:  # With one state there is no shared drift, so its parameter must not enter the loss.
+            log_prior += sigma_q_prior.distribution.log_prob(sigma_q_seas)
 
         per_series = -(log_p + log_prior)  # (B,)
         return jnp.sum(per_series), per_series

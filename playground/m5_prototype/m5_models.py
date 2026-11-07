@@ -12,7 +12,9 @@ transform needs only a new entry, not an edit of the fitter: the ``*_boxcox_*`` 
 ``ssp_dow`` and ``ssp_level_dow`` with a power transform fitted per series (issue #115). It picks the priors of its
 noise and drifts the same way, with its ``sigma_h_prior`` and ``sigma_q_prior`` fields (a
 ``bunobee.models.m5.m5_ssp_optim.SigmaPrior`` each): the ``*_wide``, ``*_halfnormal`` and ``*_lognormal`` entries
-swap the default uniform priors, set for the log target, for wider or soft ones (issue #116).
+swap the default uniform priors, set for the log target, for wider or soft ones (issue #116). It turns the weekday
+dummies on or off with its ``dow`` field: ``ssp_level_yeojohnson_halfnormal`` is the default entry without them
+(issue #145).
 """
 
 from __future__ import annotations
@@ -126,12 +128,16 @@ class SspDow:
     ``level`` there is no column of ones, so Monday rows are all zero and every Monday forecast is the
     series' fit-window mean (see ``WORKFLOW.md``, "Known problems"). With ``level`` a column of ones leads
     the matrix: its state is the local level, which ``fit_batch_series_opt`` gives its own drift, and the
-    weekday states are offsets from Monday that share the other drift.
+    weekday states are offsets from Monday that share the other drift. Without ``dow`` the weekday columns are
+    left out, so the level is the only state and a series' forecast is the same on every forecast day.
 
     Parameters
     ----------
     level : bool
         Lead the design matrix with a column of ones, the level state, by default False.
+    dow : bool
+        Include the weekday columns, by default True. ``dow=False`` needs ``level=True``, as there would be no
+        states otherwise.
     transform : Transform
         Target transform of ``fit_batch_series_opt``, by default ``LogTransform()``: each series is fitted to
         ``log(max(sales, 0.1) / mean)`` and its forecasts are inverted as lognormal means.
@@ -149,9 +155,15 @@ class SspDow:
     fit_chunk : int | None
         Max series per fit run, so peak memory scales with ``fit_chunk`` rather than with the number of
         series. ``None`` = one run over all series. Default None.
+
+    Raises
+    ------
+    ValueError
+        If both ``level`` and ``dow`` are False.
     """
 
     level: bool = False
+    dow: bool = True
     transform: Transform = LogTransform()
     sigma_h_prior: SigmaPrior = SIGMA_H_PRIOR
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR
@@ -165,6 +177,10 @@ class SspDow:
     #: The rest are per series (``sigma_h``, ``sigma_q``, ``final_loss`` and the transform's parameters, e.g.
     #: ``response_norm``), so the parameters of any transform are returned.
     DROPPED_KEYS = ("at", "Pt", "Z", "a0", "P0", "transform")
+
+    def __post_init__(self) -> None:
+        if not (self.level or self.dow):
+            raise ValueError("SspDow needs level=True or dow=True: with neither, the design matrix has no columns.")
 
     def fit_forecast(
         self,
@@ -186,12 +202,15 @@ class SspDow:
         ``fit_batch_series_opt`` but the :attr:`DROPPED_KEYS` and, under :data:`INSAMPLE_KEY`, the
         one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`).
         """
-        # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
-        # each dummy column a weekday from Tuesday to Sunday on every day, with Monday dropped.
-        dow = ds["day_of_week"].values
-        weekly = make_periodic_dummies(dow.size, period=7, phase=int(dow[0]), intercept=self.level)
-        Z = jnp.asarray(weekly[fit_mask])  # (n_fit_steps, n_states): 6 states, or 7 with the level
-        Z_future = jnp.asarray(weekly[forecast_mask])  # (horizon, n_states)
+        weekday = ds["day_of_week"].values
+        if self.dow:
+            # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
+            # each dummy column a weekday from Tuesday to Sunday on every day, with Monday dropped.
+            design = make_periodic_dummies(weekday.size, period=7, phase=int(weekday[0]), intercept=self.level)
+        else:
+            design = np.ones((weekday.size, 1), dtype=np.float32)  # __post_init__ ensures this is the level
+        Z = jnp.asarray(design[fit_mask])  # (n_fit_steps, n_states): 6 states, 7 with the level, or the level alone
+        Z_future = jnp.asarray(design[forecast_mask])  # (horizon, n_states)
         sales = ds["sales"].values[series_idx][:, fit_mask]  # (n_series, n_fit_steps)
 
         n_series = sales.shape[0]
@@ -244,6 +263,7 @@ LOG_NORMAL_PRIORS = {
 #: ``sales + 0.5`` (``boxcox_shift``), Box-Cox of ``max(sales, 0.1)`` (``boxcox_floor``) and Yeo-Johnson, which on
 #: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state. The ``_wide``,
 #: ``_halfnormal`` and ``_lognormal`` entries swap the default sigma priors for those above.
+#: ``ssp_level_yeojohnson_halfnormal`` is the default entry without its weekday dummies: the day-of-week ablation.
 MODELS: dict[str, Model] = {
     "ssp_dow": SspDow(),
     "ssp_level_dow": SspDow(level=True),
@@ -261,6 +281,9 @@ MODELS: dict[str, Model] = {
         level=True, transform=PowerTransform("yeo-johnson"), **LOG_NORMAL_PRIORS
     ),
     "ssp_level_dow_halfnormal": SspDow(level=True, **HALF_NORMAL_PRIORS),
+    "ssp_level_yeojohnson_halfnormal": SspDow(
+        level=True, dow=False, transform=PowerTransform("yeo-johnson"), **HALF_NORMAL_PRIORS
+    ),
 }
 
 #: ``m5_run.py``'s default ``--model``: the best entry on the full run at all three origins and on Kaggle (issue

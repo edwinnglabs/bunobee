@@ -141,7 +141,7 @@ model, add an entry; `m5_run.py` needs no change.
 
 | Entry | Model | Settings |
 |---|---|---|
-| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The baseline, the default until #118, and the model of the #93 and #94 Kaggle submissions | `level=False`, `transform=LogTransform()`, `sigma_h_prior=SIGMA_H_PRIOR` (U(0.1, 0.5)), `sigma_q_prior=SIGMA_Q_PRIOR` (U(0.01, 0.1)), `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
+| `ssp_dow` | Weekday dummies from Tuesday to Sunday, no level state; MAP fit by Adam. The baseline, the default until #118, and the model of the #93 and #94 Kaggle submissions | `level=False`, `dow=True`, `transform=LogTransform()`, `sigma_h_prior=SIGMA_H_PRIOR` (U(0.1, 0.5)), `sigma_q_prior=SIGMA_Q_PRIOR` (U(0.01, 0.1)), `n_iter=100`, `lr=0.03`, `chunk_size=4096`, `fit_chunk=None` |
 | `ssp_level_dow` | `ssp_dow` with a level state: a column of ones leads the weekday dummies, so 7 states (#106) | `level=True`, otherwise as `ssp_dow` |
 | `ssp_dow_boxcox_shift`, `ssp_level_dow_boxcox_shift` | `ssp_dow`, `ssp_level_dow` fitted to a Box-Cox power of `sales + 0.5`, λ fitted per series (#115) | `transform=PowerTransform("box-cox", shift=0.5)` |
 | `ssp_dow_boxcox_floor`, `ssp_level_dow_boxcox_floor` | The same with Box-Cox of `max(sales, 0.1)` | `transform=PowerTransform("box-cox", floor=0.1)` |
@@ -150,6 +150,7 @@ model, add an entry; `m5_run.py` needs no change.
 | `ssp_level_dow_yeojohnson_halfnormal` | The same with soft half-normal priors, no bound. The default since #118: best on the 3,000-series sample (0.74610), on the full run at all three origins and on Kaggle (0.70888 public, 0.79394 private) | `sigma_h_prior=SigmaPrior("half_normal", (1.0,))`, `sigma_q_prior=SigmaPrior("half_normal", (0.05,))` |
 | `ssp_level_dow_yeojohnson_lognormal` | The same with soft log-normal priors | `sigma_h_prior=SigmaPrior("log_normal", (log(0.8), 0.5))`, `sigma_q_prior=SigmaPrior("log_normal", (log(0.02), 1.0))` |
 | `ssp_level_dow_halfnormal` | `ssp_level_dow` with the half-normal priors: on the log target it forecasts 23% high | As `ssp_level_dow_yeojohnson_halfnormal`, with the log transform |
+| `ssp_level_yeojohnson_halfnormal` | The default without weekday dummies: the level is its only state, so its forecast is flat. The day-of-week ablation (#145): 1.24187 on the full-run pre-validation window against the default's 0.79563 | `dow=False`, otherwise as `ssp_level_dow_yeojohnson_halfnormal` |
 
 ## Reference results
 

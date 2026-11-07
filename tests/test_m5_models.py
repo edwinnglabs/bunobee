@@ -11,6 +11,8 @@ so a transform the fitter has never seen is tried without editing it. The power-
 are ``ssp_dow`` and ``ssp_level_dow`` with a Box-Cox or Yeo-Johnson transform; no entry forecasts negative sales.
 An entry picks the priors of its noise and drifts with its ``sigma_h_prior`` and ``sigma_q_prior`` fields (issue
 #116); the prior entries are their base entries with other priors, and every other entry keeps the default ones.
+An entry turns the weekday dummies on or off with its ``dow`` field (issue #145): the level-only entry is the default
+entry without them.
 
 Every test fits a tiny synthetic dataset built in this module, so none needs the raw M5 data. The registry
 is a playground script, not part of the package, so it is loaded by path as ``tests/test_m5_score.py``
@@ -78,6 +80,9 @@ N_DATES = N_FIT + HORIZON
 FIRST_DOW = 5
 FIT_MASK = np.arange(N_DATES) < N_FIT
 FORECAST_MASK = ~FIT_MASK
+
+# The default entry without its weekday dummies (issue #145).
+LEVEL_ONLY = "ssp_level_yeojohnson_halfnormal"
 
 
 @dataclass(frozen=True)
@@ -148,7 +153,16 @@ def level_yeojohnson_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
 
 
-def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transform=LogTransform()) -> list[tuple]:
+@pytest.fixture(scope="module")
+def level_only_fit(ds) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The registered level-only entry's forecasts and fitted arrays of every synthetic series."""
+    model = replace(m5_models.MODELS[LEVEL_ONLY], n_iter=20)
+    return model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+
+
+def _refilter(
+    ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transform=LogTransform(), dow: bool = True
+) -> list[tuple]:
     """Rerun each synthetic series' Kalman filter on its fit days with the series' fitted parameters.
 
     Parameters
@@ -161,6 +175,9 @@ def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transf
         Whether the fit's design matrix was led by a column of ones (``SspDow.level``).
     transform : Transform
         The fit's target transform (``SspDow.transform``), by default the log transform.
+    dow : bool
+        Whether the fit's design matrix had the weekday columns (``SspDow.dow``), by default True. Without them
+        it is the column of ones alone.
 
     Returns
     -------
@@ -168,7 +185,10 @@ def _refilter(ds: xr.Dataset, fitted: dict[str, np.ndarray], level: bool, transf
         Per series, its transformed sales ``y`` followed by the six outputs of ``kalman_filter_1d``:
         ``(y, log_p, at, Pt, vt, Ft, Kt)``.
     """
-    Z = jnp.asarray(make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW, intercept=level)[FIT_MASK])
+    design = (
+        make_periodic_dummies(N_DATES, period=7, phase=FIRST_DOW, intercept=level) if dow else np.ones((N_DATES, 1))
+    )
+    Z = jnp.asarray(design[FIT_MASK], dtype=jnp.float32)
     sales = ds["sales"].values[:, FIT_MASK]
     runs = []
     for i in range(N_SERIES):
@@ -231,7 +251,7 @@ DEFAULT_PRIORS = {"sigma_h_prior": m5_models.SIGMA_H_PRIOR, "sigma_q_prior": m5_
 class TestPriors:
     """An entry picks the priors of its noise and drifts with its fields, by default the fitter's uniform priors."""
 
-    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in PRIOR_ENTRIES])
+    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in {*PRIOR_ENTRIES, LEVEL_ONLY}])
     def test_other_entries_keep_the_default_priors(self, name):
         model = m5_models.MODELS[name]
         assert (model.sigma_h_prior, model.sigma_q_prior) == tuple(DEFAULT_PRIORS.values())
@@ -335,6 +355,58 @@ class TestSspLevelDow:
         )
         series_mean = fitted["response_norm"] * np.exp(fitted["sigma_h"] ** 2 / 2)
         assert not np.allclose(forecasts[:, monday], series_mean[:, None], rtol=1e-2)
+
+
+class TestDayOfWeekSwitch:
+    """``SspDow.dow`` turns the weekday dummies on or off; the level-only entry is the default entry without them."""
+
+    def test_level_only_entry_differs_from_the_default_only_by_the_switch(self):
+        model = m5_models.MODELS[LEVEL_ONLY]
+        assert not model.dow
+        assert replace(model, dow=True) == m5_models.MODELS[m5_models.DEFAULT_MODEL]
+
+    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name != LEVEL_ONLY])
+    def test_every_other_entry_keeps_the_weekday_dummies(self, name):
+        assert m5_models.MODELS[name].dow
+
+    def test_settings_record_the_switch(self):
+        assert json.loads(json.dumps(asdict(m5_models.MODELS[LEVEL_ONLY])))["dow"] is False
+        assert json.loads(json.dumps(asdict(m5_models.MODELS["ssp_dow"])))["dow"] is True
+
+    def test_no_level_and_no_weekdays_is_rejected(self):
+        with pytest.raises(ValueError, match="level=True or dow=True"):
+            m5_models.SspDow(level=False, dow=False)
+
+    def test_the_level_is_the_only_state(self, level_only_fit):
+        _, fitted = level_only_fit
+        assert fitted["sigma_q"].shape == (N_SERIES, 1)
+
+    def test_forecast_is_the_same_on_every_day(self, level_only_fit):
+        forecasts, _ = level_only_fit
+        np.testing.assert_allclose(forecasts, np.broadcast_to(forecasts[:, [0]], forecasts.shape), rtol=1e-6)
+
+    def test_forecast_is_the_last_filtered_level_inverted(self, ds, level_only_fit):
+        forecasts, fitted = level_only_fit
+        transform = PowerTransform("yeo-johnson")
+        runs = _refilter(ds, fitted, level=True, transform=transform, dow=False)
+        a_last = np.array([np.asarray(at)[-1, 0] for _, _, at, _, _, _, _ in runs])[:, None]
+        P_last = np.array([np.asarray(Pt)[-1, 0] for _, _, _, Pt, _, _, _ in runs])[:, None]
+        expected = transform.inverse(a_last, P_last + fitted["sigma_h"][:, None] ** 2, fitted)
+        np.testing.assert_allclose(forecasts, np.broadcast_to(expected, forecasts.shape), rtol=1e-4)
+
+    def test_the_switch_is_what_gives_the_forecast_its_weekly_shape(self, ds):
+        model = replace(m5_models.MODELS[LEVEL_ONLY], n_iter=20, dow=True)
+        forecasts, fitted = model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        assert fitted["sigma_q"].shape == (N_SERIES, 7)
+        assert not np.allclose(forecasts, forecasts[:, [0]], rtol=1e-3)
+
+    def test_insample_fit_is_the_filters_one_step_ahead_prediction(self, ds, level_only_fit):
+        _, fitted = level_only_fit
+        transform = PowerTransform("yeo-johnson")
+        for i, (y, _, _, _, vt, Ft, _) in enumerate(_refilter(ds, fitted, True, transform, dow=False)):
+            series = {key: value[i] for key, value in fitted.items()}
+            expected = transform.inverse(y - np.asarray(vt)[:, 0], np.asarray(Ft)[:, 0], series)
+            np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
 
 
 class TestInsample:
