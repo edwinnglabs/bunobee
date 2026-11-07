@@ -87,6 +87,16 @@ own data and can be read on their own once `ssp_02`/`ssp_03` have introduced tim
   variance, a tight prior dominates a loose one, an undisclosed operand passes the other through), n-ary fusion via
   `functools.reduce`, and the coordinate/positivity contract checks.
 
+## M5 aggregate study — `ssp_11`
+
+- **`ssp_11_m5_aggregate_covariate_priors` — Covariates and Shrinkage on the M5 Aggregate Series**
+  (`fit_one_series_opt`): the stage 2 checkpoint of the M5 study in #143. It fits the #118 default M5 model on the ten
+  series of `load_m5_aggregate()` three ways: no covariates, and the calendar columns of stage 1 plus the price index
+  under a loose prior, `N(0, 1)`, and a tight prior, `N(0, 0.1²)`. It scores them on the pre-validation window and
+  never reads the panel's last 28 days. It shows what the covariates take from the level and how far each group
+  shrinks, sweeps the prior's width, and compares the filter's diagonal covariance with a full one. Its last section
+  records the numbers of one run, because the notebook is committed without outputs.
+
 ## Running the notebooks
 
 The notebooks require the `bunobee` package and its JAX / NumPyro stack (`requires-python >= 3.11`). From the repo
@@ -98,4 +108,6 @@ jupyter lab               # then open playground/statespace_prototype/ssp_*.ipyn
 ```
 
 `ssp_02`/`ssp_03` are self-contained (they synthesise their own data). `ssp_04`/`ssp_05`/`ssp_06` expect a multi-series
-dataset (and, for `ssp_04`/`ssp_05`, a time-point beta table) loaded in their data cells.
+dataset (and, for `ssp_04`/`ssp_05`, a time-point beta table) loaded in their data cells. `ssp_11` reads only the
+packaged M5 panel, so it needs no raw M5 download, but it uses the MAP fitters of the `m5` extra:
+`pip install -e ".[m5]"`.
