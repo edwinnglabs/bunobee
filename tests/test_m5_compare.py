@@ -2,7 +2,8 @@
 
 A sampled ``m5_run.py`` run aggregates and weights only its own series, so ``m5_compare.py`` must refuse two
 runs fitted on different series or with no scored window in common (issue #104). These tests cover those
-checks, and that the differences it reports are ``RUN_B - RUN_A`` for each shared window.
+checks, and that the differences it reports are ``RUN_B - RUN_A`` for each shared window. Two runs on the benchmark
+subset (issue #154) are also compared item by item.
 
 Every test compares run directories written by :func:`_write_run`, holding only the two files the script
 reads, so none needs the raw M5 data. The script is a playground script, not part of the package, so it is
@@ -105,6 +106,30 @@ def _write_run(
     return run_dir
 
 
+ITEMS = ("FOODS_3_586", "HOUSEHOLD_1_069", "HOBBIES_1_197")
+
+
+def _write_items(run_dir: Path, windows: tuple[str, ...] = ("prevalidation",), shift: float = 0.0) -> None:
+    """Write the ``wrmsse_per_item.csv`` of a subset run into a run directory written by :func:`_write_run`.
+
+    Item ``i`` of :data:`ITEMS` scores ``WRMSSE = (i + 1) / 10 + shift`` on every window.
+    """
+    tables = [
+        pd.DataFrame(
+            {
+                "window": window,
+                "item_id": ITEMS,
+                "tier": ("high", "mid", "low"),
+                "n_series": 10,
+                "weight": (0.9, 0.04, 0.06),
+                "wrmsse": np.arange(1, 4) / 10 + shift,
+            }
+        )
+        for window in windows
+    ]
+    pd.concat(tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_item.csv", index=False)
+
+
 class TestSameSeries:
     """Runs are comparable only when they fitted the same set of series."""
 
@@ -178,6 +203,50 @@ class TestDeltas:
         evaluation = table[table["window"] == "evaluation"]
         np.testing.assert_allclose(evaluation["wrmsse_a"], LEVELS / 10 + 1.25)
         np.testing.assert_allclose(evaluation["wrmsse_b"], LEVELS / 10 + 1.125)
+
+
+class TestItems:
+    """Two subset runs are compared item by item, ``RUN_B - RUN_A``; other runs are not."""
+
+    def test_item_deltas_are_b_minus_a(self, tmp_path):
+        run_a = _write_run(tmp_path / "a", windows=("prevalidation",))
+        run_b = _write_run(tmp_path / "b", windows=("prevalidation",))
+        _write_items(run_a, shift=0.25)
+        _write_items(run_b, shift=0.125)
+
+        table = m5_compare.compare_items(run_a, run_b)
+
+        assert list(table["item_id"]) == list(ITEMS)
+        assert list(table["tier"]) == ["high", "mid", "low"]
+        np.testing.assert_allclose(table["wrmsse_a"], np.arange(1, 4) / 10 + 0.25)
+        np.testing.assert_allclose(table["wrmsse_delta"], -0.125)
+
+    def test_only_shared_windows_are_compared(self, tmp_path):
+        run_a = _write_run(tmp_path / "a", windows=("prevalidation", "validation"))
+        run_b = _write_run(tmp_path / "b", windows=("prevalidation",))
+        _write_items(run_a, windows=("prevalidation", "validation"))
+        _write_items(run_b)
+
+        assert set(m5_compare.compare_items(run_a, run_b)["window"]) == {"prevalidation"}
+
+    def test_runs_without_per_item_scores_have_no_item_table(self, tmp_path):
+        run_a, run_b = _write_run(tmp_path / "a"), _write_run(tmp_path / "b")
+        _write_items(run_a)
+
+        assert m5_compare.compare_items(run_a, run_b) is None
+
+    def test_the_cli_logs_the_item_deltas(self, tmp_path, monkeypatch, caplog):
+        run_a = _write_run(tmp_path / "a", windows=("prevalidation",))
+        run_b = _write_run(tmp_path / "b", windows=("prevalidation",))
+        _write_items(run_a, shift=0.25)
+        _write_items(run_b, shift=0.125)
+        monkeypatch.setattr(sys, "argv", ["m5_compare.py", str(run_a), str(run_b)])
+
+        with caplog.at_level("INFO", logger=m5_compare.logger.name):
+            m5_compare.main()
+
+        assert "Per-item WRMSSE (prevalidation" in caplog.text
+        assert "HOUSEHOLD_1_069" in caplog.text and "-0.1250" in caplog.text
 
 
 class TestCli:

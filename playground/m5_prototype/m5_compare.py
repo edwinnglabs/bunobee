@@ -10,6 +10,10 @@ For each window both runs scored (``wrmsse_per_level.csv``), this prints the per
 of both and its difference. A difference is ``RUN_B - RUN_A``, so a negative WRMSSE difference means
 ``RUN_B`` scores better.
 
+When both runs fitted the benchmark subset (``m5_run.py --sample-mode subset``), it then prints each item's
+WRMSSE in both runs and its difference, from their ``wrmsse_per_item.csv``: the high-volume item holds most of the
+subset's dollar weight, so the subset score alone hides the other two.
+
 A sampled run aggregates and weights only its own series, so its score is comparable only with a run on
 the same series. The script refuses two runs fitted on different series (``fit_idx`` in
 ``batch_params.npz``; their order does not matter) and two runs with no scored window in common.
@@ -153,6 +157,62 @@ def compare_runs(run_a: Path, run_b: Path) -> pd.DataFrame:
     return table[columns].reset_index(drop=True)
 
 
+def compare_items(run_a: Path, run_b: Path) -> pd.DataFrame | None:
+    """Each item's WRMSSE in two subset runs and its difference, for each window both runs scored per item.
+
+    Call it after :func:`compare_runs`, which checks that the runs fitted the same series.
+
+    Parameters
+    ----------
+    run_a, run_b : Path
+        ``m5_run.py`` run directories; differences are ``run_b - run_a``.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        One row per shared window and item: ``window``, ``item_id``, ``tier``, ``weight`` (the item's dollar share,
+        from ``run_a``), then ``wrmsse_a``, ``wrmsse_b`` and ``wrmsse_delta``. None unless both runs wrote a
+        ``wrmsse_per_item.csv``, which only ``--sample-mode subset`` runs do.
+    """
+    paths = [run / "wrmsse_per_item.csv" for run in (run_a, run_b)]
+    if not all(path.is_file() for path in paths):
+        return None
+    per_item_a, per_item_b = (pd.read_csv(path, keep_default_na=False) for path in paths)
+    keys = ["window", "item_id"]
+    table = per_item_a[[*keys, "tier", "weight", "wrmsse"]].merge(
+        per_item_b[[*keys, "wrmsse"]], on=keys, suffixes=("_a", "_b")
+    )
+    table["wrmsse_delta"] = table["wrmsse_b"] - table["wrmsse_a"]
+    return table.reset_index(drop=True)
+
+
+def log_item_comparison(table: pd.DataFrame) -> None:
+    """Log the output of :func:`compare_items`, one table per window.
+
+    Parameters
+    ----------
+    table : pd.DataFrame
+        Output of :func:`compare_items`.
+    """
+    for window, rows in table.groupby("window", sort=False):
+        logger.info(
+            "Per-item WRMSSE (%s %s), each item's series scored on their own, delta = B - A:",
+            window,
+            WINDOWS[window].days,
+        )
+        logger.info("  %-4s  %-16s  %-7s  %-8s  %-8s  %-9s", "tier", "item", "weight", "wrmsse_A", "wrmsse_B", "delta")
+        for _, row in rows.iterrows():
+            logger.info(
+                "  %-4s  %-16s  %5.1f%%   %.4f    %.4f    %+.4f",
+                row["tier"],
+                row["item_id"],
+                100 * row["weight"],
+                row["wrmsse_a"],
+                row["wrmsse_b"],
+                row["wrmsse_delta"],
+            )
+
+
 def _describe(run_dir: Path) -> str:
     """The run directory, with its model, number of series and rounding when ``run_stats.json`` records them."""
     stats_path = run_dir / "run_stats.json"
@@ -215,6 +275,9 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as err:
         raise SystemExit(f"m5_compare.py: {err}") from None
     log_comparison(table, args.run_a, args.run_b)
+    items = compare_items(args.run_a, args.run_b)
+    if items is not None:
+        log_item_comparison(items)
 
 
 if __name__ == "__main__":
