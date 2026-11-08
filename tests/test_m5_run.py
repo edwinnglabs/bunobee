@@ -13,6 +13,9 @@ series, then sections of series ranked by worst and best RMSSE and by worst and 
 RMSSE), then series at random. These tests check the sums, the RMSSE, bias, weight and contribution in the panel
 titles against the scorer, and the ranking and sections, on a tiny synthetic dataset.
 
+``--sample-mode subset`` (issue #154) fits the 30 series of the benchmark subset in ``m5_subset``. These tests check
+the choice.
+
 ``--round`` (issue #117) clips the forecasts at 0 and rounds them to integers. These tests check that it is off
 by default and that it leaves only non-negative integers.
 
@@ -73,7 +76,7 @@ def _load_script(name: str) -> ModuleType:
     return module
 
 
-for _name in ("m5_common", "m5_models", "m5_score_submission"):
+for _name in ("m5_common", "m5_models", "m5_score_submission", "m5_subset"):
     _load_script(_name)
 m5_run = _load_script("m5_run")
 
@@ -162,6 +165,14 @@ class TestOrigins:
 
     def test_a_quick_loop_can_fit_prevalidation_alone(self):
         assert m5_run.ORIGINS[m5_run._parse_args(["--origins", "prevalidation"]).origins] == ("prevalidation",)
+
+
+class TestSampleMode:
+    def test_random_by_default(self):
+        assert m5_run._parse_args([]).sample_mode == "random"
+
+    def test_the_benchmark_subset_is_a_sample_mode(self):
+        assert m5_run._parse_args(["--sample-mode", "subset"]).sample_mode == "subset"
 
 
 class TestRounding:

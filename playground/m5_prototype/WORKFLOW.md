@@ -20,6 +20,7 @@ where to work on the model. For prerequisites, every command and flag, and the r
 | `m5_check_weights.py` | Nothing; prints a comparison | You change how the scorer computes weights |
 | `m5_run.py` | `output/<timestamp>/` and a row of `output/runs.csv` | Every experiment |
 | `m5_compare.py` | Nothing; prints the deltas | You want to compare a run with a baseline run on the same series |
+| `m5_subset.py` | Nothing; prints the subset's items | You want to check that the rule still picks the committed items of the benchmark subset (#154) |
 | `m5_bias.py` | `output/bias_<timestamp>/` | You change the transform or the back-transform and want to see which mean of the sales the forecast tracks, or how many fitted sigmas sit on a prior bound |
 | `m5_score_submission.py` | Nothing; prints the score | You want to re-score a saved `submission.csv`, e.g. after changing the scorer |
 | `kaggle competitions submit` | A late submission on Kaggle | You want the official score |
@@ -160,6 +161,49 @@ match Kaggle's, so a choice made on either is tuned on the test: their actuals a
 tune to them without noticing, and then the leaderboard stops telling you anything. Until #125 the quick
 loop ran the validation window, so every choice from #106 to #117 was made on it, and every full run
 printed the evaluation score.
+
+### The benchmark subset (#154)
+
+The #143 re-plan iterates on a subset picked on purpose rather than on the random sample or a full run. A full run
+is too slow to iterate on (the stage 1 covariate entry took 4,435 s of fitting), and the random sample has no item ×
+store structure, so it cannot test a model that treats an item as one multivariate series over its 10 stores.
+
+`python m5_run.py --model NAME --sample-mode subset --origins prevalidation` fits the 30 store series of three items,
+`SUBSET_ITEMS` in `m5_subset.py`, one per volume tier and category:
+
+| Tier | Item | Rank | Units / store / day | Zero days (median store) |
+|---|---|---|---|---|
+| High | `FOODS_3_586` | 2 | 45.17 | 0.3% |
+| Mid | `HOUSEHOLD_1_069` | 1,360 (median) | 0.63 | 64.1% |
+| Low | `HOBBIES_1_197` | 2,442 (90th percentile) | 0.16 | 85.9% |
+
+The rule (`eligible_items` and `pick_items`; `python m5_subset.py` re-derives it and checks it still picks these):
+
+1. **Eligible:** a listed sell price in all 10 stores on each of the last 365 days of the pre-validation fit window,
+   d_1521–d_1885, ending 2016-03-27. 2,717 of the 3,049 items qualify.
+2. **Ranked** by units over those days, summed over the stores; ties go by `item_id`.
+3. **High:** the top-ranked `FOODS` item whose median store sells 0 on under 1% of the days. The top item,
+   `FOODS_3_090`, is skipped: it sells 0 on 10–19% of the days in every store despite its volume, which looks like
+   stockouts. **Mid** and **low:** the `HOUSEHOLD` and `HOBBIES` items whose units are nearest the median and the 10th
+   percentile of the eligible items' units.
+
+Re-derived for this issue, the table matches the one in #154 but for one rank: `HOBBIES_1_197` ties with
+`HOUSEHOLD_2_337` at 568 units and ranks 2,442, not 2,443, with ties broken by `item_id`.
+
+How the subset is scored:
+
+- **The subset WRMSSE** is the 12-level score of the 30 series, built inside the subset by
+  `compute_hierarchical_wrmsse`. With one item per category, the category, department and item levels (4, 5 and 10)
+  are the same three sums, and so are levels 6, 7 and 11 and levels 8, 9 and 12.
+- **The high item holds 96% of the dollar weight** on the pre-validation window (mid 1.5%, low 2.6%), so the subset
+  score is mostly its score. The run also scores each item's 10 series on their own, as a 12-level WRMSSE of that
+  item alone, and writes them to `wrmsse_per_item.csv` with each item's dollar share.
+- **`m5_compare.py`** compares two subset runs per level, then per item.
+
+**The rule of this phase:** an entry is accepted on the subset's pre-validation WRMSSE, with no full run. Report the
+per-item scores beside it, since the subset score barely sees the mid and low items. Read the validation and
+evaluation scores once per candidate, as the final check: `python m5_run.py --model NAME --sample-mode subset`
+(all three origins). The holdout rule above still applies to them.
 
 ### Reference scores
 
@@ -776,6 +820,42 @@ The other windows, read once as the final check:
 
 **Decision:** the default stays `ssp_level_dow_yeojohnson_halfnormal`. The two calendar entries stay registered as the
 baselines for the stage 2 notebook. Nothing was submitted to Kaggle.
+
+### Benchmark subset baselines (#154)
+
+The baselines of the subset phase (see "The benchmark subset (#154)"), each fitted once on the 30 subset series at the
+pre-validation origin: `python m5_run.py --model NAME --sample-mode subset --origins prevalidation`. All six ran at
+commit `68abeb9` on the 18-core Mac. The tree was clean for the first four. For `ssp_reg_events` and
+`ssp_reg_annual_events_tight` it was dirty, but only with the README and WORKFLOW edits of this issue. Their run
+directories and rows are in the main checkout's `output/`.
+
+| Entry | Run | Subset WRMSSE | `FOODS_3_586` (high) | `HOUSEHOLD_1_069` (mid) | `HOBBIES_1_197` (low) | Bias of the total | Fit time |
+|---|---|---|---|---|---|---|---|
+| `ssp_level_dow_yeojohnson_halfnormal`, the #118 default | `20261107_194521` | **0.53850** | **0.5338** | **0.5991** | 0.7192 | +9.6% | 1.2 s |
+| `ssp_level_yeojohnson_halfnormal`, level-only (#145) | `20261107_194527` | 0.71372 | 0.7137 | 0.6173 | **0.7135** | +8.9% | 1.2 s |
+| `ssp_level_dow_yeojohnson_halfnormal_calendar`, stage 1 (#146) | `20261107_194537` | 0.54917 | 0.5441 | 0.6169 | 0.7194 | +9.1% | 2.1 s |
+| `ssp_reg` | `20261107_194553` | 0.54037 | 0.5357 | 0.6023 | 0.7175 | +9.5% | 469.3 s |
+| `ssp_reg_events` | `20261107_195347` | 0.55267 | 0.5484 | 0.6044 | 0.7176 | +9.8% | 387.5 s |
+| `ssp_reg_annual_events_tight` | `20261107_200020` | 0.55116 | 0.5467 | 0.6055 | 0.7182 | +10.1% | 318.5 s |
+
+The item columns are each item's 12-level WRMSSE on its own 10 series. The weights in the subset score are 95.9%, 1.5%
+and 2.6%.
+
+- **The default is the subset baseline:** 0.53850, the best subset score and the best on the high and mid items. On
+  the full run it also beats the level-only and stage 1 entries, so the subset ranks those three as the full run does.
+- **Day-of-week shows on the high item only.** The level-only entry loses 0.1799 on `FOODS_3_586` and 0.0182 on the mid
+  item, and is 0.0057 better on the low item, the sparsest, where the weekday pattern is mostly noise.
+- **The calendar covariates lose 0.01067**, against 0.07000 on the full run. Most of the loss is on the mid item
+  (+0.0178).
+- **`SspReg` without covariates is within 0.0019 of the default,** the MAP fit of the same model, and the two regression
+  entries lose 0.01417 and 0.01266, a little more than the calendar entry. NUTS converged on every series: the worst R-hat is 1.005, 1.012
+  and 1.009, and the smallest effective sample size 496, 258 and 440.
+- **Every entry runs about 9–10% high on the total:** 411 units a day forecast as about 450.
+- **Cost:** the `SspDow` entries fit in 1–2 s and a whole run takes 5–10 s. The `SspReg` entries fit 30 series in three
+  NUTS runs of 10 series each, at 2–3 minutes per run and 5–8 minutes per entry, at a peak of 1.8–1.9 GiB.
+
+**Decision:** the default, 0.53850, is the score a stage of #143 has to beat on the subset. Nothing here was read on the
+validation or evaluation windows, and nothing was submitted to Kaggle.
 
 ## Working on the model
 

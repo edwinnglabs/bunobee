@@ -46,6 +46,12 @@ python m5_run.py --model <candidate> --n-demo 3000 --origins prevalidation
 #    window both runs scored. Refuses runs fitted on different series. output/runs.csv lists the runs.
 python m5_compare.py output/<baseline timestamp> output/<timestamp>
 
+# 5b. Benchmark subset (#154): the 30 store series of 3 items, one per volume tier, at the pre-validation
+#     origin, scored overall and per item; a few seconds for the default model. m5_compare.py compares two
+#     subset runs per level and per item. m5_subset.py re-derives the 3 items from m5_ds.nc.
+python m5_run.py --model <candidate> --sample-mode subset --origins prevalidation
+python m5_subset.py
+
 # 6. Full run: fit all 30,490 series at all three origins, write submission.csv and score it.
 python m5_run.py --model <candidate> --n-demo 0
 #    About 14 minutes for the default model (8 for ssp_dow) and a ~23 GiB peak (see below). Its
@@ -79,7 +85,7 @@ smoke test, quick fit, compare, full run, submit.
 |---|---|---|
 | `--model NAME` | `ssp_level_dow_yeojohnson_halfnormal` | The registered entry of `MODELS` to fit (see Models below) |
 | `--n-demo N` | 10 | Number of series to fit; 0 fits all 30,490 |
-| `--sample-mode random\|top` | `random` | Draw the `--n-demo` series at random, or take the top ones by total volume |
+| `--sample-mode random\|top\|subset` | `random` | Draw the `--n-demo` series at random, take the top ones by total volume, or fit the benchmark subset of `m5_subset.py` (30 series, whatever `--n-demo`) |
 | `--seed N` | 2026 | Seed of the random sample |
 | `--origins prevalidation\|validation\|evaluation\|both\|all` | `all` | The forecast origins to fit; `both` is validation and evaluation, the two a submission needs |
 | `--round` | off | Clip the forecasts at 0 and round them to the nearest integer before they are plotted, saved, submitted and scored |
@@ -105,6 +111,7 @@ Each `m5_run.py` run writes to `output/<timestamp>/`:
 |---|---|
 | `submission.csv` | 60,980 rows: `_validation` rows from the fit through d_1913, `_evaluation` rows from the fit through d_1941 (full runs with the validation and evaluation origins only; it has no pre-validation rows) |
 | `wrmsse_per_level.csv` | 12-level WRMSSE and bias table, one `window` per fitted origin |
+| `wrmsse_per_item.csv` | `--sample-mode subset` only: each item's 12-level WRMSSE, its 10 series scored on their own, with its tier and share of the dollar sales (`weight`), one `window` per fitted origin |
 | `run_stats.json` | Model name and settings, origins, whether the forecasts were rounded (`round`), fit time (total and per origin), total time, peak memory |
 | `batch_params.npz` | `fit_idx` (the fitted series) and the model's fitted outputs and forecasts of each fitted origin; pre-validation- and evaluation-origin arrays carry a `_prevalidation` or `_evaluation` suffix |
 | `diagnostics.png` | Histograms of the model's fitted outputs at the first origin fitted (pre-validation by default) |
@@ -120,7 +127,8 @@ latest run's order, so a column added later is blank for earlier runs.
 
 A sampled run aggregates and weights only its own series, so its WRMSSE is comparable with other runs
 on the same sample (same `--n-demo`, `--sample-mode` and `--seed`), not with a full-run score.
-`m5_compare.py` checks that two runs fitted the same series before it compares them.
+`m5_compare.py` checks that two runs fitted the same series before it compares them, and compares two subset
+runs item by item too.
 
 ### Forecast origins
 
@@ -207,7 +215,8 @@ How well the local scorer matches the official one:
 | `m5_preprocess.py` | Build and cache `m5_ds.nc` |
 | `m5_models.py` | Model registry: each entry is a model plus its settings, picked with `--model` |
 | `m5_run.py` | Fit a registered model, forecast, score, write the submission and append to the run log |
-| `m5_compare.py` | Per-level WRMSSE and bias deltas of two runs on the same series |
+| `m5_compare.py` | Per-level WRMSSE and bias deltas of two runs on the same series, and per-item deltas of two subset runs |
+| `m5_subset.py` | The 3-item × 10-store benchmark subset (#154): its items, the rule that picked them, and the per-item score |
 | `m5_bias.py` | Which mean of the sales a model's forecast tracks, per department, volume tercile and zero-share bin |
 | `m5_score_submission.py` | 12-level WRMSSE of a submission for one window |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |

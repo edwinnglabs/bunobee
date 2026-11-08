@@ -21,6 +21,10 @@ Usage examples
 # The quick loop with the forecasts rounded to integers:
     python m5_run.py --model ssp_dow --n-demo 3000 --origins prevalidation --round
 
+# The benchmark subset: the 30 store series of 3 items, one per volume tier (see ``m5_subset``), scored overall and
+# per item:
+    python m5_run.py --sample-mode subset --origins prevalidation
+
 ``--model`` picks an entry of ``MODELS`` in ``m5_models``: a model plus its settings (for ``ssp_dow``, the
 optimiser steps, learning rate and fit chunking). The runner never builds model inputs; adding a model
 needs only a new entry there.
@@ -55,6 +59,11 @@ run aggregates and weights only its own series, so its score is comparable with 
 sample (same ``--n-demo``, ``--sample-mode`` and ``--seed``; see ``m5_compare.py``), not with the full
 30,490-series score.
 
+``--sample-mode subset`` fits the benchmark subset of ``m5_subset`` instead, whatever ``--n-demo``: the 30 store
+series of ``SUBSET_ITEMS``. It also scores each item's 10 series on their own and writes those scores, with each
+item's share of the dollar sales, to ``wrmsse_per_item.csv``, one ``window`` per origin (see
+:func:`m5_subset.per_item_wrmsse`).
+
 Every run also writes the model name and settings, whether it rounded (``--round``), its wall-clock time and
 peak memory to ``run_stats.json`` in the run directory, and appends one row to the run log ``runs.csv`` in
 ``--output-dir`` (see :func:`_append_run_log`).
@@ -82,6 +91,7 @@ import xarray as xr
 
 from m5_common import DATA_DIR, load_m5_ds
 from m5_models import DEFAULT_MODEL, INSAMPLE_KEY, MODELS
+from m5_subset import SUBSET_ITEMS, per_item_wrmsse, subset_series_idx
 from m5_score_submission import (
     SUBMISSION_WINDOWS,
     WINDOWS,
@@ -158,13 +168,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Root output directory; a timestamped sub-dir is created inside.",
     )
     p.add_argument(
-        "--n-demo", type=int, default=10, metavar="N", help="Number of series to fit. 0 = all 30,490 series."
+        "--n-demo",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of series to fit. 0 = all 30,490 series. Ignored by --sample-mode subset.",
     )
     p.add_argument(
         "--sample-mode",
-        choices=["random", "top"],
+        choices=["random", "top", "subset"],
         default="random",
-        help="How to select demo series: random sample or top by total volume.",
+        help="How to select demo series: random sample, top by total volume, or the benchmark subset of m5_subset.py "
+        "(the 30 store series of 3 items, one per volume tier, scored overall and per item).",
     )
     p.add_argument("--seed", type=int, default=2026, help="RNG seed for reproducible random sampling.")
     p.add_argument(
@@ -658,6 +673,28 @@ def _append_run_log(path: Path, row: dict[str, object]) -> None:
     log.to_csv(path, index=False)
 
 
+def _log_per_item(per_item: pd.DataFrame, window: str) -> None:
+    """Log each item's WRMSSE and dollar share at one origin (``--sample-mode subset``).
+
+    Parameters
+    ----------
+    per_item : pd.DataFrame
+        Output of :func:`m5_subset.per_item_wrmsse`.
+    window : str
+        The scored window, a key of ``WINDOWS``.
+    """
+    logger.info("Per-item WRMSSE (%s %s), each item's series scored on their own:", window, WINDOWS[window].days)
+    for _, row in per_item.iterrows():
+        logger.info(
+            "  %-4s  %-16s  n=%-3d  weight %5.1f%%  wrmsse %.4f",
+            row["tier"],
+            row["item_id"],
+            row["n_series"],
+            100 * row["weight"],
+            row["wrmsse"],
+        )
+
+
 def _make_submission(
     forecasts: dict[str, np.ndarray],
     base_ids: np.ndarray,
@@ -742,12 +779,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     rng = np.random.default_rng(args.seed)
     total_sales = sales_matrix.sum(axis=1)
-    n_fit = n_series_total if args.n_demo == 0 else args.n_demo
 
-    if args.sample_mode == "random":
+    if args.sample_mode == "subset":
+        fit_idx = subset_series_idx(ds)
+        n_fit = fit_idx.size
+        label = f"subset of {len(SUBSET_ITEMS)} items x {n_fit // len(SUBSET_ITEMS)} stores"
+    elif args.sample_mode == "random":
+        n_fit = n_series_total if args.n_demo == 0 else args.n_demo
         fit_idx = rng.choice(n_series_total, size=n_fit, replace=False)
         label = f"random sample (seed={args.seed})"
     else:
+        n_fit = n_series_total if args.n_demo == 0 else args.n_demo
         fit_idx = np.argsort(total_sales)[::-1][:n_fit]
         label = "top by volume"
 
@@ -887,7 +929,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 9. WRMSSE of the fitted series, per fitted window with actuals
     # ------------------------------------------------------------------
-    tables = []
+    tables, item_tables = [], []
     for window in windows:
         _, score_mask = window_masks(split, window)
         if not np.isfinite(ds["sales"].values[:, score_mask]).all():
@@ -902,19 +944,28 @@ def main() -> None:
         )
         log_per_level(per_level, window=window)
         tables.append(per_level.assign(window=window)[["window", *per_level.columns]])
+        if args.sample_mode == "subset":
+            per_item = per_item_wrmsse(
+                ds, np.asarray(forecasts_by_window[window], dtype=np.float64), base_ids, window=window
+            )
+            _log_per_item(per_item, window)
+            item_tables.append(per_item.assign(window=window)[["window", *per_item.columns]])
     scores = {table["window"][0]: float(table["wrmsse"].mean()) for table in tables}
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_level.csv", index=False)
         logger.info("Saved wrmsse_per_level.csv  (%d series, windows: %s)", n_fit, ", ".join(scores))
     else:
         logger.warning("No window was scored, so there is no wrmsse_per_level.csv.")
+    if item_tables:
+        pd.concat(item_tables, ignore_index=True).to_csv(run_dir / "wrmsse_per_item.csv", index=False)
+        logger.info("Saved wrmsse_per_item.csv  (%d items, windows: %s)", len(item_tables[0]), ", ".join(scores))
     if tables and n_fit < n_series_total:
         logger.warning(
             "Sampled WRMSSE: only %d / %d series are aggregated and weighted, so this score is comparable with other "
-            "runs on the same sample (same --n-demo, --sample-mode and --seed; see m5_compare.py), not with a "
-            "full-run score.",
+            "runs on the same sample (%s; see m5_compare.py), not with a full-run score.",
             n_fit,
             n_series_total,
+            "--sample-mode subset" if args.sample_mode == "subset" else "same --n-demo, --sample-mode and --seed",
         )
 
     # ------------------------------------------------------------------
