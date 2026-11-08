@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `to_units` and `quantile` on the M5 `Transform`s (`LogTransform`, `PowerTransform`) and
+  `forecast_gaussian_batch_series_opt` in `bunobee.models.m5.m5_ssp_optim` — map the Gaussian forecast of a MAP-fitted
+  SSP to its exact quantiles in units, floored at 0, instead of a point forecast. `predict_batch_series_opt` is
+  unchanged.
 - `load_m5_aggregate()` returns more columns alongside `date`, `series_id` and `sales`, so a notebook can use them
   without the raw M5 download: the calendar covariates of the M5 stage 1 entries (`annual_sin_1`, `annual_cos_1`,
   `event_name_1`, `event_name_2`, `month_of_year`, `day_of_month`) and a fixed-basket `price_index`, which

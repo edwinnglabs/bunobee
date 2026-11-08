@@ -243,6 +243,50 @@ python m5u_baseline.py                                   # full size: writes bas
 python m5u_baseline.py --subset --windows prevalidation  # the 3-item x 10-store subset: scores only
 ```
 
+### SSP quantiles on the subset (#158)
+
+`m5u_ssp.py` turns the Gaussian forecast of a registered `SspDow` entry (the #118 default unless `--model` says
+otherwise) into the 9 quantiles at the 12 levels of the 3-item subset, and scores them by WSPL on the pre-validation
+window against the cheap baseline. It fits 30 series in a few seconds, makes no full run and submits nothing.
+
+```sh
+cd playground/m5_prototype
+python m5u_ssp.py                       # per-level WSPL of the baseline and of each dependence below
+python m5u_ssp.py --output wspl.csv     # also write the table
+```
+
+- **Bottom series (level 12):** `Transform.quantile` maps the Gaussian quantiles on the transformed scale through the
+  inverse transform. It is monotone, so these are the exact quantiles of each series' forecast distribution, censored
+  to the series' admissible sales as `PowerTransform.inverse` is and floored at 0.
+- **Aggregate levels (1-11):** the quantiles of a sum need a joint distribution, which independently fitted series do
+  not give. A group's quantiles are the empirical quantiles of 10,000 summed sample paths of its bottom series, drawn
+  from a **Gaussian copula** whose correlation is the rank correlation of the series' in-sample one-step-ahead errors
+  over the last 364 fit days (the same on every forecast day: the pinball loss scores each day alone). `--dependence`
+  also scores the two bounds: `independent` (the sum's spread is too narrow when the series move together) and
+  `comonotone` (every series at the same quantile, so the group's quantile is the sum of its series': the widest).
+  The copula's correlation is estimated from 30 series here; at 30,490 it would need a factor structure.
+
+Result of the #118 default on the subset, pre-validation window (seed 2026), WSPL per level:
+
+| Level | Baseline | independent | copula | comonotone |
+|---|---|---|---|---|
+| 1 Total | 0.17150 | 0.13623 | 0.13048 | 0.16611 |
+| 2 state_id | 0.17098 | 0.13677 | 0.13696 | 0.15542 |
+| 3 store_id | 0.17255 | 0.14393 | 0.14429 | 0.14497 |
+| 4 cat_id (= 5 dept_id = 10 item_id) | 0.17183 | 0.13495 | 0.13038 | 0.16266 |
+| 6 state x cat (= 7 state x dept = 11 item x state) | 0.17115 | 0.14009 | 0.13995 | 0.15304 |
+| 8 store x cat (= 9 store x dept) | 0.17211 | 0.14716 | 0.14758 | 0.14741 |
+| 12 item x store | 0.17211 | 0.14743 | 0.14743 | 0.14743 |
+| **Overall** | **0.17169** | **0.14032** | **0.13878** | **0.15465** |
+
+Every dependence beats the baseline on every level, and the bottom level is the same in all three. The dependence
+moves only the aggregate levels. The copula is best at the Total and at the category, department and item levels
+(0.130 against independence's 0.136 at the Total) and within 0.0005 of independence at the others; `comonotone`
+is worst at levels 1-7 and 10-11. The residuals' mean pairwise correlation is only 0.055, so independence is already
+close. Changing the seed of the sample paths moves a level by about 0.0005 (overall 0.13878 with seed 2026, 0.13855
+with seed 7). This is one 28-day window of 30 series, and the Total's median forecast sits above its actuals on 89% of
+the days, so the gap to the baseline is mostly the model's, not the dependence's.
+
 ## Scripts
 
 | Script | Purpose |
@@ -259,6 +303,7 @@ python m5u_baseline.py --subset --windows prevalidation  # the 3-item x 10-store
 | `m5u_score.py` | M5 Uncertainty: the 12-level hierarchy and the WSPL of per-level quantile forecasts (#157) |
 | `m5u_submission.py` | M5 Uncertainty: write and read a 771,120-row submission in the sample's row order |
 | `m5u_baseline.py` | M5 Uncertainty: empirical-quantile baseline for every series at every level; writes and scores it |
+| `m5u_ssp.py` | M5 Uncertainty: an SSP's predictive quantiles on the 3-item subset, scored by WSPL against the baseline (#158) |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |
 | `m5_submission_diff.py` | Diagnostic diff of two submissions |
 | `m5_make_accuracy_fixture.py` | Build the committed CI fixture `src/bunobee/datasets/data/m5_aggregate.csv` |

@@ -602,10 +602,31 @@ def predict_batch_series_opt(
     np.ndarray
         Point forecasts of shape (B, horizon).
     """
+    mu_future, var_future = forecast_gaussian_batch_series_opt(fit_result, Z_future)
+    return fit_result.get("transform", LogTransform()).inverse(mu_future, var_future, fit_result)
+
+
+def forecast_gaussian_batch_series_opt(fit_result: dict, Z_future: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Forecast mean and variance on the transformed scale for B series from a batch-fitted model.
+
+    The Gaussian that :func:`predict_batch_series_opt` maps to point forecasts in units, and that
+    ``fit_result["transform"].quantile`` maps to forecast quantiles in units.
+
+    Parameters
+    ----------
+    fit_result : dict
+        Output of ``fit_batch_series_opt()``.
+    Z_future : np.ndarray
+        (horizon, n_states) future design matrix, shared across all series.
+
+    Returns
+    -------
+    mu_future, var_future : np.ndarray
+        Mean and variance of each series' forecast on the transformed scale, each of shape (B, horizon).
+    """
     at = fit_result["at"]  # (B, n_steps, n_states)
     Pt = fit_result["Pt"]  # (B, n_steps, n_states) diagonal covariances
     sigma_h = np.asarray(fit_result["sigma_h"])  # (B,)
-    transform = fit_result.get("transform", LogTransform())
 
     Z_future = np.asarray(Z_future)  # (horizon, n_states)
     a_last = at[:, -1, :]  # (B, n_states)
@@ -620,5 +641,4 @@ def predict_batch_series_opt(
     # converged Kalman filter, so the correction remains meaningful but horizon-flat.
     Z_sq = Z_future**2  # (horizon, n_states)
     var_future = P_last @ Z_sq.T + (sigma_h**2)[:, None]  # (B, horizon)
-
-    return transform.inverse(mu_future, var_future, fit_result)
+    return mu_future, var_future

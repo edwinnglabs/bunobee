@@ -494,3 +494,79 @@ class TestPowerTransformFit:
         forecasts = m5_ssp_optim.predict_batch_series_opt(result, Z_future=Z_future)
         assert forecasts.shape == (LEVELS.size, HORIZON)
         assert np.isfinite(forecasts).all() and (forecasts >= 0).all()
+
+
+@pytest.fixture(scope="module", params=["log", *POWER_TRANSFORMS])
+def quantile_case(request, sales):
+    """A transform and its per-series parameters, for the log transform and every power transform."""
+    transform = LogTransform() if request.param == "log" else POWER_TRANSFORMS[request.param]
+    if request.param != "log" and importlib.util.find_spec("sklearn") is None:
+        pytest.skip("needs scikit-learn, part of the optional 'm5' extra: pip install 'bunobee[m5]'")
+    return transform, transform.fit(sales)
+
+
+class TestQuantile:
+    """``Transform.quantile`` maps the Gaussian forecast's quantiles through the monotone inverse (issue #158)."""
+
+    U = np.array([0.005, 0.025, 0.165, 0.25, 0.5, 0.75, 0.835, 0.975, 0.995])
+
+    def test_shape_and_order(self, quantile_case):
+        transform, params = quantile_case
+        mu = np.linspace(-1.0, 1.0, LEVELS.size * HORIZON).reshape(LEVELS.size, HORIZON)
+        quantiles = transform.quantile(mu, np.full_like(mu, 0.4), self.U, params)
+        assert quantiles.shape == (LEVELS.size, self.U.size, HORIZON)
+        assert np.isfinite(quantiles).all() and (quantiles >= 0).all()
+        assert (np.diff(quantiles, axis=1) >= 0).all()
+
+    def test_quantiles_of_a_certain_forecast_are_its_point_forecast(self, quantile_case):
+        # With no variance the forecast is its median, so every quantile is the point forecast.
+        transform, params = quantile_case
+        mu = np.linspace(-1.5, 1.5, LEVELS.size * HORIZON).reshape(LEVELS.size, HORIZON)
+        quantiles = transform.quantile(mu, np.zeros_like(mu), self.U, params)
+        expected = transform.inverse(mu, np.zeros_like(mu), params)
+        np.testing.assert_allclose(quantiles, np.repeat(expected[:, None], self.U.size, axis=1), rtol=1e-5, atol=1e-6)
+
+    def test_quantiles_are_those_of_the_mapped_draws(self, quantile_case):
+        # Independent of the quantile function: map Gaussian draws to units and take their empirical quantiles.
+        transform, params = quantile_case
+        mu = np.full((LEVELS.size, 1), 0.3)
+        var = np.full((LEVELS.size, 1), 0.5)
+        draws = np.random.default_rng(158).normal(mu[:, 0], np.sqrt(var[:, 0]), size=(400_000, LEVELS.size))
+        units = transform.to_units(draws[:, :, None], params)[:, :, 0].T  # draws lead: (n_series, n_draws)
+        expected = np.quantile(units, self.U[1:-1], axis=1).T
+        quantiles = transform.quantile(mu, var, self.U[1:-1], params)[:, :, 0]
+        np.testing.assert_allclose(quantiles, expected, rtol=2e-2, atol=2e-2)
+
+    def test_lognormal_quantiles(self, sales):
+        transform = LogTransform()
+        params = transform.fit(sales)
+        mu, var = np.array([[0.2, -0.4]]), np.array([[0.3, 0.8]])
+        quantiles = transform.quantile(np.repeat(mu, LEVELS.size, 0), np.repeat(var, LEVELS.size, 0), self.U, params)
+        for i in range(LEVELS.size):
+            expected = stats.lognorm.ppf(self.U[:, None], s=np.sqrt(var), scale=np.exp(mu) * params["response_norm"][i])
+            np.testing.assert_allclose(quantiles[i], expected, rtol=1e-5)
+
+    def test_quantile_axis_leads_to_the_same_values_for_a_single_series(self, quantile_case):
+        transform, params = quantile_case
+        mu, var = np.full((LEVELS.size, 3), 0.1), np.full((LEVELS.size, 3), 0.2)
+        batch = transform.quantile(mu, var, self.U, params)
+        for i in range(LEVELS.size):
+            series = {key: value[i] for key, value in params.items()}
+            np.testing.assert_allclose(transform.quantile(mu[i], var[i], self.U, series), batch[i], rtol=1e-6)
+
+    def test_stay_within_the_admissible_sales(self, quantile_case):
+        # However far the Gaussian reaches, the power transforms' quantiles are finite and from 0 to the largest sales.
+        transform, params = quantile_case
+        if not isinstance(transform, PowerTransform):
+            pytest.skip("the lognormal has no largest sales")
+        mu, var = (grid.ravel() for grid in np.meshgrid([-1e3, -3.0, 0.0, 3.0, 1e3], [0.0, 0.3, 1e4]))
+        quantiles = transform.quantile(np.tile(mu, (LEVELS.size, 1)), np.tile(var, (LEVELS.size, 1)), self.U, params)
+        ceiling = np.maximum(params["sales_max"], transform.floor)
+        assert np.isfinite(quantiles).all() and (quantiles >= 0).all()
+        assert (quantiles <= ceiling[:, None, None] * (1 + 1e-9)).all()
+
+    @pytest.mark.parametrize("u", [[0.0, 0.5], [0.5, 1.0], [[0.5]], [-0.1]])
+    def test_levels_outside_the_open_interval_raise(self, u):
+        with pytest.raises(ValueError, match="quantile levels"):
+            LogTransform().quantile(np.zeros((1, 2)), np.ones((1, 2)), np.array(u), {"response_norm": np.ones(1)})
+

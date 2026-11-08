@@ -731,3 +731,53 @@ class TestSspReg:
         a, _ = plain.fit_forecast(ds, idx, FIT_MASK, FORECAST_MASK)
         b, _ = events.fit_forecast(ds, idx, FIT_MASK, FORECAST_MASK)
         assert not np.allclose(a, b)
+
+
+@pytest.fixture(scope="module", params=["ssp_level_dow", "ssp_level_dow_yeojohnson"])
+def gaussian_fit(request, ds) -> tuple:
+    """A registered entry with its point forecasts and its Gaussian forecast on the synthetic series."""
+    model = replace(m5_models.MODELS[request.param], n_iter=20)
+    series = np.arange(N_SERIES)
+    forecasts, _ = model.fit_forecast(ds, series, FIT_MASK, FORECAST_MASK)
+    return model, forecasts, model.fit_forecast_gaussian(ds, series, FIT_MASK, FORECAST_MASK)
+
+
+class TestGaussianForecast:
+    """``SspDow.fit_forecast_gaussian`` returns the Gaussian forecast behind the point forecast (issue #158)."""
+
+    U = np.array([0.025, 0.25, 0.5, 0.75, 0.975])
+
+    def test_shapes(self, ds, gaussian_fit):
+        _, _, gaussian = gaussian_fit
+        assert gaussian.mu.shape == gaussian.var.shape == (N_SERIES, HORIZON)
+        assert gaussian.fit_mu.shape == gaussian.fit_var.shape == (N_SERIES, N_FIT)
+        assert (gaussian.var > 0).all()
+        assert gaussian.quantile(self.U).shape == (N_SERIES, self.U.size, HORIZON)
+
+    def test_inverse_of_the_gaussian_is_the_point_forecast(self, gaussian_fit):
+        _, forecasts, gaussian = gaussian_fit
+        np.testing.assert_allclose(
+            gaussian.transform.inverse(gaussian.mu, gaussian.var, gaussian.params), forecasts, rtol=1e-4, atol=1e-5
+        )
+
+    def test_median_is_the_inverse_power_of_the_mean(self, ds, gaussian_fit):
+        # The transform is monotone, so the median of the forecast is the transform's inverse of the Gaussian's median.
+        _, _, gaussian = gaussian_fit
+        median = gaussian.quantile(np.array([0.5]))[:, 0]
+        expected = gaussian.transform.to_units(gaussian.mu, gaussian.params)
+        np.testing.assert_allclose(median, expected, rtol=1e-5, atol=1e-6)
+
+    def test_fit_chunk_gives_the_same_gaussian_shape(self, ds, gaussian_fit):
+        model, _, gaussian = gaussian_fit
+        chunked = replace(model, fit_chunk=3).fit_forecast_gaussian(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        np.testing.assert_allclose(chunked.mu, gaussian.mu, rtol=1e-2, atol=1e-2)
+        assert chunked.params.keys() == gaussian.params.keys()
+
+    def test_residuals_are_the_standardised_one_step_errors(self, ds, gaussian_fit):
+        _, _, gaussian = gaussian_fit
+        sales = ds["sales"].values[:, FIT_MASK]
+        residuals = gaussian.residuals(sales)
+        assert residuals.shape == (N_SERIES, N_FIT) and np.isfinite(residuals).all()
+        expected = (gaussian.transform.forward(sales, gaussian.params) - gaussian.fit_mu) / np.sqrt(gaussian.fit_var)
+        np.testing.assert_allclose(residuals, expected, rtol=1e-5, atol=1e-6)
+

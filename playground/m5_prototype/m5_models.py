@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -37,6 +38,7 @@ from bunobee.models.m5.m5_ssp_optim import (
     SIGMA_Q_PRIOR,
     SigmaPrior,
     fit_batch_series_opt,
+    forecast_gaussian_batch_series_opt,
     predict_batch_series_opt,
 )
 from bunobee.models.m5.m5_ssp_reg import fit_batch_series_reg, predict_batch_series_reg
@@ -92,6 +94,51 @@ class Model(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class GaussianForecast:
+    """A fitted SSP's Gaussian forecast and one-step-ahead fit on the transformed scale (issue #158).
+
+    Attributes
+    ----------
+    mu, var : np.ndarray
+        Forecast mean and variance of each series, each of shape ``(n_series, horizon)``.
+    fit_mu, fit_var : np.ndarray
+        Mean and variance of each fit day predicted from the days before it, each of shape ``(n_series, n_fit_steps)``.
+    transform : Transform
+        The transform the series were fitted on.
+    params : dict of str to np.ndarray
+        The fit's per-series outputs, i.e. the transform's parameters among them; what ``transform`` reads to map
+        the Gaussian to units.
+    """
+
+    mu: np.ndarray
+    var: np.ndarray
+    fit_mu: np.ndarray
+    fit_var: np.ndarray
+    transform: Transform
+    params: dict[str, Any]
+
+    def quantile(self, u: np.ndarray) -> np.ndarray:
+        """Quantiles in units of the forecast, ``(n_series, len(u), horizon)``; see ``Transform.quantile``."""
+        return self.transform.quantile(self.mu, self.var, u, self.params)
+
+    def residuals(self, sales: np.ndarray) -> np.ndarray:
+        """Standardised one-step-ahead forecast errors on the transformed scale.
+
+        Parameters
+        ----------
+        sales : np.ndarray
+            The fit days' sales, ``(n_series, n_fit_steps)``.
+
+        Returns
+        -------
+        np.ndarray
+            ``(transform.forward(sales) - fit_mu) / sqrt(fit_var)``, same shape.
+        """
+        z = np.asarray(self.transform.forward(sales, self.params), dtype=np.float64)
+        return (z - self.fit_mu) / np.sqrt(self.fit_var)
+
+
 def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
     """In-sample fit of a ``fit_batch_series_opt`` result: each fit day predicted from the days before it.
 
@@ -113,6 +160,28 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
     np.ndarray
         In-sample fit of shape ``(B, n_steps)``, in units.
     """
+    mu, var = _one_step_ahead_gaussian(result, Z)
+    return result["transform"].inverse(mu, var, result)
+
+
+def _one_step_ahead_gaussian(result: dict, Z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and variance, on the transformed scale, of each fit day predicted from the days before it.
+
+    The Gaussian that :func:`_one_step_ahead_fit` maps to units. Its standardised residuals
+    ``(transform.forward(sales) - mu) / sqrt(var)`` are the one-step-ahead forecast errors.
+
+    Parameters
+    ----------
+    result : dict
+        Output of ``fit_batch_series_opt`` for B series.
+    Z : np.ndarray
+        ``(n_steps, n_states)`` design matrix the series were fitted with.
+
+    Returns
+    -------
+    mu, var : np.ndarray
+        Predicted mean and variance of each fit day, each of shape ``(B, n_steps)``.
+    """
     Z = np.asarray(Z)
     at, Pt = result["at"], result["Pt"]  # (B, n_steps, n_states) each
     mu = np.empty(at.shape[:2], dtype=at.dtype)
@@ -123,7 +192,7 @@ def _one_step_ahead_fit(result: dict, Z: np.ndarray) -> np.ndarray:
     mu[:, 1:] = np.einsum("bts,ts->bt", at[:, :-1], Z[1:])
     var[:, 1:] = np.einsum("bts,ts->bt", Pt[:, :-1], Z[1:] ** 2)
     var += np.asarray(result["sigma_h"])[:, None] ** 2
-    return result["transform"].inverse(mu, var, result)
+    return mu, var
 
 
 @dataclass(frozen=True)
@@ -303,6 +372,68 @@ class SspDow:
         one-step-ahead fit of every fit day (see :func:`_one_step_ahead_fit`). Its ``sigma_q`` holds the drifting
         states only: the level and the weekdays, whatever the ``covariates``.
         """
+        forecasts, fitted = [], {}
+        for result, Z, Z_future in self._fit_runs(ds, series_idx, fit_mask, forecast_mask):
+            forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
+            for key, value in result.items():
+                if key not in self.DROPPED_KEYS:
+                    fitted.setdefault(key, []).append(np.asarray(value))
+            fitted.setdefault(INSAMPLE_KEY, []).append(_one_step_ahead_fit(result, Z))
+        return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
+
+    def fit_forecast_gaussian(
+        self,
+        ds: xr.Dataset,
+        series_idx: np.ndarray,
+        fit_mask: np.ndarray,
+        forecast_mask: np.ndarray,
+    ) -> GaussianForecast:
+        """Fit as :meth:`fit_forecast` does, but return the Gaussian forecast on the transformed scale.
+
+        The forecast quantiles in units are ``transform.quantile`` of ``mu`` and ``var`` (issue #158); the same
+        fit and the same Gaussian give the point forecast of :meth:`fit_forecast`.
+
+        See :meth:`Model.fit_forecast` for the parameters.
+
+        Returns
+        -------
+        GaussianForecast
+            The forecast and one-step-ahead fit of every series, in ``series_idx`` order.
+        """
+        parts: dict[str, list[np.ndarray]] = {key: [] for key in ("mu", "var", "fit_mu", "fit_var")}
+        params: dict[str, list[np.ndarray]] = {}
+        transform = self.transform
+        for result, Z, Z_future in self._fit_runs(ds, series_idx, fit_mask, forecast_mask):
+            mu, var = forecast_gaussian_batch_series_opt(result, Z_future)
+            fit_mu, fit_var = _one_step_ahead_gaussian(result, Z)
+            for key, value in zip(parts, (mu, var, fit_mu, fit_var)):
+                parts[key].append(np.asarray(value))
+            transform = result["transform"]
+            for key, value in result.items():
+                if key not in self.DROPPED_KEYS:
+                    params.setdefault(key, []).append(np.asarray(value))
+        return GaussianForecast(
+            **{key: np.concatenate(value) for key, value in parts.items()},
+            transform=transform,
+            params={key: np.concatenate(value) for key, value in params.items()},
+        )
+
+    def _fit_runs(
+        self,
+        ds: xr.Dataset,
+        series_idx: np.ndarray,
+        fit_mask: np.ndarray,
+        forecast_mask: np.ndarray,
+    ) -> Iterator[tuple[dict, jnp.ndarray, jnp.ndarray]]:
+        """Fit the series in runs of at most ``fit_chunk`` and yield each run's result and design matrices.
+
+        Yields
+        ------
+        result : dict
+            Output of ``fit_batch_series_opt`` for the run's series, its ``sigma_q`` cut to the drifting states.
+        Z, Z_future : jnp.ndarray
+            ``(n_fit_steps, n_states)`` and ``(horizon, n_states)`` design matrices, shared by every run.
+        """
         weekday = ds["day_of_week"].values
         if self.dow:
             # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes
@@ -323,8 +454,6 @@ class SspDow:
         n_series = sales.shape[0]
         step = self.fit_chunk or n_series
         n_runs = math.ceil(n_series / step)
-        fitted: dict[str, list[np.ndarray]] = {}
-        forecasts = []
         for run, start in enumerate(range(0, n_series, step), start=1):
             end = min(start + step, n_series)
             if n_runs > 1:
@@ -343,12 +472,7 @@ class SspDow:
                 fixed_states=fixed_states,
             )
             result["sigma_q"] = result["sigma_q"][:, :n_drifting]
-            forecasts.append(predict_batch_series_opt(result, Z_future=Z_future))
-            for key, value in result.items():
-                if key not in self.DROPPED_KEYS:
-                    fitted.setdefault(key, []).append(np.asarray(value))
-            fitted.setdefault(INSAMPLE_KEY, []).append(_one_step_ahead_fit(result, Z))
-        return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
+            yield result, Z, Z_future
 
 
 #: Sigma priors for the standardised power scale (issue #116), where the default priors, set for log sales, hold
