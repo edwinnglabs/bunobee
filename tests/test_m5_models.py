@@ -561,8 +561,9 @@ class TestCalendarEntries:
         assert json.loads(json.dumps(asdict(m5_models.MODELS["ssp_dow"])))["covariates"] is None
 
     def test_other_entries_have_no_covariates(self):
+        # The NUTS regression entries carry covariates too, as a static regression outside the filter.
         for name, model in m5_models.MODELS.items():
-            if name not in {CALENDAR, LEVEL_CALENDAR}:
+            if name not in {CALENDAR, LEVEL_CALENDAR, *REG_ENTRIES}:
                 assert model.covariates is None, name
 
     def test_fitted_sigma_q_holds_the_drifting_states_only(self, entry_fit):
