@@ -18,13 +18,17 @@ the model, and what is still open.
 3. Kaggle credentials: `kaggle auth login`, or a token from <https://www.kaggle.com/settings/api> saved
    to `~/.kaggle/access_token` (or exported as `KAGGLE_API_TOKEN`).
 4. The competition rules, accepted once while signed in:
-   <https://www.kaggle.com/competitions/m5-forecasting-accuracy/rules>.
+   <https://www.kaggle.com/competitions/m5-forecasting-accuracy/rules>, and, for the Uncertainty
+   `sample_submission.csv` that `m5_fetch.py` also downloads,
+   <https://www.kaggle.com/competitions/m5-forecasting-uncertainty/rules>.
 
 ## Runbook
 
 ```sh
 # 1. Fetch: the 5 Kaggle files, plus the 4 official reference files (test actuals and scoring
-#    weights) from a public mirror. Skips files already present; --force re-downloads.
+#    weights) from a public mirror, plus the M5 Uncertainty sample_submission.csv (into its own folder,
+#    playground/resource/m5-forecasting-uncertainty/, since it shares its name with the accuracy one).
+#    Skips files already present; --force re-downloads.
 python playground/m5_prototype/m5_fetch.py
 
 # 2. Preprocess: build the cached dataset m5_ds.nc (~550 MB). A no-op once built; --force rebuilds.
@@ -74,6 +78,10 @@ kaggle competitions submissions -c m5-forecasting-accuracy | head -3
 #    share of series with a sigma on a prior bound. About 20 s per model (30 s with a power transform);
 #    writes output/bias_<timestamp>/.
 python m5_bias.py --model ssp_dow ssp_level_dow
+
+# 10. Optional: the M5 Uncertainty competition (#157) -- see "M5 Uncertainty" below. The cheap baseline
+#     writes a full-size 771,120-row submission in seconds and prints its local WSPL; nothing is submitted.
+python m5u_baseline.py
 ```
 
 [WORKFLOW.md](WORKFLOW.md), "The experiment loop", walks through the cycle these steps make up: develop,
@@ -206,12 +214,41 @@ How well the local scorer matches the official one:
   forecast clipping, float32 arithmetic or the trimming variants tried; it is far below the score
   differences between leaderboard entries.
 
+## M5 Uncertainty
+
+The [M5 Uncertainty](https://www.kaggle.com/competitions/m5-forecasting-uncertainty) competition uses the same
+sales data but scores forecast distributions: 9 quantiles (0.005, 0.025, 0.165, 0.25, 0.5, 0.75, 0.835, 0.975,
+0.995) of all 42,840 series of the 12 aggregation levels, with the weighted scaled pinball loss (WSPL). Its
+`sample_submission.csv` has 771,120 rows (42,840 series × 9 quantiles × 2 windows), ids `<series_id>_<quantile>_<window>`
+(`Total_X_0.005_validation`, `WI_FOODS_1_001_0.500_evaluation`), and sits in
+`playground/resource/m5-forecasting-uncertainty/`. On the private leaderboard 1st place scored 0.15420 and 10th
+0.16473 (Kaggle CLI, 2026-11-07).
+
+- **WSPL (`m5u_score.py`):** per series, the pinball loss over the 28 days and the 9 quantiles, divided by the mean
+  absolute one-step difference of its training history from its first sale on (the accuracy scale with absolute
+  instead of squared differences); weighted by the same dollar weights as the WRMSSE; the mean of the 12 levels.
+  The quantiles of a level are not sums of the bottom series', so a forecast is one `(n_groups, 9, 28)` array
+  per level, in the order of `build_hierarchy(...)`. `build_hierarchy(ds, rows)` takes the full dataset or any set
+  of bottom series such as the 3-item subset, whose own 12 levels are then scored.
+  `python m5u_score.py --submission CSV --window validation` scores a submission file.
+- **Writer (`m5u_submission.py`):** lays the per-level quantiles of both windows out in the sample's rows, takes
+  the ids and their order from the sample, and refuses forecasts that do not cover exactly those rows.
+- **Baseline (`m5u_baseline.py`):** for every series at every level, the empirical quantiles of its last 91 training
+  days, flat over the 28 days. It fits nothing: about 10 s for the full hierarchy. Its local WSPL on the full
+  hierarchy is 0.290 (validation) and 0.265 (evaluation).
+
+```sh
+cd playground/m5_prototype
+python m5u_baseline.py                                   # full size: writes baseline_submission.csv, prints the WSPL
+python m5u_baseline.py --subset --windows prevalidation  # the 3-item x 10-store subset: scores only
+```
+
 ## Scripts
 
 | Script | Purpose |
 |---|---|
 | `m5_common.py` | Shared data directory and `load_m5_ds()` |
-| `m5_fetch.py` | Download the Kaggle files and the reference files |
+| `m5_fetch.py` | Download the Kaggle files, the reference files and the M5 Uncertainty `sample_submission.csv` |
 | `m5_preprocess.py` | Build and cache `m5_ds.nc` |
 | `m5_models.py` | Model registry: each entry is a model plus its settings, picked with `--model` |
 | `m5_run.py` | Fit a registered model, forecast, score, write the submission and append to the run log |
@@ -219,6 +256,9 @@ How well the local scorer matches the official one:
 | `m5_subset.py` | The 3-item × 10-store benchmark subset (#154): its items, the rule that picked them, and the per-item score |
 | `m5_bias.py` | Which mean of the sales a model's forecast tracks, per department, volume tercile and zero-share bin |
 | `m5_score_submission.py` | 12-level WRMSSE of a submission for one window |
+| `m5u_score.py` | M5 Uncertainty: the 12-level hierarchy and the WSPL of per-level quantile forecasts (#157) |
+| `m5u_submission.py` | M5 Uncertainty: write and read a 771,120-row submission in the sample's row order |
+| `m5u_baseline.py` | M5 Uncertainty: empirical-quantile baseline for every series at every level; writes and scores it |
 | `m5_check_weights.py` | Compare the scorer's weights with the official files |
 | `m5_submission_diff.py` | Diagnostic diff of two submissions |
 | `m5_make_accuracy_fixture.py` | Build the committed CI fixture `src/bunobee/datasets/data/m5_aggregate.csv` |
