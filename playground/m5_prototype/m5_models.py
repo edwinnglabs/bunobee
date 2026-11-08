@@ -16,7 +16,9 @@ swap the default uniform priors, set for the log target, for wider or soft ones 
 dummies on or off with its ``dow`` field: ``ssp_level_yeojohnson_halfnormal`` is the default entry without them
 (issue #145). It adds annual Fourier terms, events, month and day of month with its ``covariates`` field (a
 :class:`CalendarCovariates`): the ``*_calendar`` entries are the default entry and the level-only entry with them
-(issue #146).
+(issue #146). :class:`SspReg` is the other way to use them: the covariates are a static regression ``X beta`` outside
+the Kalman filter, with no states of their own, fitted by NUTS, so a design of any width costs the filter the same 7
+states.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from bunobee.models.m5.m5_ssp_optim import (
     fit_batch_series_opt,
     predict_batch_series_opt,
 )
+from bunobee.models.m5.m5_ssp_reg import fit_batch_series_reg, predict_batch_series_reg
 from bunobee.models.m5.transforms import LogTransform, PowerTransform, Transform
 from bunobee.regression import make_fourier_series, make_periodic_dummies
 
@@ -371,6 +374,120 @@ LOG_NORMAL_PRIORS = {
 CALENDAR_COVARIATES = CalendarCovariates(annual_order=1)
 CALENDAR_FIT_CHUNK = 1024
 
+
+@dataclass(frozen=True)
+class SspReg:
+    """Level + weekday SSP with a static regression on shared columns, fitted by NUTS.
+
+    The model of a series, on the scale of ``transform``, is ``level_t + dow_t · alpha_t + x_t · beta``. The level and
+    the six weekday offsets are the filter's seven drifting states, as in ``SspDow(level=True)``. The covariates are
+    not states: ``x_t`` is a row of ``covariates.design(ds)``, the same for every series, and ``beta``, with the prior
+    ``N(0, tau^2)`` on each coefficient, is a parameter of the series with no time dimension (see
+    :mod:`bunobee.models.m5.m5_ssp_reg`). The forecast is the mean over posterior draws of the back-transformed
+    forecast, so it is a posterior mean where ``SspDow`` forecasts from one MAP point.
+
+    Parameters
+    ----------
+    transform : Transform
+        Target transform, by default Yeo-Johnson, fitted once per series and held fixed.
+    sigma_h_prior : SigmaPrior
+        Prior of the noise ``sigma_h``, by default the half-normal prior of the #118 default entry.
+    sigma_q_prior : SigmaPrior
+        Prior of each of the two drifts, by default the half-normal prior of the #118 default entry.
+    covariates : CalendarCovariates | None
+        Calendar columns of the regression, by default None: no regression.
+    tau : float
+        Prior scale of each coefficient, by default 1.0 (loose). 0.1 is tight.
+    num_warmup, num_samples, num_chains : int
+        NUTS warmup and draws per chain, and chains, by default 200, 200 and 4.
+    n_forecast_draws : int
+        Posterior draws the forecast averages, by default 100.
+    fit_chunk : int | None
+        Max series per NUTS run, by default 10. The series of one run share a step size, so a run adapts to the
+        hardest of them, and a smaller chunk fits each series more closely at the cost of more runs. ``None`` = one
+        run over all series.
+    seed : int
+        PRNG seed of every run, by default 0.
+    """
+
+    transform: Transform = PowerTransform("yeo-johnson")
+    sigma_h_prior: SigmaPrior = HALF_NORMAL_PRIORS["sigma_h_prior"]
+    sigma_q_prior: SigmaPrior = HALF_NORMAL_PRIORS["sigma_q_prior"]
+    covariates: CalendarCovariates | None = None
+    tau: float = 1.0
+    num_warmup: int = 200
+    num_samples: int = 200
+    num_chains: int = 4
+    n_forecast_draws: int = 100
+    fit_chunk: int | None = 10
+    seed: int = 0
+
+    def fit_forecast(
+        self,
+        ds: xr.Dataset,
+        series_idx: np.ndarray,
+        fit_mask: np.ndarray,
+        forecast_mask: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Fit and forecast the series in independent NUTS runs of at most ``fit_chunk`` series.
+
+        See :meth:`Model.fit_forecast` for the parameters and returns. ``fitted`` holds, per series, the posterior
+        means of ``sigma_h``, ``sigma_q_level``, ``sigma_q_dow`` and, with covariates, ``beta`` (series × covariates),
+        the transform's parameters, and the worst R-hat (``r_hat_max``, NaN with one chain) and the smallest effective
+        sample size (``n_eff_min``) over the series' parameters. It has no in-sample fit, so ``forecasts.pdf`` draws
+        none.
+        """
+        weekday = ds["day_of_week"].values
+        # The calendar is contiguous daily dates, so phasing step 0 at the first day's weekday (Mon=0) makes each
+        # dummy column a weekday from Tuesday to Sunday on every day, with Monday dropped.
+        Z = make_periodic_dummies(weekday.size, period=7, phase=int(weekday[0]), intercept=True)
+        X = None if self.covariates is None else self.covariates.design(ds)
+        sales = ds["sales"].values[series_idx][:, fit_mask]  # (n_series, n_fit_steps)
+
+        n_series = sales.shape[0]
+        step = self.fit_chunk or n_series
+        n_runs = math.ceil(n_series / step)
+        forecasts = []
+        fitted: dict[str, list[np.ndarray]] = {}
+        for run, start in enumerate(range(0, n_series, step), start=1):
+            end = min(start + step, n_series)
+            if n_runs > 1:
+                logger.info("Fit run %d/%d: series %d-%d", run, n_runs, start, end - 1)
+            result = fit_batch_series_reg(
+                sales[start:end],
+                Z[fit_mask],
+                None if X is None else X[fit_mask],
+                tau=self.tau,
+                transform=self.transform,
+                sigma_h_prior=self.sigma_h_prior,
+                sigma_q_prior=self.sigma_q_prior,
+                num_warmup=self.num_warmup,
+                num_samples=self.num_samples,
+                num_chains=self.num_chains,
+                seed=self.seed,
+            )
+            forecasts.append(
+                predict_batch_series_reg(
+                    result,
+                    Z[forecast_mask],
+                    None if X is None else X[forecast_mask],
+                    n_draws=self.n_forecast_draws,
+                )
+            )
+            samples = result["samples"]
+            outputs = {site: samples[site].mean(axis=0) for site in samples}  # (B,) or (B, n_covariates)
+            outputs |= result["transform_params"]
+            outputs |= {"r_hat_max": result["r_hat_max"], "n_eff_min": result["n_eff_min"]}
+            for key, value in outputs.items():
+                fitted.setdefault(key, []).append(np.asarray(value))
+        return np.concatenate(forecasts), {key: np.concatenate(parts) for key, parts in fitted.items()}
+
+
+#: The regression entries' covariates (see ``WORKFLOW.md``): the event columns alone, and the annual Fourier pair with
+#: the events. Both leave out month and day of month, which the stage 1 covariates of #146 add.
+EVENT_COVARIATES = CalendarCovariates(annual_order=0, month=False, day_of_month=False)
+ANNUAL_EVENT_COVARIATES = CalendarCovariates(annual_order=1, month=False, day_of_month=False)
+
 #: Registered models by name, the choices of ``m5_run.py --model``. The power-transform entries fit Box-Cox of
 #: ``sales + 0.5`` (``boxcox_shift``), Box-Cox of ``max(sales, 0.1)`` (``boxcox_floor``) and Yeo-Johnson, which on
 #: sales is Box-Cox of ``sales + 1`` (``yeojohnson``), each without and with the level state. The ``_wide``,
@@ -412,6 +529,10 @@ MODELS: dict[str, Model] = {
         fit_chunk=CALENDAR_FIT_CHUNK,
         **HALF_NORMAL_PRIORS,
     ),
+    # The NUTS regression entries: the default model's states and priors, a static ``X beta`` outside the filter.
+    "ssp_reg": SspReg(),
+    "ssp_reg_events": SspReg(covariates=EVENT_COVARIATES, tau=1.0),
+    "ssp_reg_annual_events_tight": SspReg(covariates=ANNUAL_EVENT_COVARIATES, tau=0.1),
 }
 
 #: ``m5_run.py``'s default ``--model``: the best entry on the full run at all three origins and on Kaggle (issue

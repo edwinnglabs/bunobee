@@ -91,6 +91,9 @@ LEVEL_ONLY = "ssp_level_yeojohnson_halfnormal"
 CALENDAR = "ssp_level_dow_yeojohnson_halfnormal_calendar"
 LEVEL_CALENDAR = "ssp_level_yeojohnson_halfnormal_calendar"
 
+# The NUTS regression entries: a static ``X beta`` outside the filter, with the default entry's transform and priors.
+REG_ENTRIES = ("ssp_reg", "ssp_reg_events", "ssp_reg_annual_events_tight")
+
 # The calendar of the synthetic dataset starts on M5's d_1, so the fit days run to late March and the forecast days to
 # late April. Two distinct events fall on one day, and one event falls in the forecast days only.
 DATES = pd.date_range("2011-01-29", periods=N_DATES)
@@ -272,7 +275,11 @@ class TestPriors:
 
     @pytest.mark.parametrize(
         "name",
-        [name for name in m5_models.MODELS if name not in {*PRIOR_ENTRIES, LEVEL_ONLY, CALENDAR, LEVEL_CALENDAR}],
+        [
+            name
+            for name in m5_models.MODELS
+            if name not in {*PRIOR_ENTRIES, LEVEL_ONLY, CALENDAR, LEVEL_CALENDAR, *REG_ENTRIES}
+        ],
     )
     def test_other_entries_keep_the_default_priors(self, name):
         model = m5_models.MODELS[name]
@@ -324,7 +331,7 @@ class TestContract:
     def test_forecasts_are_never_negative(self, ds, name):
         forecasts, fitted = m5_models.MODELS[name].fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
         assert (forecasts >= 0).all()
-        assert (fitted.get(m5_models.INSAMPLE_KEY, 0.0) >= 0).all()
+        assert np.all(fitted.get(m5_models.INSAMPLE_KEY, 0.0) >= 0)
 
 
 class TestSspDow:
@@ -387,7 +394,9 @@ class TestDayOfWeekSwitch:
         assert not model.dow
         assert replace(model, dow=True) == m5_models.MODELS[m5_models.DEFAULT_MODEL]
 
-    @pytest.mark.parametrize("name", [name for name in m5_models.MODELS if name not in {LEVEL_ONLY, LEVEL_CALENDAR}])
+    @pytest.mark.parametrize(
+        "name", [name for name in m5_models.MODELS if name not in {LEVEL_ONLY, LEVEL_CALENDAR, *REG_ENTRIES}]
+    )
     def test_every_other_entry_keeps_the_weekday_dummies(self, name):
         assert m5_models.MODELS[name].dow
 
@@ -660,3 +669,64 @@ class TestTransform:
             series = {key: value[i] for key, value in fitted.items()}
             expected = transform.inverse(y - np.asarray(vt)[:, 0], np.asarray(Ft)[:, 0], series)
             np.testing.assert_allclose(fitted[m5_models.INSAMPLE_KEY][i], expected, rtol=1e-4)
+
+
+# Small enough to fit in seconds: the registered entries sample 4 chains of 400 draws.
+FAST_NUTS = {"num_warmup": 30, "num_samples": 30, "num_chains": 2, "n_forecast_draws": 20}
+
+
+class TestSspReg:
+    """The NUTS regression entries: the default's states, transform and priors, with ``X beta`` outside the filter."""
+
+    def test_entries_are_registered(self):
+        assert all(name in m5_models.MODELS for name in REG_ENTRIES)
+        assert all(isinstance(m5_models.MODELS[name], m5_models.SspReg) for name in REG_ENTRIES)
+
+    @pytest.mark.parametrize("name", REG_ENTRIES)
+    def test_transform_and_priors_are_the_default_entrys(self, name):
+        model, default = m5_models.MODELS[name], m5_models.MODELS[m5_models.DEFAULT_MODEL]
+        assert (model.transform, model.sigma_h_prior, model.sigma_q_prior) == (
+            default.transform,
+            default.sigma_h_prior,
+            default.sigma_q_prior,
+        )
+
+    def test_the_entries_differ_by_covariates_and_tau(self):
+        plain, events, tight = (m5_models.MODELS[name] for name in REG_ENTRIES)
+        assert plain.covariates is None
+        assert (events.covariates, events.tau) == (m5_models.EVENT_COVARIATES, 1.0)
+        assert (tight.covariates, tight.tau) == (m5_models.ANNUAL_EVENT_COVARIATES, 0.1)
+
+    def test_event_and_annual_covariates_have_no_month_or_day_of_month_columns(self, ds):
+        assert m5_models.EVENT_COVARIATES.design(ds).shape == (N_DATES, 3)
+        assert m5_models.ANNUAL_EVENT_COVARIATES.design(ds).shape == (N_DATES, 5)
+
+    @pytest.mark.parametrize(
+        ("name", "n_covariates"), [("ssp_reg", 0), ("ssp_reg_events", 3), ("ssp_reg_annual_events_tight", 5)]
+    )
+    def test_fitted_arrays(self, ds, name, n_covariates):
+        model = replace(m5_models.MODELS[name], **FAST_NUTS)
+        _, fitted = model.fit_forecast(ds, np.arange(N_SERIES), FIT_MASK, FORECAST_MASK)
+        assert {"sigma_h", "sigma_q_level", "sigma_q_dow", "r_hat_max", "n_eff_min"} <= set(fitted)
+        assert ("beta" in fitted) == bool(n_covariates)
+        if n_covariates:
+            assert fitted["beta"].shape == (N_SERIES, n_covariates)
+        assert m5_models.INSAMPLE_KEY not in fitted
+
+    def test_chunks_keep_the_order_of_series_idx(self, ds):
+        # The synthetic levels are 0.5, 2, 5 and 12 for series 0 to 3, so the forecasts follow the order asked for.
+        model = replace(m5_models.MODELS["ssp_reg"], fit_chunk=2, **FAST_NUTS)
+        forecasts, fitted = model.fit_forecast(ds, np.array([3, 0, 2]), FIT_MASK, FORECAST_MASK)
+        assert forecasts.shape == (3, HORIZON)
+        means = forecasts.mean(axis=1)
+        assert means[0] > means[2] > means[1]
+        assert all(np.shape(value)[0] == 3 for value in fitted.values())
+
+    def test_an_event_in_the_forecast_days_moves_the_forecast_only_with_covariates(self, ds):
+        # The forecast days hold one "Easter" event: the forecast ignores it without covariates, not with them.
+        plain = replace(m5_models.MODELS["ssp_reg"], **FAST_NUTS)
+        events = replace(m5_models.MODELS["ssp_reg_events"], **FAST_NUTS)
+        idx = np.arange(N_SERIES)
+        a, _ = plain.fit_forecast(ds, idx, FIT_MASK, FORECAST_MASK)
+        b, _ = events.fit_forecast(ds, idx, FIT_MASK, FORECAST_MASK)
+        assert not np.allclose(a, b)
