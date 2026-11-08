@@ -92,6 +92,67 @@ class Transform(Protocol):
         """
         ...
 
+    def to_units(self, z: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Map values on the transformed scale to units: the inverse of ``forward``, kept within the admissible sales.
+
+        Unlike ``inverse`` it maps each value as it is, not a Gaussian forecast, so it takes draws or quantiles of the
+        forecast distribution to the same distribution in units. It is monotone in ``z``.
+
+        Parameters
+        ----------
+        z : np.ndarray
+            Values on the transformed scale, of shape ``(..., n_steps)``. Leading dimensions beyond the series'
+            own, e.g. one of draws, broadcast against the parameters.
+        params : Mapping of str to Any
+            Holds at least the parameters ``fit`` returned, for the same series.
+
+        Returns
+        -------
+        np.ndarray
+            Values in units, of the shape of ``z``, never negative.
+        """
+        ...
+
+    def quantile(self, mu: np.ndarray, var: np.ndarray, u: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Quantiles in units of a Gaussian forecast on the transformed scale.
+
+        The transform is monotone, so the ``u`` quantile of the forecast in units is ``to_units`` of the ``u``
+        quantile ``mu + sqrt(var) * ndtri(u)`` of the Gaussian: these are the exact quantiles of the distribution
+        ``inverse`` takes the mean of, floored at 0.
+
+        Parameters
+        ----------
+        mu, var : np.ndarray
+            Forecast mean and variance on the transformed scale, of shape ``(..., horizon)``.
+        u : np.ndarray
+            Quantile levels in (0, 1), of shape ``(n_quantiles,)``.
+        params : Mapping of str to Any
+            Holds at least the parameters ``fit`` returned, for the same series.
+
+        Returns
+        -------
+        np.ndarray
+            Quantiles in units, of shape ``(..., n_quantiles, horizon)``, increasing along the quantile axis.
+        """
+        ...
+
+
+def _gaussian_quantile(
+    transform: Transform, mu: np.ndarray, var: np.ndarray, u: np.ndarray, params: Mapping[str, Any]
+) -> np.ndarray:
+    """Quantiles of a Gaussian forecast in units; see :meth:`Transform.quantile`.
+
+    The quantile axis leads while the quantiles are mapped, so the per-series parameters broadcast as they do for
+    a forecast, and moves to second-to-last at the end.
+    """
+    u = np.asarray(u, dtype=np.float64)
+    if u.ndim != 1 or not ((u > 0) & (u < 1)).all():
+        raise ValueError("u must be a 1-D array of quantile levels strictly between 0 and 1")
+    mu, var = np.asarray(mu), np.asarray(var)
+    sd = np.sqrt(np.maximum(var, 0.0))
+    z = mu + sd * special.ndtri(u).reshape((-1,) + (1,) * mu.ndim)  # (n_quantiles, ..., horizon)
+    return np.moveaxis(transform.to_units(z, params), 0, -2)
+
 
 @dataclass(frozen=True)
 class LogTransform:
@@ -124,6 +185,14 @@ class LogTransform:
     def inverse(self, mu: np.ndarray, var: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
         """Return ``exp(mu + var / 2) * response_norm``; see :meth:`Transform.inverse`."""
         return np.exp(mu + 0.5 * var) * _per_series(params["response_norm"])
+
+    def to_units(self, z: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return ``exp(z) * response_norm``; see :meth:`Transform.to_units`."""
+        return np.exp(z) * _per_series(params["response_norm"])
+
+    def quantile(self, mu: np.ndarray, var: np.ndarray, u: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return the lognormal's quantiles; see :meth:`Transform.quantile`."""
+        return _gaussian_quantile(self, mu, var, u, params)
 
 
 #: Methods of :class:`PowerTransform`, as scikit-learn's ``PowerTransformer`` names them.
@@ -263,3 +332,22 @@ class PowerTransform:
                     w = np.exp(start + half * (1 + node))
                     mean += weight * half * w * special.ndtr((centre - special.boxcox(w, lmbda)) / spread)
         return np.maximum(mean - self._offset - self.shift, 0.0).astype(np.result_type(mu, var))
+
+    def to_units(self, z: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return the inverse power of ``z``, censored to the series' admissible sales; see :meth:`Transform.to_units`.
+
+        As in :meth:`inverse`, ``z`` is censored to the power of no sales and, where the power is bounded above, of
+        the largest sales, so a value beyond them maps to 0 or ``sales_max`` and nothing maps to a NaN.
+        """
+        lmbda, loc, scale, sales_max = (
+            _per_series(np.asarray(params[key], dtype=np.float64)) for key in ("lmbda", "loc", "scale", "sales_max")
+        )
+        w_low, w_high = self._input(0.0) + self._offset, self._input(sales_max) + self._offset
+        z_low, z_high = special.boxcox(w_low, lmbda), special.boxcox(w_high, lmbda)
+        centre = loc + scale * np.asarray(z, dtype=np.float64)
+        w = np.clip(special.inv_boxcox(np.clip(centre, z_low, z_high), lmbda), w_low, w_high)
+        return np.maximum(w - self._offset - self.shift, 0.0).astype(np.result_type(z, np.float32))
+
+    def quantile(self, mu: np.ndarray, var: np.ndarray, u: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return the quantiles of the censored sales the Gaussian implies; see :meth:`Transform.quantile`."""
+        return _gaussian_quantile(self, mu, var, u, params)
