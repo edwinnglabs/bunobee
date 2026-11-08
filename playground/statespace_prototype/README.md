@@ -87,6 +87,18 @@ own data and can be read on their own once `ssp_02`/`ssp_03` have introduced tim
   variance, a tight prior dominates a loose one, an undisclosed operand passes the other through), n-ary fusion via
   `functools.reduce`, and the coordinate/positivity contract checks.
 
+## Research notebook — `ssp_12`
+
+- **`ssp_12_lasso_sparse_priors` — LASSO-type sparse priors for the M5 covariates, with fast inference** (issue #155,
+  part of the #143 re-plan): compares, on the 3-item × 10-store M5 benchmark subset of
+  [`m5_subset.py`](../m5_prototype/m5_subset.py), the #118 default and `SspReg` against an optimisation-only L1 and
+  group-L1 fit (Adam plus a proximal soft-threshold on a static `X beta`), NUTS with a Laplace and a regularized
+  horseshoe prior on `beta`, and SVI (`AutoNormal`) on the same two priors, by pre-validation WRMSSE and fit time. It
+  lists the numpyro modules each approach uses and the pieces that are missing (an inverse-Gaussian sampler, a
+  full-covariance filter, a simulation smoother), and ends with a recommendation of what to build as an M5 entry. It
+  needs the M5 dataset (`m5_fetch.py`, `m5_preprocess.py`) and the `m5` extra, is committed without outputs, and takes
+  about 70 minutes end to end, almost all of it the two sparse-prior NUTS fits.
+
 ## Running the notebooks
 
 The notebooks require the `bunobee` package and its JAX / NumPyro stack (`requires-python >= 3.11`). From the repo
