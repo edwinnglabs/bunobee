@@ -111,9 +111,7 @@ class TestJointQuantiles:
         bottom = self._forecasts(hierarchy, dependence, gaussian)[-1]
         for series in range(N_SERIES):
             group = hierarchy.group_idx[-1][series]
-            expected = stats.lognorm.ppf(
-                QUANTILES, s=0.5, scale=np.exp(gaussian.mu[series, 0]) * RESPONSE_NORM[series]
-            )
+            expected = stats.lognorm.ppf(QUANTILES, s=0.5, scale=np.exp(gaussian.mu[series, 0]) * RESPONSE_NORM[series])
             np.testing.assert_allclose(bottom[group, :, 0], expected, rtol=1e-6)
 
     def test_bottom_level_follows_the_hierarchy_order_of_a_shuffled_subset(self):

@@ -569,4 +569,3 @@ class TestQuantile:
     def test_levels_outside_the_open_interval_raise(self, u):
         with pytest.raises(ValueError, match="quantile levels"):
             LogTransform().quantile(np.zeros((1, 2)), np.ones((1, 2)), np.array(u), {"response_norm": np.ones(1)})
-

@@ -780,4 +780,3 @@ class TestGaussianForecast:
         assert residuals.shape == (N_SERIES, N_FIT) and np.isfinite(residuals).all()
         expected = (gaussian.transform.forward(sales, gaussian.params) - gaussian.fit_mu) / np.sqrt(gaussian.fit_var)
         np.testing.assert_allclose(residuals, expected, rtol=1e-5, atol=1e-6)
-
