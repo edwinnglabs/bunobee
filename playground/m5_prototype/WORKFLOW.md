@@ -15,7 +15,7 @@ where to work on the model. For prerequisites, every command and flag, and the r
 
 | Step | Writes | Rerun when |
 |---|---|---|
-| `m5_fetch.py` | 9 CSVs in `playground/resource/m5-forecasting-accuracy/` | A file is missing (it skips files already there) or corrupted (`--force`) |
+| `m5_fetch.py` | 9 CSVs in `playground/resource/m5-forecasting-accuracy/`, and the Uncertainty `sample_submission.csv` in `m5-forecasting-uncertainty/` | A file is missing (it skips files already there) or corrupted (`--force`) |
 | `m5_preprocess.py` | `m5_ds.nc` in the same directory | You change `m5_preprocess.py`, e.g. to add a variable. Pass `--force`: on its own the script rebuilds only when the cache lacks the test-window actuals |
 | `m5_check_weights.py` | Nothing; prints a comparison | You change how the scorer computes weights |
 | `m5_run.py` | `output/<timestamp>/` and a row of `output/runs.csv` | Every experiment |

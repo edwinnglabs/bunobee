@@ -16,6 +16,9 @@ from pathlib import Path
 import xarray as xr
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "resource" / "m5-forecasting-accuracy"
+#: Where the M5 Uncertainty competition's ``sample_submission.csv`` lives. It shares its name with the accuracy
+#: competition's file, so it has a folder of its own; the sales data are the accuracy ones in :data:`DATA_DIR`.
+UNCERTAINTY_DIR = DATA_DIR.parent / "m5-forecasting-uncertainty"
 DS_FILE = "m5_ds.nc"
 
 
