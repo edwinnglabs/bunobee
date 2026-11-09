@@ -68,7 +68,8 @@ from bunobee.regression import RegressionScheme, make_fourier_series, make_perio
 logger = logging.getLogger(__name__)
 
 # The accuracy guard runs a real NUTS fit, so it is materially slower than the rest of the suite. It
-# stays in the default CI run; local iteration can deselect it with ``pytest -m "not slow"``.
+# runs in its own parallel CI job (``pytest -m slow``); the fast job and local iteration deselect it
+# with ``pytest -m "not slow"``.
 pytestmark = pytest.mark.slow
 
 _ROOT = Path(__file__).resolve().parents[1]
