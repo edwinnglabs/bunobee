@@ -26,8 +26,8 @@ handful of units (e.g. ``TOTAL = 14`` against a ~30 000 baseline), and six of th
 ``state x cat`` aggregates read exactly zero. Those are the only zeros anywhere in the panel. A hard
 zero makes MAPE undefined and the near-zero neighbours make it explode, so the closure dates are
 repaired in place with the same-weekday average of the surrounding weeks — ``(y[t - 7] + y[t + 7]) /
-2``, rounded to the nearest unit. The repair is deterministic and is re-applied by the provenance
-test, so the committed copy still cannot drift.
+2``, rounded to the nearest unit. The repair is deterministic and is re-applied by ``--check``, so the committed copy can be
+verified against the raw dump.
 
 Calendar covariates
 -------------------
@@ -385,9 +385,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=_DEFAULT_DATA_DIR, help="raw M5 CSV directory")
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT, help="fixture CSV path")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="rebuild the aggregate from the raw files and compare it with the file at --output, without writing",
+    )
     args = parser.parse_args()
 
     panel = build_m5_aggregate(args.data_dir)
+    if args.check:
+        committed = pd.read_csv(args.output, parse_dates=["date"], keep_default_na=False)
+        try:
+            pd.testing.assert_frame_equal(committed, panel, check_dtype=False)
+        except AssertionError as exc:
+            raise SystemExit(f"{args.output} does not match the raw files:\n{exc}") from exc
+        print(f"{args.output} matches the raw files ({len(panel)} rows)")
+        return
     digest = write_fixture(panel, args.output)
 
     dates = panel["date"]

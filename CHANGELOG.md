@@ -65,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Behavior is unchanged. The transforms are documented as written for non-negative series. `LogTransform`'s floor is
   in the units of the data.
+- No unit test reads the raw M5 files any more. The test that rebuilt the packaged aggregate panel from them is now
+  `playground/m5_prototype/m5_make_accuracy_fixture.py --check`; the pinned digest of the committed panel is still
+  tested.
 
 ### Removed
 

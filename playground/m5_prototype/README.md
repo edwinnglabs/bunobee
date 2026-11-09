@@ -16,7 +16,8 @@ For the tutorial, install the `optim` extra: `pip install -e ".[optim]"` (adds `
 
 ## Rebuilding the packaged panel
 
-Only needed if you change `m5_make_accuracy_fixture.py`. All commands run from the repo root, and every downloaded
+Only needed if you change `m5_make_accuracy_fixture.py`. No unit test reads the raw files; `--check` is the way to
+compare the packaged panel with them. All commands run from the repo root, and every downloaded
 or generated file is gitignored.
 
 1. The Kaggle CLI: `pip install kaggle`, on `PATH`.
@@ -30,6 +31,7 @@ or generated file is gitignored.
 ```sh
 python playground/m5_prototype/m5_fetch.py          # download the raw files into playground/resource/
 python playground/m5_prototype/m5_preprocess.py     # build the cached dataset m5_ds.nc (~550 MB)
-python playground/m5_prototype/m5_make_accuracy_fixture.py
-pytest tests/test_m5_accuracy.py                    # the provenance tests check the rebuilt file's digest
+python playground/m5_prototype/m5_make_accuracy_fixture.py          # rewrite the packaged panel
+python playground/m5_prototype/m5_make_accuracy_fixture.py --check  # or only compare it with the raw files
+pytest tests/test_m5_accuracy.py                                    # the pinned digest must match the rebuilt file
 ```
