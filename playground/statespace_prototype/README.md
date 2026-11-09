@@ -87,28 +87,6 @@ own data and can be read on their own once `ssp_02`/`ssp_03` have introduced tim
   variance, a tight prior dominates a loose one, an undisclosed operand passes the other through), n-ary fusion via
   `functools.reduce`, and the coordinate/positivity contract checks.
 
-## Research notebooks — `ssp_12`, `ssp_13`
-
-- **`ssp_12_lasso_sparse_priors` — LASSO-type sparse priors for the M5 covariates, with fast inference** (issue #155,
-  part of the #143 re-plan): compares, on the 3-item × 10-store M5 benchmark subset of
-  [`m5_subset.py`](../m5_prototype/m5_subset.py), the #118 default and `SspReg` against an optimisation-only L1 and
-  group-L1 fit (Adam plus a proximal soft-threshold on a static `X beta`), NUTS with a Laplace and a regularized
-  horseshoe prior on `beta`, and SVI (`AutoNormal`) on the same two priors, by pre-validation WRMSSE and fit time. It
-  lists the numpyro modules each approach uses and the pieces that are missing (an inverse-Gaussian sampler, a
-  full-covariance filter, a simulation smoother), and ends with a recommendation of what to build as an M5 entry. It
-  needs the M5 dataset (`m5_fetch.py`, `m5_preprocess.py`) and the `m5` extra, is committed without outputs, and takes
-  about 70 minutes end to end, almost all of it the two sparse-prior NUTS fits.
-
-- **`ssp_13_hierarchical_pooling` — Hierarchical pooling across an item's stores** (issue #156, part of the #143
-  re-plan): on the same 3-item × 10-store subset, compares the #118 default with pooling variants by pre-validation
-  WRMSSE (subset total and per item) and fit time: reconciled bottom-up / OLS / WLS / MinT forecasts, no, full and partial
-  pooling of the covariate coefficients (`beta = item part + store deviation`, MAP and one NUTS run), a static weekly
-  pattern shared, or partly shared, by an item's stores, a shared drifting weekly pattern, and correlated store levels
-  (SUTSE) in a small joint multi-observation Kalman filter written in the notebook and checked against the batch filter.
-  The variants are also scored at the validation and evaluation origins. It ends with a recommendation of what to
-  register as an M5 entry. It needs the M5 dataset (`m5_fetch.py`, `m5_preprocess.py`) and the `m5` extra, is committed
-  without outputs, and takes about 21 minutes end to end.
-
 ## Running the notebooks
 
 The notebooks require the `bunobee` package and its JAX / NumPyro stack (`requires-python >= 3.11`). From the repo

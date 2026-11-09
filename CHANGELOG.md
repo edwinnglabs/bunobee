@@ -13,15 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `to_units` and `quantile` on the M5 `Transform`s (`LogTransform`, `PowerTransform`) and
-  `forecast_gaussian_batch_series_opt` in `bunobee.models.m5.m5_ssp_optim` — map the Gaussian forecast of a MAP-fitted
-  SSP to its exact quantiles in units, floored at 0, instead of a point forecast. `predict_batch_series_opt` is
+- `to_units` and `quantile` on the `Transform`s (`LogTransform`, `PowerTransform`) and
+  `forecast_gaussian_map_batch` in `bunobee.models.ssp.map_fit` — map the Gaussian forecast of a MAP-fitted
+  SSP to its exact quantiles in units, floored at 0, instead of a point forecast. `predict_map_batch` is
   unchanged.
 - `load_m5_aggregate()` returns more columns alongside `date`, `series_id` and `sales`, so a notebook can use them
-  without the raw M5 download: the calendar covariates of the M5 stage 1 entries (`annual_sin_1`, `annual_cos_1`,
+  without the raw M5 download: the calendar covariates (`annual_sin_1`, `annual_cos_1`,
   `event_name_1`, `event_name_2`, `month_of_year`, `day_of_month`) and a fixed-basket `price_index`, which
   `playground/m5_prototype/m5_make_accuracy_fixture.py` defines. `sales` is unchanged.
-- `fixed_states` argument on `fit_one_series_opt` and `fit_batch_series_opt` — a boolean mask of states whose drift is
+- `fixed_states` argument on `fit_map` and `fit_map_batch` — a boolean mask of states whose drift is
   0, for covariates with fixed coefficients. A drift no state uses has no term in the loss. The default `None` leaves
   the fit unchanged.
 - `fourier` argument on `build_forecast_design` — continues Fourier columns, as built by `make_fourier_series`, past
@@ -47,9 +47,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forecast noise. An unknown `noise_dist`, or bounds outside `0 < min_nu < max_nu`, raise `ValueError`; the default
   `"normal"` leaves the model unchanged.
 
+### Changed
+
+- **Breaking:** the MAP fitters and the target transforms left the M5 package and lost their M5 names. Update imports
+  and calls as follows:
+
+  | Before (`0.0.6`) | Now |
+  |---|---|
+  | `bunobee.models.m5.transforms` | `bunobee.target_transforms` |
+  | `bunobee.models.m5.m5_ssp_optim` | `bunobee.models.ssp.map_fit` |
+  | `fit_one_series_opt`, `predict_one_series_opt` | `fit_map`, `predict_map` |
+  | `fit_batch_series_opt`, `predict_batch_series_opt` | `fit_map_batch`, `predict_map_batch` |
+  | `forecast_gaussian_batch_series_opt` | `forecast_gaussian_map_batch` |
+  | the `sales` and `sales_matrix` arguments | `values` |
+  | the `sales_max` parameter of `PowerTransform` | `max_value` |
+  | the `m5` extra | the `optim` extra |
+
+  Behavior is unchanged. The transforms are documented as written for non-negative series. `LogTransform`'s floor is
+  in the units of the data.
+- No unit test reads the raw M5 files any more. The test that rebuilt the packaged aggregate panel from them is now
+  `playground/m5_prototype/m5_make_accuracy_fixture.py --check`; the pinned digest of the committed panel is still
+  tested.
+
+### Removed
+
+- `bunobee.models.m5.m5_ssp_mcmc` (the single-series NUTS fit and its predictor) and `bunobee.models.m5.m5_ssp_reg`
+  (`SspReg`, the NUTS regression with a static `X beta`). The comparison of M5 models, its scoring and submission
+  scripts, and the research notebooks `ssp_12` and `ssp_13` moved out of this repository. What stays under
+  `playground/m5_prototype/` is the packaged aggregate panel, the script that rebuilds it and two notebooks that use it.
+
 ### Fixed
 
-- `fit_one_series_opt` and `fit_batch_series_opt` no longer add the prior of the shared drift to the loss of a one-state
+- `fit_map` and `fit_map_batch` no longer add the prior of the shared drift to the loss of a one-state
   design, which has no shared drift. The term changed which step's parameters were kept. Designs with two or more
   states are unchanged.
 

@@ -170,6 +170,37 @@ print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, 
 
 A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb`](playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb).
 
+### Fast MAP fits for many series
+
+For hundreds or thousands of non-negative series (sales, counts, demand), `fit_map_batch` fits the linear state-space
+model to all of them in parallel by MAP instead of NUTS, in seconds and without posterior uncertainty. The target is
+fitted on a transform scale (`LogTransform` by default, or a Box-Cox / Yeo-Johnson `PowerTransform` with a λ per
+series) and mapped back to units. It needs the `optim` extra: `pip install "bunobee[optim]"`.
+
+```python
+import jax.numpy as jnp
+import numpy as np
+
+from bunobee.models.ssp.map_fit import fit_map_batch, predict_map_batch
+from bunobee.regression import make_periodic_dummies
+from bunobee.target_transforms import PowerTransform
+
+n_fit, horizon = 200, 28
+rng = np.random.default_rng(0)
+values = rng.poisson(5.0, size=(100, n_fit)).astype(np.float32)  # 100 non-negative series
+
+# One design for all series: a level plus weekday dummies, built over the fit and forecast days.
+Z = np.asarray(make_periodic_dummies(n_fit + horizon, period=7, intercept=True), dtype=np.float32)
+
+fit = fit_map_batch(values, Z=jnp.asarray(Z[:n_fit]), transform=PowerTransform("yeo-johnson"))
+forecast = predict_map_batch(fit, Z_future=Z[n_fit:])  # (100, 28), in the units of `values`
+```
+
+The recipe was developed on the [M5 Forecasting — Accuracy](https://www.kaggle.com/competitions/m5-forecasting-accuracy)
+data. `bunobee.datasets.load_m5_aggregate()` returns ten aggregated M5 series, and
+[`playground/m5_prototype/ssp_m5_aggregate_forecast_seasonality.ipynb`](playground/m5_prototype/ssp_m5_aggregate_forecast_seasonality.ipynb)
+fits one with annual and event covariates.
+
 ## Development
 
 Notebooks under `playground/` are committed **without outputs**, so the repo stays small and diffs stay

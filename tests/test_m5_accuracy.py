@@ -9,7 +9,7 @@ now fails the suite instead of merely printing a worse number.
 The data is ``bunobee.datasets.load_m5_aggregate()``, backed by the packaged
 ``src/bunobee/datasets/data/m5_aggregate.csv``, built by
 ``playground/m5_prototype/m5_make_accuracy_fixture.py`` from the M5 Forecasting — Accuracy competition
-dump. That dump is 980 MB and untracked (``*.csv`` / ``*.nc`` are gitignored), so CI cannot see it; the
+dump. That dump is 980 MB and untracked (``*.csv`` / ``*.nc`` are gitignored), so no test reads it; the
 committed file is a derived aggregate of it — 3 states x 3 categories plus a national ``TOTAL``, summed
 over all 30 490 item-store series, for the last ``N_STEPS + HORIZON`` observed days — not a
 redistribution of the raw competition data. It is packaged rather than kept test-only so the same panel
@@ -25,9 +25,8 @@ The panel also carries the calendar covariates of stage 1 of #143 and a fixed-ba
 notebook can read them without the raw dump. The harnesses below ignore them and score ``sales`` only. The builder's
 docstring defines the index, and :class:`TestFixtureProvenance` and :class:`TestPriceIndexDefinition` check it.
 
-:class:`TestFixtureProvenance` mirrors the class of the same name in ``tests/test_ssp_forecast_e2e.py``:
-the grid checks always run, and the re-derivation check rebuilds the aggregate from the raw dump
-whenever a working copy has it, so the committed copy cannot silently drift.
+:class:`TestFixtureProvenance` checks the committed file alone: its grid, its density and its pinned digest. No
+test reads the raw dump. To check that the committed copy still matches the dump, run the builder with ``--check``.
 
 :class:`TestAccuracyHarness` scores the panel. The path is the one
 ``tests/test_ssp_forecast_e2e.py`` already walks — ``_ekf_prior`` -> :func:`transform_to_ekf_st` ->
@@ -74,7 +73,6 @@ pytestmark = pytest.mark.slow
 
 _ROOT = Path(__file__).resolve().parents[1]
 M5_PANEL = M5_AGGREGATE_PATH
-M5_SOURCE = _ROOT / "playground" / "resource" / "m5-forecasting-accuracy"
 M5_BUILDER = _ROOT / "playground" / "m5_prototype" / "m5_make_accuracy_fixture.py"
 
 # Window and panel shape. Mirrors the builder's constants on purpose: declaring them again here means a
@@ -119,7 +117,7 @@ FLOAT_DECIMALS = 6
 N_EVENT_NAMES = 30
 
 # SHA-256 of the committed fixture, as printed by the builder on 2026-11-06. Pinning it makes a
-# hand-edited value fail everywhere, not only where the raw dump is on hand to re-derive against.
+# hand-edited value fail. ``m5_make_accuracy_fixture.py --check`` re-derives the file from the raw dump by hand.
 FIXTURE_SHA256 = "218bf77d6301a05ac6edcb2d2328c0f505d15f382f434f374b55ec8ea84a6843"
 
 # The fixture is a committed test asset, not a data release; keep it small enough to stay one.
@@ -284,16 +282,6 @@ class TestFixtureProvenance:
         content = M5_PANEL.read_bytes().replace(b"\r\n", b"\n")
 
         assert hashlib.sha256(content).hexdigest() == FIXTURE_SHA256
-
-    def test_matches_the_m5_dump_when_available(self):
-        # The raw competition dump is gitignored, so this only runs where a working copy has it.
-        if not M5_SOURCE.exists():
-            pytest.skip(f"raw M5 data not available at {M5_SOURCE}")
-
-        expected = _load_builder().build_m5_aggregate(M5_SOURCE)
-        committed = _read_panel()
-
-        pd.testing.assert_frame_equal(committed, expected, check_dtype=False)
 
     def test_calendar_columns_hold_one_value_per_date(self):
         by_date = _read_panel().groupby("date")[CALENDAR_COLUMNS].nunique()

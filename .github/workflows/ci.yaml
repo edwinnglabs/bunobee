@@ -22,7 +22,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install package with test tooling
-        run: pip install -e ".[test,m5]"
+        run: pip install -e ".[test,optim]"
 
       - name: Lint with black
         run: black --check .

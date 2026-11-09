@@ -26,17 +26,16 @@ handful of units (e.g. ``TOTAL = 14`` against a ~30 000 baseline), and six of th
 ``state x cat`` aggregates read exactly zero. Those are the only zeros anywhere in the panel. A hard
 zero makes MAPE undefined and the near-zero neighbours make it explode, so the closure dates are
 repaired in place with the same-weekday average of the surrounding weeks — ``(y[t - 7] + y[t + 7]) /
-2``, rounded to the nearest unit. The repair is deterministic and is re-applied by the provenance
-test, so the committed copy still cannot drift.
+2``, rounded to the nearest unit. The repair is deterministic and is re-applied by ``--check``, so the committed copy can be
+verified against the raw dump.
 
 Calendar covariates
 -------------------
-Stage 1 of #143 (``m5_models.CALENDAR_COVARIATES``) in columns a demo can read without the raw dump, one value per
-date, repeated on each of its rows:
+Calendar features in columns a demo can read without the raw dump, one value per date, repeated on each of its rows:
 
-- ``annual_sin_1``, ``annual_cos_1``: the annual Fourier terms, ``make_fourier_series`` columns for the stage 1 period
-  and order. Step 0 is the first day of the M5 calendar, 2011-01-29, as in the stage 1 design, not the first day of
-  this window.
+- ``annual_sin_1``, ``annual_cos_1``: the annual Fourier terms, ``make_fourier_series`` columns of period 365.25 days and
+  order 1. Step 0 is the first day of the M5 calendar, 2011-01-29, not the first day of this window, so a design
+  that starts on the calendar's first day lines up with them.
 - ``event_name_1``, ``event_name_2``: the M5 event names, ``""`` on a day without one. They stay names, because one
   0/1 column per event would not fit the file's size budget.
 - ``month_of_year`` (1-12), ``day_of_month`` (1-31).
@@ -124,6 +123,8 @@ N_DATES = N_STEPS + HORIZON
 TOTAL_SERIES = "TOTAL"
 N_SERIES = 10  # 3 states x 3 categories, plus the national total
 PERIOD = 7  # weekly cycle, used to repair the Christmas closure
+ANNUAL_PERIOD = 365.25  # days, of the annual Fourier columns
+ANNUAL_ORDER = 1  # harmonics of the annual Fourier columns: one sine and one cosine
 
 # Splits carrying observed sales; d_1942+ ("test") is NaN in the competition files.
 _OBSERVED_SPLITS = ("train", "validation")
@@ -131,7 +132,7 @@ _OBSERVED_SPLITS = ("train", "validation")
 _EVENT_COLUMNS = ("event_name_1", "event_name_2")
 _DECIMALS = 6  # of the float columns: enough for a covariate, and a platform's last bits cannot reach the digest
 
-#: The file's columns, in order. ``annual_*`` follows ``m5_models.CALENDAR_COVARIATES``.
+#: The file's columns, in order.
 PANEL_COLUMNS = (
     "date",
     "series_id",
@@ -318,12 +319,11 @@ def calendar_covariates(ds: xr.Dataset) -> pd.DataFrame:
     pd.DataFrame
         Frame indexed by ``date``, with the calendar columns of :data:`PANEL_COLUMNS`.
     """
-    stage_1 = _load_sibling("m5_models").CALENDAR_COVARIATES
-    terms = make_fourier_series(ds.sizes["date"], period=stage_1.annual_period, order=stage_1.annual_order)
+    terms = make_fourier_series(ds.sizes["date"], period=ANNUAL_PERIOD, order=ANNUAL_ORDER)
     columns = {
         f"annual_{kind}_{k}": np.round(terms[:, offset + k - 1], _DECIMALS)
-        for offset, kind in ((0, "sin"), (stage_1.annual_order, "cos"))
-        for k in range(1, stage_1.annual_order + 1)
+        for offset, kind in ((0, "sin"), (ANNUAL_ORDER, "cos"))
+        for k in range(1, ANNUAL_ORDER + 1)
     }
     for name in _EVENT_COLUMNS:
         values = ds[name].values
@@ -385,9 +385,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=_DEFAULT_DATA_DIR, help="raw M5 CSV directory")
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT, help="fixture CSV path")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="rebuild the aggregate from the raw files and compare it with the file at --output, without writing",
+    )
     args = parser.parse_args()
 
     panel = build_m5_aggregate(args.data_dir)
+    if args.check:
+        committed = pd.read_csv(args.output, parse_dates=["date"], keep_default_na=False)
+        try:
+            pd.testing.assert_frame_equal(committed, panel, check_dtype=False)
+        except AssertionError as exc:
+            raise SystemExit(f"{args.output} does not match the raw files:\n{exc}") from exc
+        print(f"{args.output} matches the raw files ({len(panel)} rows)")
+        return
     digest = write_fixture(panel, args.output)
 
     dates = panel["date"]

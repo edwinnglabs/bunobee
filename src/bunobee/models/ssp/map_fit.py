@@ -1,19 +1,24 @@
-"""M5 SSP models fitted by MAP (Adam) instead of NUTS.
+"""MAP fits of the linear state-space model, one series at a time or many in parallel.
 
-The ``predict_*_opt`` helpers here are deprecated in favor of
-:func:`bunobee.models.ssp.forecast.forecast_ssp`; they are retained because their
-closed-form lognormal-mean correction has no posterior-replay equivalent. See each
-function's deprecation note for the migration path.
+:func:`fit_map` fits one series and :func:`fit_map_batch` fits ``B`` independent series with ``jax.vmap``. Both
+maximise the Kalman filter's log likelihood plus the log priors of the noise and the drifts with Adam, much faster
+than NUTS and without posterior uncertainty, and return the parameters of the lowest loss over their steps. The
+design matrix ``Z`` of shape ``(n_steps, n_states)`` is shared by all series: a local level, a seasonal pattern, a
+trend or regression columns are whatever the caller puts in it. The first state drifts on its own; the other states
+share one drift, and ``fixed_states`` gives the states it names no drift, for coefficients that do not move.
 
-The fitters take the target transform as an argument (see :mod:`bunobee.models.m5.transforms`), by default
-:class:`~bunobee.models.m5.transforms.LogTransform`, and the predictors invert the transform a fit used. They take
+The fitters take the target transform as an argument (see :mod:`bunobee.target_transforms`), by default
+:class:`~bunobee.target_transforms.LogTransform`, and the predictors invert the transform a fit used. They take
 the priors of the noise and the drifts as arguments too (see :class:`SigmaPrior`), by default the uniform priors
-:data:`SIGMA_H_PRIOR` and :data:`SIGMA_Q_PRIOR`, and return the parameters of the lowest loss over their steps. Their
-``fixed_states`` argument gives the states it names no drift, for covariates with fixed coefficients.
+:data:`SIGMA_H_PRIOR` and :data:`SIGMA_Q_PRIOR`. Their filtered covariances are diagonal, so the forecast variance
+the predictors use is approximate.
 
-This module drives the optimization-mode demo and is the only part of ``bunobee`` that
-needs ``optax`` and ``tqdm``. Those live behind the optional ``m5`` extra, so importing
-this module requires ``pip install 'bunobee[m5]'``.
+The ``predict_*`` helpers here are deprecated in favor of :func:`bunobee.models.ssp.forecast.forecast_ssp`; they are
+retained because their closed-form lognormal-mean correction has no posterior-replay equivalent. See each
+function's deprecation note.
+
+This module is the only part of ``bunobee`` that needs ``optax`` and ``tqdm``. Those live behind the optional
+``optim`` extra, so importing this module requires ``pip install 'bunobee[optim]'``.
 """
 
 from __future__ import annotations
@@ -32,15 +37,15 @@ from numpyro import distributions as dist
 try:
     import optax
     from tqdm.auto import tqdm
-except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the m5 extra
+except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the optim extra
     raise ModuleNotFoundError(
-        f"bunobee.models.m5.m5_ssp_optim requires the optional 'm5' extra (missing: {exc.name}). "
-        "Install it with: pip install 'bunobee[m5]'"
+        f"bunobee.models.ssp.map_fit requires the optional 'optim' extra (missing: {exc.name}). "
+        "Install it with: pip install 'bunobee[optim]'"
     ) from exc
 
-from ..ssp.kalman_1d import kalman_filter_1d
-from ..ssp.vfactory import make_kalman_batch
-from .transforms import LogTransform, Transform
+from .kalman_1d import kalman_filter_1d
+from .vfactory import make_kalman_batch
+from bunobee.target_transforms import LogTransform, Transform
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +53,8 @@ logger = logging.getLogger(__name__)
 kalman_filter_1d_batch = make_kalman_batch(kalman_filter_1d)
 
 #: Bounds of the default uniform priors of the MAP fitters: ``sigma_h``, the observation noise, and ``sigma_q``, the
-#: drifts of the states. They were set for the log target, whose noise is on the scale of log sales.
+#: drifts of the states. They suit the default log target, which divides each series by its mean, so the noise is on
+#: the scale of the log of a unit-mean series whatever the series' own units.
 SIGMA_H_BOUNDS = (0.1, 0.5)
 SIGMA_Q_BOUNDS = (0.01, 0.1)
 
@@ -164,8 +170,8 @@ def _state_drifts(sigma_q_first: jnp.ndarray, sigma_q_rest: jnp.ndarray, drifts:
     return sigma_q * drifts
 
 
-def fit_one_series_opt(
-    sales: np.ndarray,
+def fit_map(
+    values: np.ndarray,
     n_iter: int = 500,
     lr: float = 3e-2,
     Z: jnp.ndarray | None = None,
@@ -177,25 +183,24 @@ def fit_one_series_opt(
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
     fixed_states: np.ndarray | None = None,
 ) -> dict:
-    """Fit a local-level + weekly-seasonality SSP model via MAP (Adam optimiser).
+    """Fit a linear state-space model to one series via MAP (Adam optimiser).
 
-    Uses the same Kalman filter and prior specification as ``fit_one_series`` but
-    replaces NUTS with gradient-based MAP estimation — much faster, no posterior
-    uncertainty. The model is fitted to ``transform.forward(sales)``, with the
-    transform's parameters fitted on ``sales`` first. The returned parameters are
-    those of the lowest loss over the steps run.
+    Gradient-based MAP estimation of the Kalman filter's noise and drifts — much faster
+    than NUTS, no posterior uncertainty. The model is fitted to
+    ``transform.forward(values)``, with the transform's parameters fitted on ``values``
+    first. The returned parameters are those of the lowest loss over the steps run.
 
     Parameters
     ----------
-    sales : np.ndarray
-        1-D array of daily unit sales (n_steps,).
+    values : np.ndarray
+        1-D array of the series' non-negative observations (n_steps,).
     n_iter : int
         Maximum number of Adam optimisation steps, by default 500.
     lr : float
         Adam learning rate, by default 3e-2.
     Z : jnp.ndarray | None
-        (n_steps, n_states) pre-built design matrix. Pass ``Z_shared`` to avoid
-        redundant dummy builds when fitting many series of the same length.
+        (n_steps, n_states) pre-built design matrix. Build it once and reuse it
+        when fitting many series of the same length.
     patience : int | None
         Stop early if the loss does not improve by more than ``tol`` for this
         many consecutive steps. Set to ``None`` to disable early stopping.
@@ -205,7 +210,7 @@ def fit_one_series_opt(
         Log loss at this step interval via DEBUG. ``None`` disables logging.
     transform : Transform
         Target transform, by default :class:`LogTransform`: the model is fitted to
-        ``log(max(sales, 0.1) / mean)``.
+        ``log(max(values, floor) / mean)``, floor 0.1.
     sigma_h_prior : SigmaPrior
         Prior of the observation noise ``sigma_h``, by default :data:`SIGMA_H_PRIOR`,
         U(0.1, 0.5).
@@ -228,8 +233,8 @@ def fit_one_series_opt(
         the lowest of ``losses``, which the returned sigmas achieve), ``n_iter_run``
         (int).
     """
-    transform_params = transform.fit(sales)
-    y = jnp.array(transform.forward(sales, transform_params))
+    transform_params = transform.fit(values)
+    y = jnp.array(transform.forward(values, transform_params))
 
     n_states = Z.shape[1]
     drifts = _drift_mask(n_states, fixed_states)
@@ -336,7 +341,7 @@ def fit_one_series_opt(
     }
 
 
-def predict_one_series_opt(
+def predict_map(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -349,19 +354,17 @@ def predict_one_series_opt(
 
     .. deprecated::
         Prefer :func:`bunobee.models.ssp.forecast.forecast_ssp` for new code. This
-        function is kept for the m5 MAP pipeline only: it has no posterior draws to
+        function is kept for MAP fits only: they have no posterior draws to
         replay, and its closed-form variance ``Z_future**2 @ P_last + sigma_h**2``
         comes from the terminal filtered covariance rather than from the forward
         process-noise accumulation ``forecast_ssp`` samples, so the two are not
-        interchangeable. To migrate, fit with ``fit_one_series`` (NUTS) and call
-        ``forecast_ssp``, then take the mean of ``forecast_samples`` for the same
-        E[Y] target. See :func:`bunobee.models.m5.m5_ssp_mcmc.predict_one_series`
-        for the wrapper pattern.
+        interchangeable. To migrate, fit with NUTS and call ``forecast_ssp``, then
+        take the mean of ``forecast_samples`` for the same E[Y] target.
 
     Parameters
     ----------
     fit_result : dict
-        Output of ``fit_one_series_opt()``. Without a ``transform`` key the
+        Output of ``fit_map()``. Without a ``transform`` key the
         forecast is inverted as :class:`LogTransform` inverts it.
     Z_future : np.ndarray | None
         (horizon, n_states) pre-built future design matrix.
@@ -393,8 +396,8 @@ def predict_one_series_opt(
     return transform.inverse(mu_future, var_future, fit_result)
 
 
-def fit_batch_series_opt(
-    sales_matrix: np.ndarray,
+def fit_map_batch(
+    values: np.ndarray,
     n_iter: int = 500,
     lr: float = 3e-2,
     Z: jnp.ndarray | None = None,
@@ -406,18 +409,18 @@ def fit_batch_series_opt(
     sigma_q_prior: SigmaPrior = SIGMA_Q_PRIOR,
     fixed_states: np.ndarray | None = None,
 ) -> dict:
-    """Fit a local-level + weekly-seasonality SSP model for B series in parallel.
+    """Fit a linear state-space model to B series in parallel via MAP (Adam optimiser).
 
     Uses ``jax.vmap`` to batch the Kalman filter across series and runs Adam
     optimisation for a fixed number of steps, tracking the best parameters
     per series: those of the lowest loss over the steps. Each series is fitted
-    to ``transform.forward`` of its sales, with its transform parameters fitted
-    on its sales first.
+    to ``transform.forward`` of its values, with its transform parameters fitted
+    on its values first.
 
     Parameters
     ----------
-    sales_matrix : np.ndarray
-        2-D array of daily unit sales, shape (B, n_steps).
+    values : np.ndarray
+        2-D array of the series' non-negative observations, shape (B, n_steps).
     n_iter : int
         Number of Adam optimisation steps, by default 500.
     lr : float
@@ -433,7 +436,7 @@ def fit_batch_series_opt(
         Display a ``tqdm`` progress bar over optimisation steps, by default False.
     transform : Transform
         Target transform, by default :class:`LogTransform`: each series is fitted
-        to ``log(max(sales, 0.1) / mean)``.
+        to ``log(max(values, floor) / mean)``, floor 0.1.
     sigma_h_prior : SigmaPrior
         Prior of the observation noise ``sigma_h``, by default :data:`SIGMA_H_PRIOR`,
         U(0.1, 0.5).
@@ -455,10 +458,10 @@ def fit_batch_series_opt(
         ``a0``, ``P0``, ``final_loss`` (B,), the lowest loss over the steps,
         which the returned sigmas achieve.
     """
-    B = sales_matrix.shape[0]
+    B = values.shape[0]
 
-    transform_params = transform.fit(sales_matrix)  # (B,) each
-    y = jnp.array(transform.forward(sales_matrix, transform_params))  # (B, n_steps)
+    transform_params = transform.fit(values)  # (B,) each
+    y = jnp.array(transform.forward(values, transform_params))  # (B, n_steps)
 
     n_states = Z.shape[1]
     drifts = _drift_mask(n_states, fixed_states)
@@ -569,7 +572,7 @@ def fit_batch_series_opt(
     }
 
 
-def predict_batch_series_opt(
+def predict_map_batch(
     fit_result: dict,
     Z_future: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -582,7 +585,7 @@ def predict_batch_series_opt(
 
     .. deprecated::
         Prefer :func:`bunobee.models.ssp.forecast.forecast_ssp` for new code. Same
-        caveat as :func:`predict_one_series_opt`: these are MAP point estimates with
+        caveat as :func:`predict_map`: these are MAP point estimates with
         an analytic Jensen correction built on the terminal filtered covariance
         ``Pt[:, -1, :]``, not posterior draws, so ``forecast_ssp`` cannot reproduce
         them numerically. It is the sampling replacement — build the ``(horizon,
@@ -592,7 +595,7 @@ def predict_batch_series_opt(
     Parameters
     ----------
     fit_result : dict
-        Output of ``fit_batch_series_opt()``. Without a ``transform`` key the
+        Output of ``fit_map_batch()``. Without a ``transform`` key the
         forecasts are inverted as :class:`LogTransform` inverts them.
     Z_future : np.ndarray | None
         (horizon, n_states) future design matrix, shared across all series.
@@ -602,20 +605,20 @@ def predict_batch_series_opt(
     np.ndarray
         Point forecasts of shape (B, horizon).
     """
-    mu_future, var_future = forecast_gaussian_batch_series_opt(fit_result, Z_future)
+    mu_future, var_future = forecast_gaussian_map_batch(fit_result, Z_future)
     return fit_result.get("transform", LogTransform()).inverse(mu_future, var_future, fit_result)
 
 
-def forecast_gaussian_batch_series_opt(fit_result: dict, Z_future: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def forecast_gaussian_map_batch(fit_result: dict, Z_future: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Forecast mean and variance on the transformed scale for B series from a batch-fitted model.
 
-    The Gaussian that :func:`predict_batch_series_opt` maps to point forecasts in units, and that
+    The Gaussian that :func:`predict_map_batch` maps to point forecasts in units, and that
     ``fit_result["transform"].quantile`` maps to forecast quantiles in units.
 
     Parameters
     ----------
     fit_result : dict
-        Output of ``fit_batch_series_opt()``.
+        Output of ``fit_map_batch()``.
     Z_future : np.ndarray
         (horizon, n_states) future design matrix, shared across all series.
 
