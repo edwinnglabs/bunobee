@@ -1,8 +1,8 @@
 name: CI
 
+# No ``push: main`` trigger: Publish calls this workflow as a gate on every push to main, so a
+# merge runs the suite once instead of twice.
 on:
-  push:
-    branches: [main]
   pull_request:
   # Lets Publish run this same workflow as a gate before building or publishing.
   workflow_call:
@@ -27,8 +27,26 @@ jobs:
       - name: Lint with black
         run: black --check .
 
+      # The ``slow`` marker (the M5 accuracy guard) runs in the parallel ``accuracy`` job.
       - name: Run tests
-        run: pytest tests/
+        run: pytest tests/ -m "not slow"
+
+  # Required checks pin the job name ``test``, so the slow tests live in their own job rather
+  # than under that name. Together the two jobs cover every test exactly once.
+  accuracy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package with test tooling
+        run: pip install -e ".[test,optim]"
+
+      - name: Run slow tests (accuracy guard)
+        run: pytest tests/ -m slow
 
   notebooks:
     runs-on: ubuntu-latest

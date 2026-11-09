@@ -5,7 +5,7 @@
 # Bunobee
 
 [![PyPI version](https://img.shields.io/pypi/v/bunobee.svg)](https://pypi.org/project/bunobee/)
-[![CI](https://github.com/edwinnglabs/bunobee/actions/workflows/ci.yaml/badge.svg)](https://github.com/edwinnglabs/bunobee/actions/workflows/ci.yaml)
+[![Publish](https://github.com/edwinnglabs/bunobee/actions/workflows/publish.yaml/badge.svg)](https://github.com/edwinnglabs/bunobee/actions/workflows/publish.yaml)
 [![License: MIT](https://img.shields.io/pypi/l/bunobee.svg)](https://github.com/edwinnglabs/bunobee/blob/main/LICENSE)
 [![Python versions](https://img.shields.io/pypi/pyversions/bunobee.svg)](https://pypi.org/project/bunobee/)
 

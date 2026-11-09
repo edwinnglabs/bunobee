@@ -67,5 +67,5 @@ extend-exclude = ""
 log_cli = true
 log_cli_level = "INFO"
 markers = [
-    "slow: marks a test as slow (deselect locally with -m 'not slow'; still runs in CI)",
+    "slow: marks a test as slow (runs in its own CI job; deselect locally with -m 'not slow')",
 ]
