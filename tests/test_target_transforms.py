@@ -1,6 +1,6 @@
-"""Unit tests for the M5 target transforms, ``bunobee.models.m5.transforms`` (issue #114).
+"""Unit tests for the target transforms, ``bunobee.target_transforms`` (issue #114).
 
-The MAP fitters and predictors of ``m5_ssp_optim`` used to hard-code the log target: fit on
+The MAP fitters and predictors of ``map_fit`` used to hard-code the log target: fit on
 ``log(max(sales, 0.1) / mean)``, forecast ``exp(mu + 0.5 · var) · mean``. They now take a ``Transform``, by
 default ``LogTransform``. These tests check that ``LogTransform`` is that target bit for bit, and that the
 default fit and forecast reproduce the pre-refactor implementation, kept verbatim below as the reference but for
@@ -24,24 +24,26 @@ from jax import jit, value_and_grad
 from numpyro import distributions as dist
 from scipy import integrate, optimize, special, stats
 
-from bunobee.models.m5.transforms import LogTransform, PowerTransform
+from bunobee.target_transforms import LogTransform, PowerTransform
 from bunobee.regression import make_periodic_dummies
 
 try:
     import optax
 
-    from bunobee.models.m5 import m5_ssp_optim
-except ModuleNotFoundError:  # the optional 'm5' extra (optax, tqdm) is not installed
-    m5_ssp_optim = None
+    from bunobee.models.ssp import map_fit
+except ModuleNotFoundError as exc:  # the optional 'optim' extra (optax, tqdm) is not installed
+    if exc.name not in {"optax", "tqdm"}:
+        raise
+    map_fit = None
 
-requires_m5_extra = pytest.mark.skipif(
-    m5_ssp_optim is None,
-    reason="needs the optional 'm5' extra: pip install 'bunobee[m5]'",
+requires_optim_extra = pytest.mark.skipif(
+    map_fit is None,
+    reason="needs the optional 'optim' extra: pip install 'bunobee[optim]'",
 )
 
 requires_sklearn = pytest.mark.skipif(
     importlib.util.find_spec("sklearn") is None,
-    reason="needs scikit-learn, part of the optional 'm5' extra: pip install 'bunobee[m5]'",
+    reason="needs scikit-learn, part of the optional 'optim' extra: pip install 'bunobee[optim]'",
 )
 
 # Fixed series: Poisson sales from intermittent to dense, so the 0.1 floor bites on most days of the first.
@@ -106,15 +108,15 @@ class TestLogTransform:
 
 
 def _softplus(x):
-    return m5_ssp_optim._softplus(x)
+    return map_fit._softplus(x)
 
 
 def _softplus_inv(v):
-    return m5_ssp_optim._softplus_inv(v)
+    return map_fit._softplus_inv(v)
 
 
-def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_size=4096):
-    """The pre-refactor ``fit_batch_series_opt`` as the numerical reference.
+def _legacy_fit_map_batch(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_size=4096):
+    """The pre-refactor ``fit_map_batch`` as the numerical reference.
 
     Kept verbatim but for logging and the fix of issue #116: it keeps ``params``, whose loss each step computes,
     as the best parameters, where it used to keep ``new_params``, one Adam step after them.
@@ -141,7 +143,7 @@ def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_si
         sigma_q = jnp.concatenate(
             [sigma_q_level[:, None], jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1)], axis=1
         )
-        log_p, _, _, _, _, _ = m5_ssp_optim.kalman_filter_1d_batch(
+        log_p, _, _, _, _, _ = map_fit.kalman_filter_1d_batch(
             a0=a0, P0=P0, Z=Z, sigma_h=sigma_h, sigma_q=sigma_q, y=y, logp=True, chunk_size=chunk_size
         )
         log_prior = (
@@ -172,7 +174,7 @@ def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_si
     sigma_q_level = _softplus(best_params[:, 1])
     sigma_q_seas = _softplus(best_params[:, 2])
     sigma_q = jnp.concatenate([sigma_q_level[:, None], jnp.repeat(sigma_q_seas[:, None], n_states - 1, axis=1)], axis=1)
-    _, at, Pt, _, _, _ = m5_ssp_optim.kalman_filter_1d_batch(
+    _, at, Pt, _, _, _ = map_fit.kalman_filter_1d_batch(
         a0=a0, P0=P0, Z=Z, sigma_h=sigma_h, sigma_q=sigma_q, y=y, logp=False, chunk_size=chunk_size
     )
     return {
@@ -185,8 +187,8 @@ def _legacy_fit_batch_series_opt(sales_matrix, n_iter, lr=3e-2, Z=None, chunk_si
     }
 
 
-def _legacy_predict_batch_series_opt(fit_result, Z_future):
-    """The pre-refactor ``predict_batch_series_opt``, kept verbatim as the numerical reference."""
+def _legacy_predict_map_batch(fit_result, Z_future):
+    """The pre-refactor ``predict_map_batch``, kept verbatim as the numerical reference."""
     at = fit_result["at"]
     Pt = fit_result["Pt"]
     sigma_h = np.asarray(fit_result["sigma_h"])
@@ -200,8 +202,8 @@ def _legacy_predict_batch_series_opt(fit_result, Z_future):
     return np.exp(mu_future + 0.5 * var_future) * response_norm[:, None]
 
 
-def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=1e-5):
-    """The pre-refactor ``fit_one_series_opt`` as the numerical reference.
+def _legacy_fit_map(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=1e-5):
+    """The pre-refactor ``fit_map`` as the numerical reference.
 
     Kept verbatim but for logging and the fix of issue #116: it returns the parameters of the lowest loss, where it
     used to return those after the last step's update, whose loss it never computed.
@@ -219,7 +221,7 @@ def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=
         sigma_q_level = _softplus(params[1])
         sigma_q_seas = _softplus(params[2])
         sigma_q = jnp.concatenate([sigma_q_level[None], jnp.repeat(sigma_q_seas[None], n_states - 1)])
-        lp, _, _, _, _, _ = m5_ssp_optim.kalman_filter_1d(
+        lp, _, _, _, _, _ = map_fit.kalman_filter_1d(
             a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q, y=y, Z=Z, logp=True
         )
         log_prior = (
@@ -261,14 +263,12 @@ def _legacy_fit_one_series_opt(sales, n_iter, lr=3e-2, Z=None, patience=50, tol=
     sigma_q_level = float(_softplus(best_params[1]))
     sigma_q_seas = float(_softplus(best_params[2]))
     sigma_q = jnp.concatenate([jnp.array([sigma_q_level]), jnp.repeat(jnp.array([sigma_q_seas]), n_states - 1)])
-    _, at, Pt, _, _, _ = m5_ssp_optim.kalman_filter_1d(
-        a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q, y=y, Z=Z, logp=False
-    )
+    _, at, Pt, _, _, _ = map_fit.kalman_filter_1d(a0=a0, P0=P0, sigma_h=sigma_h, sigma_q=sigma_q, y=y, Z=Z, logp=False)
     return {"at": np.array(at), "Pt": np.array(Pt), "sigma_h": sigma_h, "response_norm": response_norm}
 
 
-def _legacy_predict_one_series_opt(fit_result, Z_future):
-    """The pre-refactor ``predict_one_series_opt``, kept verbatim as the numerical reference."""
+def _legacy_predict_map(fit_result, Z_future):
+    """The pre-refactor ``predict_map``, kept verbatim as the numerical reference."""
     at = fit_result["at"]
     Pt = fit_result["Pt"]
     sigma_h = float(fit_result["sigma_h"])
@@ -283,12 +283,12 @@ def _legacy_predict_one_series_opt(fit_result, Z_future):
 
 
 def _designs(intercept: bool) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Weekday dummies over the fit and forecast days, phased as M5's d_1 (a Saturday), with or without a level."""
+    """Weekday dummies over the fit and forecast days, starting on a Saturday, with or without a level."""
     weekly = make_periodic_dummies(N_FIT + HORIZON, period=7, phase=5, intercept=intercept)
     return jnp.asarray(weekly[:N_FIT]), jnp.asarray(weekly[N_FIT:])
 
 
-@requires_m5_extra
+@requires_optim_extra
 class TestReproducesLegacy:
     """With the default ``LogTransform`` the fitters and predictors return today's forecasts exactly."""
 
@@ -297,30 +297,30 @@ class TestReproducesLegacy:
         Z, Z_future = _designs(intercept)
         fit_sales = sales[:, :N_FIT]
 
-        result = m5_ssp_optim.fit_batch_series_opt(fit_sales, n_iter=60, Z=Z)
-        legacy = _legacy_fit_batch_series_opt(fit_sales, n_iter=60, Z=Z)
+        result = map_fit.fit_map_batch(fit_sales, n_iter=60, Z=Z)
+        legacy = _legacy_fit_map_batch(fit_sales, n_iter=60, Z=Z)
 
         assert result["transform"] == LogTransform()
         for key in legacy:
             np.testing.assert_array_equal(result[key], legacy[key], err_msg=key)
         _assert_identical(
-            m5_ssp_optim.predict_batch_series_opt(result, Z_future=Z_future),
-            _legacy_predict_batch_series_opt(legacy, Z_future),
+            map_fit.predict_map_batch(result, Z_future=Z_future),
+            _legacy_predict_map_batch(legacy, Z_future),
         )
 
     def test_single_series_forecasts_unchanged(self, sales):
         Z, Z_future = _designs(intercept=True)
         for series in sales[:, :N_FIT]:
-            result = m5_ssp_optim.fit_one_series_opt(series, n_iter=60, Z=Z)
-            legacy = _legacy_fit_one_series_opt(series, n_iter=60, Z=Z)
+            result = map_fit.fit_map(series, n_iter=60, Z=Z)
+            legacy = _legacy_fit_map(series, n_iter=60, Z=Z)
             assert float(result["response_norm"]) == legacy["response_norm"]
             _assert_identical(
-                m5_ssp_optim.predict_one_series_opt(result, Z_future=Z_future),
-                _legacy_predict_one_series_opt(legacy, Z_future),
+                map_fit.predict_map(result, Z_future=Z_future),
+                _legacy_predict_map(legacy, Z_future),
             )
 
 
-# The registered power transforms (m5_models.py): zero-sales days 0.5, 0.1 and 1 unit above zero before the power.
+# Power transforms that lift zero-sales days 0.5, 0.1 and 1 unit above zero before the power.
 POWER_TRANSFORMS = {
     "boxcox_shift": PowerTransform("box-cox", shift=0.5),
     "boxcox_floor": PowerTransform("box-cox", floor=0.1),
@@ -333,12 +333,12 @@ def _censored_mean(transform: PowerTransform, mu: float, var: float, params: dic
 
     An independent reference for ``PowerTransform.inverse``, which integrates the survival function instead: here the
     Gaussian ``z`` on the original power scale is mapped back by the inverse power, censored to the admissible
-    sales from 0 to ``sales_max``, and averaged under its density.
+    sales from 0 to ``max_value``, and averaged under its density.
     """
     offset = 1.0 if transform.method == "yeo-johnson" else 0.0
     lmbda, loc, scale = (float(params[key]) for key in ("lmbda", "loc", "scale"))
     w_low = transform.floor + transform.shift + offset
-    w_high = max(float(params["sales_max"]), transform.floor) + transform.shift + offset
+    w_high = max(float(params["max_value"]), transform.floor) + transform.shift + offset
     z_low, z_high = special.boxcox(w_low, lmbda), special.boxcox(w_high, lmbda)
     centre, spread = loc + scale * mu, scale * np.sqrt(var)
     a, b = (z_low - centre) / spread, (z_high - centre) / spread
@@ -369,7 +369,7 @@ class TestPowerTransform:
         params = transform.fit(sales)
         np.testing.assert_allclose(params["lmbda"], reference.lambdas_, rtol=1e-9)
         np.testing.assert_allclose(transform.forward(sales, params), reference.transform(x.T).T, rtol=1e-5, atol=1e-6)
-        np.testing.assert_array_equal(params["sales_max"], sales.max(axis=1))
+        np.testing.assert_array_equal(params["max_value"], sales.max(axis=1))
 
     def test_unstandardized_forward_is_the_power(self, sales):
         transform = PowerTransform("box-cox", floor=0.1, standardize=False)
@@ -445,7 +445,7 @@ class TestPowerTransform:
             forecast = transform.inverse(mu, var, series)
             assert np.isfinite(forecast).all()
             assert (forecast >= transform.floor).all()
-            assert (forecast <= max(series["sales_max"], transform.floor) * (1 + 1e-9)).all()
+            assert (forecast <= max(series["max_value"], transform.floor) * (1 + 1e-9)).all()
 
     def test_single_series_matches_its_batch_row(self, sales):
         transform = POWER_TRANSFORMS["yeojohnson"]
@@ -477,7 +477,7 @@ class TestPowerTransform:
             PowerTransform(**kwargs)
 
 
-@requires_m5_extra
+@requires_optim_extra
 @requires_sklearn
 class TestPowerTransformFit:
     """The MAP fitters fit a power transform as any other: they return its parameters and invert its forecasts."""
@@ -486,12 +486,12 @@ class TestPowerTransformFit:
     def test_batch_fit_returns_its_parameters_and_nonnegative_forecasts(self, sales, name):
         transform = POWER_TRANSFORMS[name]
         Z, Z_future = _designs(intercept=False)
-        result = m5_ssp_optim.fit_batch_series_opt(sales[:, :N_FIT], n_iter=30, Z=Z, transform=transform)
+        result = map_fit.fit_map_batch(sales[:, :N_FIT], n_iter=30, Z=Z, transform=transform)
         assert result["transform"] == transform
         expected = transform.fit(sales[:, :N_FIT])
         for key, value in expected.items():
             np.testing.assert_array_equal(result[key], value, err_msg=key)
-        forecasts = m5_ssp_optim.predict_batch_series_opt(result, Z_future=Z_future)
+        forecasts = map_fit.predict_map_batch(result, Z_future=Z_future)
         assert forecasts.shape == (LEVELS.size, HORIZON)
         assert np.isfinite(forecasts).all() and (forecasts >= 0).all()
 
@@ -501,7 +501,7 @@ def quantile_case(request, sales):
     """A transform and its per-series parameters, for the log transform and every power transform."""
     transform = LogTransform() if request.param == "log" else POWER_TRANSFORMS[request.param]
     if request.param != "log" and importlib.util.find_spec("sklearn") is None:
-        pytest.skip("needs scikit-learn, part of the optional 'm5' extra: pip install 'bunobee[m5]'")
+        pytest.skip("needs scikit-learn, part of the optional 'optim' extra: pip install 'bunobee[optim]'")
     return transform, transform.fit(sales)
 
 
@@ -561,7 +561,7 @@ class TestQuantile:
             pytest.skip("the lognormal has no largest sales")
         mu, var = (grid.ravel() for grid in np.meshgrid([-1e3, -3.0, 0.0, 3.0, 1e3], [0.0, 0.3, 1e4]))
         quantiles = transform.quantile(np.tile(mu, (LEVELS.size, 1)), np.tile(var, (LEVELS.size, 1)), self.U, params)
-        ceiling = np.maximum(params["sales_max"], transform.floor)
+        ceiling = np.maximum(params["max_value"], transform.floor)
         assert np.isfinite(quantiles).all() and (quantiles >= 0).all()
         assert (quantiles <= ceiling[:, None, None] * (1 + 1e-9)).all()
 

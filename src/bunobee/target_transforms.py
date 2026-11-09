@@ -1,13 +1,16 @@
-"""Target transforms of the M5 SSP models: the scale the sales are fitted on, and the way back to units.
+"""Target transforms: the scale a series is fitted on, and the way back to units.
 
-The MAP fitters in :mod:`bunobee.models.m5.m5_ssp_optim` fit a linear-Gaussian state-space model to the
-transformed sales of each series, and their predictors map the Gaussian forecast back to a point forecast in
+The MAP fitters in :mod:`bunobee.models.ssp.map_fit` fit a linear-Gaussian state-space model to the
+transformed values of each series, and their predictors map the Gaussian forecast back to a point forecast in
 units. A :class:`Transform` owns both directions, so trying another target needs a new transform, not an edit
 of the fitter. :class:`LogTransform` is the default; :class:`PowerTransform` fits a Box-Cox or Yeo-Johnson
 power per series.
 
-Unlike :mod:`bunobee.models.m5.m5_ssp_optim`, this module needs only ``numpy`` and ``scipy``.
-:class:`PowerTransform` fits its powers with ``scikit-learn``, part of the optional ``m5`` extra, which it
+The transforms are written for non-negative series such as sales, counts or demand: values below ``floor`` are
+floored, and ``to_units`` and ``inverse`` never return a negative value.
+
+Unlike :mod:`bunobee.models.ssp.map_fit`, this module needs only ``numpy`` and ``scipy``.
+:class:`PowerTransform` fits its powers with ``scikit-learn``, part of the optional ``optim`` extra, which it
 imports only when it fits.
 """
 
@@ -30,23 +33,23 @@ def _per_series(value: Any) -> Any:
 
 
 class Transform(Protocol):
-    """A per-series map from sales to the scale an SSP model is fitted on, and back to units.
+    """A per-series map from values to the scale an SSP model is fitted on, and back to units.
 
-    ``fit`` fits each series' parameters on its fit days, ``forward`` maps sales to the transformed scale and
+    ``fit`` fits each series' parameters on its fit days, ``forward`` maps values to the transformed scale and
     ``inverse`` maps a Gaussian forecast on that scale back to a point forecast in units. The inverse of the
-    forecast mean is not the mean of the sales (``exp(mu)`` is a lognormal's median), so ``inverse`` takes the
+    forecast mean is not the mean of the values (``exp(mu)`` is a lognormal's median), so ``inverse`` takes the
     forecast variance too and carries the bias correction.
 
     Arrays hold one series per row along their leading dimensions and its days along the last one.
     """
 
-    def fit(self, sales: np.ndarray) -> dict[str, np.ndarray]:
+    def fit(self, values: np.ndarray) -> dict[str, np.ndarray]:
         """Fit the per-series parameters on the fit days.
 
         Parameters
         ----------
-        sales : np.ndarray
-            Daily unit sales over the fit days, of shape ``(..., n_steps)``.
+        values : np.ndarray
+            Non-negative observations over the fit days, of shape ``(..., n_steps)``.
 
         Returns
         -------
@@ -56,20 +59,20 @@ class Transform(Protocol):
         """
         ...
 
-    def forward(self, sales: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Map sales to the transformed scale.
+    def forward(self, values: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Map values to the transformed scale.
 
         Parameters
         ----------
-        sales : np.ndarray
-            Daily unit sales, of shape ``(..., n_steps)``.
+        values : np.ndarray
+            Non-negative observations, of shape ``(..., n_steps)``.
         params : Mapping of str to Any
             Holds at least the parameters ``fit`` returned, for the same series.
 
         Returns
         -------
         np.ndarray
-            The transformed sales, of shape ``(..., n_steps)``.
+            The transformed values, of shape ``(..., n_steps)``.
         """
         ...
 
@@ -93,7 +96,7 @@ class Transform(Protocol):
         ...
 
     def to_units(self, z: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Map values on the transformed scale to units: the inverse of ``forward``, kept within the admissible sales.
+        """Map values on the transformed scale to units: the inverse of ``forward``, kept within the admissible range.
 
         Unlike ``inverse`` it maps each value as it is, not a Gaussian forecast, so it takes draws or quantiles of the
         forecast distribution to the same distribution in units. It is monotone in ``z``.
@@ -156,31 +159,31 @@ def _gaussian_quantile(
 
 @dataclass(frozen=True)
 class LogTransform:
-    """Log of the floored sales over their fit-days mean, inverted as a lognormal mean.
+    """Log of the floored values over their fit-days mean, inverted as a lognormal mean.
 
-    ``fit`` sets ``response_norm``, the mean of ``max(sales, floor)`` over the fit days. ``forward`` maps sales to
-    ``log(max(sales, floor) / response_norm)``, so a zero-sales day becomes ``log(floor / response_norm)``.
+    ``fit`` sets ``response_norm``, the mean of ``max(values, floor)`` over the fit days. ``forward`` maps values to
+    ``log(max(values, floor) / response_norm)``, so a zero day becomes ``log(floor / response_norm)``.
     ``inverse`` returns ``exp(mu + var / 2) * response_norm``, the mean of a lognormal: the Jensen correction
     ``var / 2`` makes it an estimate of ``E[Y]`` rather than ``exp(E[log Y])``.
 
     Parameters
     ----------
     floor : float
-        Floor applied to the sales before the log, by default 0.1.
+        Floor applied to the values before the log, in the units of the data, by default 0.1.
     """
 
     floor: float = 0.1
 
-    def _floored(self, sales: np.ndarray) -> np.ndarray:
-        return np.clip(sales, self.floor, None).astype(np.float32)
+    def _floored(self, values: np.ndarray) -> np.ndarray:
+        return np.clip(values, self.floor, None).astype(np.float32)
 
-    def fit(self, sales: np.ndarray) -> dict[str, np.ndarray]:
+    def fit(self, values: np.ndarray) -> dict[str, np.ndarray]:
         """Set ``response_norm``; see :meth:`Transform.fit`."""
-        return {"response_norm": self._floored(sales).mean(axis=-1)}
+        return {"response_norm": self._floored(values).mean(axis=-1)}
 
-    def forward(self, sales: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Return ``log(max(sales, floor) / response_norm)``; see :meth:`Transform.forward`."""
-        return np.log(self._floored(sales) / _per_series(params["response_norm"]))
+    def forward(self, values: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return ``log(max(values, floor) / response_norm)``; see :meth:`Transform.forward`."""
+        return np.log(self._floored(values) / _per_series(params["response_norm"]))
 
     def inverse(self, mu: np.ndarray, var: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
         """Return ``exp(mu + var / 2) * response_norm``; see :meth:`Transform.inverse`."""
@@ -201,23 +204,23 @@ POWER_METHODS = ("box-cox", "yeo-johnson")
 
 @dataclass(frozen=True)
 class PowerTransform:
-    """Box-Cox or Yeo-Johnson power of the sales with a fitted λ per series, inverted as the mean of its forecast.
+    """Box-Cox or Yeo-Johnson power of the values with a fitted λ per series, inverted as the mean of its forecast.
 
-    The power applies to ``x = max(sales, floor) + shift``. ``fit`` fits each series' ``lmbda`` by maximum
+    The power applies to ``x = max(values, floor) + shift``. ``fit`` fits each series' ``lmbda`` by maximum
     likelihood on its fit days with scikit-learn's ``PowerTransformer``, then clips it to ``lmbda_bounds``. With
     ``standardize`` it sets ``loc`` and ``scale`` to the mean and standard deviation of the powered fit days, as
-    ``PowerTransformer(standardize=True)`` does; without it they are 0 and 1. It also sets ``sales_max``, the
-    series' largest fit-day sales. ``forward`` returns ``(power(x, lmbda) - loc) / scale``.
+    ``PowerTransformer(standardize=True)`` does; without it they are 0 and 1. It also sets ``max_value``, the
+    series' largest fit-day observation. ``forward`` returns ``(power(x, lmbda) - loc) / scale``.
 
-    Box-Cox needs ``x > 0``, so ``floor + shift`` must be positive. Yeo-Johnson accepts zeros. Sales are never
-    negative, and on ``x >= 0`` Yeo-Johnson is the Box-Cox power of ``x + 1``, with the same maximum-likelihood
+    Box-Cox needs ``x > 0``, so ``floor + shift`` must be positive. Yeo-Johnson accepts zeros. The observations are
+    never negative, and on ``x >= 0`` Yeo-Johnson is the Box-Cox power of ``x + 1``, with the same maximum-likelihood
     λ: ``method="yeo-johnson"`` fits what ``method="box-cox"`` fits with one more unit of ``shift``.
 
-    ``inverse`` maps a Gaussian forecast ``z`` back by ``loc`` and ``scale`` and returns the mean of the sales it
-    implies, not the inverse power of its mean, which is their median. A Gaussian puts mass where no sales map
-    to: below the power of no sales and, with ``lmbda < 0``, whose power is bounded above, beyond the power of
-    any sales. The inverse power of ``z`` is therefore censored to the series' admissible sales, from 0 to
-    ``sales_max``, and the forecast is the mean of the censored sales, ``w_0 + ∫ P(W > w) dw`` over that range,
+    ``inverse`` maps a Gaussian forecast ``z`` back by ``loc`` and ``scale`` and returns the mean of the observations it
+    implies, not the inverse power of its mean, which is their median. A Gaussian puts mass where no observation
+    maps to: below the power of zero and, with ``lmbda < 0``, whose power is bounded above, beyond the power of
+    any observation. The inverse power of ``z`` is therefore censored to the series' admissible range, from 0 to
+    ``max_value``, and the forecast is the mean of the censored observations, ``w_0 + ∫ P(W > w) dw`` over that range,
     ``W`` the censored inverse power and ``w_0`` its least value. The integral is a Gauss-Legendre quadrature
     in ``log w``, where the integrand is smooth, on either side of the median, where it falls through 1/2. The
     forecast is never negative, nor below ``floor``.
@@ -227,16 +230,17 @@ class PowerTransform:
     method : str
         ``"box-cox"`` or ``"yeo-johnson"``, by default ``"box-cox"``.
     shift : float
-        Added to the floored sales before the power and subtracted after its inverse, by default 0.
+        Added to the floored values before the power and subtracted after its inverse, by default 0.
     floor : float
-        Floor applied to the sales before the shift, as :class:`LogTransform` floors them, by default 0.
+        Floor applied to the values before the shift, as :class:`LogTransform` floors them, by default 0.
     standardize : bool
-        Centre and scale each series' powered sales on its fit days, by default True.
+        Centre and scale each series' powered values on its fit days, by default True.
     lmbda_bounds : tuple of float, optional
         Bounds the fitted λ is clipped to, by default ``(-1.0, 2.0)``, the range R's ``forecast::BoxCox.lambda``
         searches. The profile log-likelihood of λ is concave, so the clipped λ is the maximum-likelihood λ within
-        the bounds. ``None`` leaves λ unbounded: on the M5 sales most series' λ is then below -1 and some below
-        -30, a power that maps every day with sales to almost one value and whose inverse loses all precision.
+        the bounds. ``None`` leaves λ unbounded: on intermittent retail sales, for one, most series' λ is then below
+        -1 and some below -30, a power that maps every day with sales to almost one value and whose inverse loses all
+        precision.
     n_nodes : int
         Gauss-Legendre nodes on each side of the median in ``inverse``, by default 24.
     """
@@ -261,25 +265,25 @@ class PowerTransform:
         """What Yeo-Johnson adds to ``x`` before its Box-Cox power: 1, and 0 for Box-Cox."""
         return float(self.method == "yeo-johnson")
 
-    def _input(self, sales: Any) -> np.ndarray:
-        """The power's input ``x = max(sales, floor) + shift``, in float64."""
-        return np.maximum(np.asarray(sales, dtype=np.float64), self.floor) + self.shift
+    def _input(self, values: Any) -> np.ndarray:
+        """The power's input ``x = max(values, floor) + shift``, in float64."""
+        return np.maximum(np.asarray(values, dtype=np.float64), self.floor) + self.shift
 
-    def fit(self, sales: np.ndarray) -> dict[str, np.ndarray]:
-        """Set ``lmbda``, ``loc``, ``scale`` and ``sales_max``; see :meth:`Transform.fit`.
+    def fit(self, values: np.ndarray) -> dict[str, np.ndarray]:
+        """Set ``lmbda``, ``loc``, ``scale`` and ``max_value``; see :meth:`Transform.fit`.
 
-        A series whose fit days all have the same sales has no maximum-likelihood λ (scipy's Box-Cox raises on
+        A series whose fit days all have the same value has no maximum-likelihood λ (scipy's Box-Cox raises on
         it), so its ``lmbda`` is 1 before the bounds.
         """
         try:
             from sklearn.preprocessing import PowerTransformer
-        except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the m5 extra
+        except ModuleNotFoundError as exc:  # pragma: no cover - only hit without the optim extra
             raise ModuleNotFoundError(
-                "PowerTransform requires scikit-learn, part of the optional 'm5' extra. "
-                "Install it with: pip install 'bunobee[m5]'"
+                "PowerTransform requires scikit-learn, part of the optional 'optim' extra. "
+                "Install it with: pip install 'bunobee[optim]'"
             ) from exc
 
-        x = self._input(sales)
+        x = self._input(values)
         rows = x.reshape(-1, x.shape[-1])  # (n_series, n_steps)
         lmbda = np.ones(rows.shape[0])
         varying = np.ptp(rows, axis=1) > 0
@@ -294,27 +298,27 @@ class PowerTransform:
             powered = special.boxcox(rows + self._offset, lmbda[:, None])
             loc, scale = powered.mean(axis=1), powered.std(axis=1)
             scale[scale == 0] = 1.0  # as StandardScaler leaves a constant column unscaled
-        sales_max = np.asarray(sales, dtype=np.float64).reshape(rows.shape).max(axis=1)
+        max_value = np.asarray(values, dtype=np.float64).reshape(rows.shape).max(axis=1)
         shape = x.shape[:-1]
         return {
             "lmbda": lmbda.reshape(shape),
             "loc": loc.reshape(shape),
             "scale": scale.reshape(shape),
-            "sales_max": sales_max.reshape(shape),
+            "max_value": max_value.reshape(shape),
         }
 
-    def forward(self, sales: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Return ``(power(max(sales, floor) + shift, lmbda) - loc) / scale``; see :meth:`Transform.forward`."""
-        powered = special.boxcox(self._input(sales) + self._offset, _per_series(params["lmbda"]))
+    def forward(self, values: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
+        """Return ``(power(max(values, floor) + shift, lmbda) - loc) / scale``; see :meth:`Transform.forward`."""
+        powered = special.boxcox(self._input(values) + self._offset, _per_series(params["lmbda"]))
         return ((powered - _per_series(params["loc"])) / _per_series(params["scale"])).astype(np.float32)
 
     def inverse(self, mu: np.ndarray, var: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Return the mean of the sales the Gaussian forecast implies; see :meth:`Transform.inverse`."""
-        lmbda, loc, scale, sales_max = (
-            _per_series(np.asarray(params[key], dtype=np.float64)) for key in ("lmbda", "loc", "scale", "sales_max")
+        """Return the mean of the observations the Gaussian forecast implies; see :meth:`Transform.inverse`."""
+        lmbda, loc, scale, max_value = (
+            _per_series(np.asarray(params[key], dtype=np.float64)) for key in ("lmbda", "loc", "scale", "max_value")
         )
-        # W, the Box-Cox argument the Gaussian z maps back to, censored to the admissible sales: 0 to sales_max.
-        w_low, w_high = self._input(0.0) + self._offset, self._input(sales_max) + self._offset
+        # W, the Box-Cox argument the Gaussian z maps back to, censored to the admissible range: 0 to max_value.
+        w_low, w_high = self._input(0.0) + self._offset, self._input(max_value) + self._offset
         centre = loc + scale * np.asarray(mu, dtype=np.float64)
         spread = np.maximum(scale * np.sqrt(np.asarray(var, dtype=np.float64)), np.finfo(np.float64).tiny)
         z_low, z_high = special.boxcox(w_low, lmbda), special.boxcox(w_high, lmbda)
@@ -334,20 +338,20 @@ class PowerTransform:
         return np.maximum(mean - self._offset - self.shift, 0.0).astype(np.result_type(mu, var))
 
     def to_units(self, z: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Return the inverse power of ``z``, censored to the series' admissible sales; see :meth:`Transform.to_units`.
+        """Return the inverse power of ``z``, censored to the series' admissible range; see :meth:`Transform.to_units`.
 
-        As in :meth:`inverse`, ``z`` is censored to the power of no sales and, where the power is bounded above, of
-        the largest sales, so a value beyond them maps to 0 or ``sales_max`` and nothing maps to a NaN.
+        As in :meth:`inverse`, ``z`` is censored to the power of zero and, where the power is bounded above, of
+        the largest observation, so a value beyond them maps to 0 or ``max_value`` and nothing maps to a NaN.
         """
-        lmbda, loc, scale, sales_max = (
-            _per_series(np.asarray(params[key], dtype=np.float64)) for key in ("lmbda", "loc", "scale", "sales_max")
+        lmbda, loc, scale, max_value = (
+            _per_series(np.asarray(params[key], dtype=np.float64)) for key in ("lmbda", "loc", "scale", "max_value")
         )
-        w_low, w_high = self._input(0.0) + self._offset, self._input(sales_max) + self._offset
+        w_low, w_high = self._input(0.0) + self._offset, self._input(max_value) + self._offset
         z_low, z_high = special.boxcox(w_low, lmbda), special.boxcox(w_high, lmbda)
         centre = loc + scale * np.asarray(z, dtype=np.float64)
         w = np.clip(special.inv_boxcox(np.clip(centre, z_low, z_high), lmbda), w_low, w_high)
         return np.maximum(w - self._offset - self.shift, 0.0).astype(np.result_type(z, np.float32))
 
     def quantile(self, mu: np.ndarray, var: np.ndarray, u: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
-        """Return the quantiles of the censored sales the Gaussian implies; see :meth:`Transform.quantile`."""
+        """Return the quantiles of the censored observations the Gaussian implies; see :meth:`Transform.quantile`."""
         return _gaussian_quantile(self, mu, var, u, params)

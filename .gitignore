@@ -181,7 +181,7 @@ push_package.sh
 *.npz
 *.pdf
 
-# M5 prototype run outputs (playground/m5_prototype/m5_run.py)
+# M5 run outputs from before the runs moved to wunkui; kept so old local runs stay ignored
 playground/m5_prototype/output/
 
 # avoid dictating claude performance

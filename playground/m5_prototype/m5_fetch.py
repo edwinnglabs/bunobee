@@ -9,7 +9,7 @@ downloads the four reference files below into the same directory.
 The M5 Forecasting — Uncertainty competition scores the same sales data, so it adds only one file:
 its ``sample_submission.csv`` (771,120 rows: 42,840 series × 9 quantiles × 2 windows). It has the name of the accuracy
 competition's file, so it goes into its own folder, ``playground/resource/m5-forecasting-uncertainty/``
-(:data:`~m5_common.UNCERTAINTY_DIR`); saving it beside the accuracy files would overwrite the file ``m5_run.py`` reads.
+(:data:`~m5_common.UNCERTAINTY_DIR`); saving it beside the accuracy files would overwrite the accuracy competition's file.
 The Kaggle CLI saves it as ``sample_submission.csv.zip``; this script unzips it and deletes the zip.
 
 Prerequisites
@@ -32,7 +32,7 @@ needs no credentials; this script extracts only :data:`REFERENCE_FILES` from it:
   d_1942–d_1969. ``m5_preprocess.py`` fills the ``test`` split from the evaluation file, so the
   ``_evaluation`` rows of a submission can be scored locally.
 - ``weights_validation.csv`` / ``weights_evaluation.csv`` — the official per-series WRMSSE weights,
-  which ``m5_check_weights.py`` compares with the local scorer's.
+  which a local WRMSSE scorer can be checked against.
 
 Usage
 -----
