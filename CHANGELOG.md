@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `T` argument on `kalman_filter_1d_st` — an optional `(n_states, n_states)` transition matrix, so the predict
+  step is `a ← T a`, `P ← T P Tᵀ + diag(σ_q²)` and a state can decay (e.g. an AR(1) deviation with `T[i, i] = φ`).
+  The log-likelihood is differentiable in `T`, so a NumPyro model can fit its entries. The default `None` leaves
+  every output bitwise unchanged.
+- `kalman_rts_smoother_1d_st` in `bunobee.models.ssp.kalman_1d_st` — an RTS smoother for the same model, taking the
+  filter's arguments (`T`, `mask`, fusion and positivity included) and returning the smoothed state means and full
+  covariances over the fitted steps.
 - `to_units` and `quantile` on the `Transform`s (`LogTransform`, `PowerTransform`) and
   `forecast_gaussian_map_batch` in `bunobee.models.ssp.map_fit` — map the Gaussian forecast of a MAP-fitted
   SSP to its exact quantiles in units, floored at 0, instead of a point forecast. `predict_map_batch` is
