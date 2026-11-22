@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from statistics import NormalDist
+
 import matplotlib
 
 matplotlib.use("Agg")  # headless backend; must precede any pyplot import
@@ -9,8 +11,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from bunobee.models.ssp import plot_prior_cross_sections, plot_prior_density
-from bunobee.models.ssp.prior import extend_states_prior_smoothed
+from bunobee.models.ssp import plot_prior_cross_sections, plot_prior_density, plot_states
+from bunobee.models.ssp.prior import disclosed_idx, extend_states_prior_smoothed
 
 
 def _prior(a_obs: np.ndarray, p_obs: np.ndarray) -> xr.Dataset:
@@ -223,3 +225,108 @@ def test_cross_sections_rejects_bad_arguments(priors_empty, state, times, colors
 
     with pytest.raises(ValueError, match=match):
         plot_prior_cross_sections(priors, state, times, colors=colors)
+
+
+def _states_inputs(n_steps: int = 12, n_draws: int = 50):
+    """Posterior draws, dates and the two-state disclosure block for ``plot_states``."""
+    prior = _multi_state_prior(n_steps)
+    draws = np.random.default_rng(0).normal(0.5, 0.1, size=(n_draws, n_steps, 2))
+    return {"at": draws}, np.arange(n_steps), ["s0", "s1"], prior
+
+
+def _anchor_whiskers(ax: plt.Axes) -> list:
+    return [c for c in ax.collections if str(c.get_label()).startswith("prior anchor ") and "CI" in c.get_label()]
+
+
+def test_plot_states_draws_anchor_whiskers_at_the_ribbon_ci():
+    posterior, dates, labels, prior = _states_inputs()
+    a_obs, p_obs = prior["a_obs"].values, prior["P_obs"].values
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        states_key="at",
+        obs_idx=disclosed_idx(prior),
+        a_obs=a_obs,
+        P_obs=p_obs,
+        ci=(0.05, 0.5, 0.95),
+    )
+
+    z = NormalDist().inv_cdf(0.95)
+    for i, ax in enumerate(axes[:2]):
+        (whiskers,) = _anchor_whiskers(ax)
+        assert whiskers.get_label() == "prior anchor 90% CI"
+        segments = whiskers.get_segments()
+        t = np.flatnonzero(np.isfinite(p_obs[:, i]))
+        assert len(segments) == len(t)  # one whisker per finite disclosure of this state, none for inf
+        for seg, step in zip(segments, t):
+            (x0, lo), (x1, hi) = seg
+            assert x0 == x1 == dates[step]
+            sd = np.sqrt(p_obs[step, i])
+            np.testing.assert_allclose([lo, hi], [a_obs[step, i] - z * sd, a_obs[step, i] + z * sd])
+    plt.close(fig)
+
+
+def test_plot_states_whiskers_follow_an_asymmetric_ci():
+    posterior, dates, labels, prior = _states_inputs()
+    a_obs, p_obs = prior["a_obs"].values, prior["P_obs"].values
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        obs_idx=disclosed_idx(prior),
+        a_obs=a_obs,
+        P_obs=p_obs,
+        states_key="at",
+        ci=(0.1, 0.5, 0.8),
+    )
+
+    (whiskers,) = _anchor_whiskers(axes[0])
+    (_, lo), (_, hi) = whiskers.get_segments()[0]
+    sd = np.sqrt(p_obs[2, 0])
+    np.testing.assert_allclose(
+        [lo, hi], [a_obs[2, 0] + NormalDist().inv_cdf(0.1) * sd, a_obs[2, 0] + NormalDist().inv_cdf(0.8) * sd]
+    )
+    plt.close(fig)
+
+
+def test_plot_states_anchor_ci_off_keeps_only_the_markers():
+    posterior, dates, labels, prior = _states_inputs()
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        states_key="at",
+        obs_idx=disclosed_idx(prior),
+        a_obs=prior["a_obs"].values,
+        P_obs=prior["P_obs"].values,
+        anchor_ci=False,
+    )
+
+    for ax in axes[:2]:
+        assert not _anchor_whiskers(ax)
+        assert [c.get_label() for c in ax.collections].count("prior anchor") == 1
+    plt.close(fig)
+
+
+def test_plot_states_legend_lists_anchors_drawn_on_later_panels_only():
+    posterior, dates, labels, prior = _states_inputs()
+    p_obs = prior["P_obs"].values.copy()
+    p_obs[:, 0] = np.inf  # the first panel has no disclosure, as for an undisclosed level
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        states_key="at",
+        obs_idx=disclosed_idx(prior),
+        a_obs=prior["a_obs"].values,
+        P_obs=p_obs,
+    )
+
+    texts = [t.get_text() for t in axes[0].get_legend().get_texts()]
+    assert texts == ["median", "90% CI", "prior anchor 90% CI", "prior anchor"]
+    plt.close(fig)
