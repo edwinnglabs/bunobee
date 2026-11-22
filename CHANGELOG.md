@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plot_states` draws the disclosure uncertainty: each prior anchor gets a whisker spanning `N(a_obs, P_obs)` at the
+  same `ci` levels as the posterior ribbons (±1.645 sd for the default 90%), so prior and posterior widths compare
+  directly; dense disclosure windows merge into a band. `anchor_ci=False` keeps the old markers-only look. The legend
+  now gathers entries from every panel, so anchors that sit only on later states are listed.
 - `T` argument on `kalman_filter_1d_st` — an optional `(n_states, n_states)` transition matrix, so the predict
   step is `a ← T a`, `P ← T P Tᵀ + diag(σ_q²)` and a state can decay (e.g. an AR(1) deviation with `T[i, i] = φ`).
   The log-likelihood is differentiable in `T`, so a NumPyro model can fit its entries. The default `None` leaves

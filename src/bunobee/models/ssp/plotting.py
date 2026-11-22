@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from statistics import NormalDist
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +26,7 @@ def plot_states(
     n_cols: int = 4,
     ci: tuple[float, float, float] = (0.05, 0.5, 0.95),
     colors: dict[str, str] | Sequence[str] | None = None,
+    anchor_ci: bool = True,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Plot posterior quantile ribbons for latent states across MCMC samples.
 
@@ -60,7 +62,8 @@ def plot_states(
         ``obs_idx`` and ``P_obs`` to draw scatter markers.
     P_obs : np.ndarray or None, optional
         Disclosed state variances, shape ``(T, n_states)``.  ``isfinite`` is
-        used as the active-disclosure mask per state.
+        used as the active-disclosure mask per state.  It must be on the same
+        scale as ``a_obs`` and the plotted ``states_key``.
     title : str or None, optional
         Figure suptitle.  Auto-generated from ``states_key`` when ``None``.
     n_cols : int, optional
@@ -74,6 +77,12 @@ def plot_states(
         from the dict fall back to the default palette.  Defaults to
         ``matplotlib``'s ``tab10`` cycle, with ``"darkgreen"`` as the first
         colour to preserve the original single-overlay appearance.
+    anchor_ci : bool, optional
+        Draw each disclosure as a whisker spanning the Gaussian interval of
+        ``N(a_obs, P_obs)`` at the same ``ci`` levels as the posterior
+        ribbons, so the prior anchor and the posterior read on one scale.
+        Dense disclosure windows merge into a band.  By default ``True``;
+        ``False`` draws only the anchor markers.
 
     Returns
     -------
@@ -105,6 +114,8 @@ def plot_states(
 
     has_disclosure = obs_idx is not None and len(obs_idx) > 0 and a_obs is not None and P_obs is not None
     obs_dates = dates[obs_idx] if has_disclosure else []
+    # Gaussian quantiles of the disclosure at the ribbon's own levels: ci=(0.05, 0.5, 0.95) gives ±1.645 sd.
+    z_lo, z_hi = NormalDist().inv_cdf(ci[0]), NormalDist().inv_cdf(ci[2])
 
     n_states = len(state_labels)
     n_rows = math.ceil(n_states / n_cols)
@@ -123,16 +134,31 @@ def plot_states(
             ax.axhline(coefs_lookup[label], color="grey", linestyle=":", linewidth=1.0, label="true coef")
 
         if has_disclosure:
-            anchor_mask = np.isfinite(np.asarray(P_obs)[obs_idx, i])
+            anchor_var = np.asarray(P_obs, dtype=float)[obs_idx, i]
+            anchor_mask = np.isfinite(anchor_var)
             if anchor_mask.any():
+                anchor_dates = obs_dates[anchor_mask]
+                anchor_mean = np.asarray(a_obs, dtype=float)[obs_idx][anchor_mask, i]
+                if anchor_ci:
+                    sd = np.sqrt(anchor_var[anchor_mask])
+                    ax.vlines(
+                        anchor_dates,
+                        anchor_mean + z_lo * sd,
+                        anchor_mean + z_hi * sd,
+                        color="crimson",
+                        alpha=0.45,
+                        linewidth=1.2,
+                        label=f"prior anchor {ci_pct}% CI",
+                        zorder=3,
+                    )
                 ax.scatter(
-                    obs_dates[anchor_mask],
-                    np.asarray(a_obs)[obs_idx][anchor_mask, i],
+                    anchor_dates,
+                    anchor_mean,
                     s=14,
                     color="crimson",
                     marker="x",
                     label="prior anchor",
-                    zorder=3,
+                    zorder=4,
                 )
 
         ax.set_title(label, fontsize=9)
@@ -142,7 +168,12 @@ def plot_states(
     for ax in axes[n_states:]:
         ax.set_visible(False)
 
-    axes[0].legend(fontsize=7)
+    # One legend on the first panel, gathered from every panel: anchors or a true coef may sit on later states only.
+    legend = {}
+    for ax in axes[:n_states]:
+        for handle, text in zip(*ax.get_legend_handles_labels()):
+            legend.setdefault(text, handle)
+    axes[0].legend(legend.values(), legend.keys(), fontsize=7)
 
     if title is None:
         title = keys[0] if single else " vs ".join(keys)
