@@ -330,3 +330,62 @@ def test_plot_states_legend_lists_anchors_drawn_on_later_panels_only():
     texts = [t.get_text() for t in axes[0].get_legend().get_texts()]
     assert texts == ["median", "90% CI", "prior anchor 90% CI", "prior anchor"]
     plt.close(fig)
+
+
+def test_plot_states_defaults_keep_the_original_look():
+    posterior, dates, labels, prior = _states_inputs()
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        states_key="at",
+        obs_idx=disclosed_idx(prior),
+        a_obs=prior["a_obs"].values,
+        P_obs=prior["P_obs"].values,
+    )
+
+    ribbon = next(c for c in axes[0].collections if c.get_label() == "90% CI")
+    (whiskers,) = _anchor_whiskers(axes[0])
+    markers = next(c for c in axes[0].collections if c.get_label() == "prior anchor")
+    assert ribbon.get_alpha() == 0.25
+    assert whiskers.get_alpha() == 0.45
+    np.testing.assert_allclose(whiskers.get_colors()[0][:3], matplotlib.colors.to_rgb("crimson"))
+    np.testing.assert_allclose(markers.get_facecolors()[0][:3], matplotlib.colors.to_rgb("crimson"))
+    plt.close(fig)
+
+
+def test_plot_states_anchor_color_and_alphas_are_applied():
+    posterior, dates, labels, prior = _states_inputs()
+
+    fig, axes = plot_states(
+        posterior,
+        dates,
+        labels,
+        states_key="at",
+        obs_idx=disclosed_idx(prior),
+        a_obs=prior["a_obs"].values,
+        P_obs=prior["P_obs"].values,
+        anchor_color="black",
+        ribbon_alpha=0.1,
+        anchor_alpha=0.8,
+    )
+
+    for ax in axes[:2]:
+        ribbon = next(c for c in ax.collections if c.get_label() == "90% CI")
+        (whiskers,) = _anchor_whiskers(ax)
+        markers = next(c for c in ax.collections if c.get_label() == "prior anchor")
+        assert ribbon.get_alpha() == 0.1
+        assert whiskers.get_alpha() == 0.8
+        np.testing.assert_allclose(whiskers.get_colors()[0][:3], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(markers.get_facecolors()[0][:3], (0.0, 0.0, 0.0))
+        assert markers.get_alpha() is None  # the markers stay opaque
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("arg", ["ribbon_alpha", "anchor_alpha"])
+@pytest.mark.parametrize("value", [-0.1, 1.5])
+def test_plot_states_rejects_alpha_outside_unit_interval(arg, value):
+    posterior, dates, labels, _ = _states_inputs()
+    with pytest.raises(ValueError, match=f"{arg} must be in"):
+        plot_states(posterior, dates, labels, states_key="at", **{arg: value})

@@ -27,6 +27,9 @@ def plot_states(
     ci: tuple[float, float, float] = (0.05, 0.5, 0.95),
     colors: dict[str, str] | Sequence[str] | None = None,
     anchor_ci: bool = True,
+    anchor_color: str = "crimson",
+    ribbon_alpha: float = 0.25,
+    anchor_alpha: float = 0.45,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Plot posterior quantile ribbons for latent states across MCMC samples.
 
@@ -83,6 +86,14 @@ def plot_states(
         ribbons, so the prior anchor and the posterior read on one scale.
         Dense disclosure windows merge into a band.  By default ``True``;
         ``False`` draws only the anchor markers.
+    anchor_color : str, optional
+        Matplotlib colour of the anchor markers and whiskers, by default
+        ``"crimson"``.
+    ribbon_alpha : float, optional
+        Opacity of the posterior ribbons, in ``[0, 1]``, by default ``0.25``.
+    anchor_alpha : float, optional
+        Opacity of the anchor whiskers, in ``[0, 1]``, by default ``0.45``.
+        The markers stay opaque.
 
     Returns
     -------
@@ -93,6 +104,9 @@ def plot_states(
     keys = [states_key] if isinstance(states_key, str) else list(states_key)
     if not keys:
         raise ValueError("states_key must contain at least one key")
+    for name, value in (("ribbon_alpha", ribbon_alpha), ("anchor_alpha", anchor_alpha)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}")
 
     if isinstance(posterior, xr.Dataset):
         posterior = {k: posterior[k].stack(sample=("chain", "draw")).transpose("sample", ...).values for k in keys}
@@ -128,7 +142,7 @@ def plot_states(
             median_label = "median" if single else f"{key} median"
             ribbon_label = f"{ci_pct}% CI" if single else f"{key} {ci_pct}% CI"
             ax.plot(dates, mid[:, i], color=color, linewidth=0.9, label=median_label)
-            ax.fill_between(dates, lo[:, i], hi[:, i], alpha=0.25, color=color, label=ribbon_label)
+            ax.fill_between(dates, lo[:, i], hi[:, i], alpha=ribbon_alpha, color=color, label=ribbon_label)
 
         if i > 0 and coefs_lookup is not None and label in coefs_lookup.index:
             ax.axhline(coefs_lookup[label], color="grey", linestyle=":", linewidth=1.0, label="true coef")
@@ -145,8 +159,8 @@ def plot_states(
                         anchor_dates,
                         anchor_mean + z_lo * sd,
                         anchor_mean + z_hi * sd,
-                        color="crimson",
-                        alpha=0.45,
+                        color=anchor_color,
+                        alpha=anchor_alpha,
                         linewidth=1.2,
                         label=f"prior anchor {ci_pct}% CI",
                         zorder=3,
@@ -155,7 +169,7 @@ def plot_states(
                     anchor_dates,
                     anchor_mean,
                     s=14,
-                    color="crimson",
+                    color=anchor_color,
                     marker="x",
                     label="prior anchor",
                     zorder=4,
