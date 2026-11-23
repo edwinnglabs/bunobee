@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same `ci` levels as the posterior ribbons (±1.645 sd for the default 90%), so prior and posterior widths compare
   directly; dense disclosure windows merge into a band. `anchor_ci=False` keeps the old markers-only look. The legend
   now gathers entries from every panel, so anchors that sit only on later states are listed.
+- `anchor_color`, `ribbon_alpha` and `anchor_alpha` on `plot_states` — the anchor colour (default `"crimson"`) and
+  the opacity of the posterior ribbons (`0.25`) and anchor whiskers (`0.45`). The defaults keep the current look; an
+  alpha outside `[0, 1]` raises `ValueError`. The CI level stays one shared `ci` for ribbons and anchors.
 - `T` argument on `kalman_filter_1d_st` — an optional `(n_states, n_states)` transition matrix, so the predict
   step is `a ← T a`, `P ← T P Tᵀ + diag(σ_q²)` and a state can decay (e.g. an AR(1) deviation with `T[i, i] = φ`).
   The log-likelihood is differentiable in `T`, so a NumPyro model can fit its entries. The default `None` leaves
