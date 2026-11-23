@@ -170,6 +170,47 @@ print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, 
 
 A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb`](playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb).
 
+### Model classes
+
+`SSP` and `DLT` wrap the same models behind one shape: configure, `fit`, `predict`. `SSP` writes the NumPyro model
+above for you from a natural-scale prior. It puts `Beta(2, 10) * sdy` on each series' `sigma_h` and reads `sigma_q`'s
+prior from the prior's `sigma_q` block. The filter name fixes the positivity mechanism and the matching
+`forecast_ssp` link. `DLT` gives the same posterior as `run_dlt_model` and forecasts with the hyperparameters it was
+fitted with. The posterior is on `idata_` and the sampler on `mcmc_`:
+
+```python
+import numpy as np
+import xarray as xr
+
+from bunobee.models.dlt import DLT
+from bunobee.models.ssp import SSP, build_forecast_design
+
+# Natural-scale prior: a free level and a spend effect kept positive, with Beta(2, 10) * scale on each drift
+prior = xr.Dataset(
+    {
+        "a0": (("state",), np.array([1.0, 0.3])),
+        "P0": (("state",), np.array([0.5, 0.1])),
+        "positivity": (("state",), np.array([False, True])),
+        "sigma_q_alpha_prior": (("state",), np.array([2.0, 2.0])),
+        "sigma_q_beta_prior": (("state",), np.array([10.0, 10.0])),
+        "sigma_q_scale_prior": (("state",), np.array([0.05, 0.02])),
+    },
+    coords={"state": ["level", "spend"]},
+).assign_attrs(sigma_q_family="beta")
+
+# y, Z, horizon and rng as in the SSP example above
+model = SSP(prior, filter="ekf", exponent=1.0).fit(y, Z, mcmc_args={"num_warmup": 200, "num_samples": 200})
+Z_future = build_forecast_design(Z, horizon, covariates_future=rng.uniform(0.5, 1.5, size=(horizon, n_series, 1)))
+forecast = model.predict(Z_future, noise_embed=True)
+print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, n_series)
+
+dlt = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8).fit(y_dlt, mcmc_args={"num_warmup": 200, "num_samples": 200})
+print(dlt.predict(end_step=len(y_dlt) + 10)["forecast_samples"].shape)  # (200, 30) for the 20-step y_dlt
+```
+
+`filter="linear"` uses `kalman_filter_1d_st` instead, which keeps the positivity states on the natural scale and
+floors them. NaN entries of `y` become predict-only steps.
+
 ### Fast MAP fits for many series
 
 For hundreds or thousands of non-negative series (sales, counts, demand), `fit_map_batch` fits the linear state-space

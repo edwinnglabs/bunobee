@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Model classes with a shared `fit` / `predict` shape. `bunobee.models.base.Forecaster` is the base: it runs NUTS on
+  the subclass's NumPyro model, keeps the posterior on `idata_` and the sampler on `mcmc_`, and raises
+  `NotFittedError` before a fit. The filters and the DLT recursion stay plain JAX functions; the classes only call
+  them, and every existing function stays public and unchanged.
+  - `bunobee.models.ssp.SSP(prior, filter="ekf" | "linear", exponent=..., sigma_h_prior=...)` packages the
+    multi-series NUTS model the `ssp_04` to `ssp_06` notebooks wrote by hand: `sigma_h = sigma_h_raw * sdy` per
+    series, `sigma_q` from the prior's Beta or truncated-normal block (per state, or compressed to
+    `[first state, shared]`), and the filter's log likelihood, with the `a_obs` / `P_obs` anchors fused in. Under
+    `"ekf"` the natural-scale prior goes through `transform_to_ekf_st` for you. The filter name also fixes the
+    `forecast_ssp` link, so a posterior can't be forecast under the wrong positivity mechanism. `fit(y, Z)` takes a
+    `(n_steps, n_series)` panel or one 1-D series, treats NaN in `y` as missing (predict-only steps), and stores
+    `at`, `at_nat` (EKF), `mu`, `sigma_h`, `sigma_q` with the labels from the prior; `predict(Z_future)` calls
+    `forecast_ssp`.
+  - `bunobee.models.dlt.DLT(lev_sm, slp_sm, theta, ...)`: `fit` gives the same `idata` as `run_dlt_model`, and
+    `predict` calls `make_inference` with the fitted `lev_sm` / `slp_sm` / `theta`, so the forecast can't use different
+    smoothing values from the fit. `run_dlt_model` now shares its input-building and posterior-packaging steps with
+    `DLT`.
 - `plot_states` draws the disclosure uncertainty: each prior anchor gets a whisker spanning `N(a_obs, P_obs)` at the
   same `ci` levels as the posterior ribbons (±1.645 sd for the default 90%), so prior and posterior widths compare
   directly; dense disclosure windows merge into a band. `anchor_ci=False` keeps the old markers-only look. The legend

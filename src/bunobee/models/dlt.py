@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
+from .base import Forecaster
 
 logger = logging.getLogger("bunobee")
 
@@ -273,11 +274,44 @@ def run_dlt_model(
     if noise_dist == "student_t" and not 0 < min_nu < max_nu:
         raise ValueError(f"need 0 < min_nu < max_nu, got min_nu={min_nu}, max_nu={max_nu}")
 
+    reg_input, var_name = _dlt_reg_input(regression_scheme, covariates_df)
+    _check_pos_coef_sum_scale(pos_coef_sum_scale, reg_input)
+
+    init_strategy = init_to_median(num_samples=10)
+    kernel = NUTS(dlt_model, init_strategy=init_strategy)
+    mcmc = MCMC(kernel, **mcmc_run_args)
+
+    mcmc.run(
+        rng_key,
+        lev_sm=lev_sm,
+        slp_sm=slp_sm,
+        theta=theta,
+        y=y,
+        reg_input=reg_input,
+        pos_coef_sum_scale=pos_coef_sum_scale,
+        noise_dist=noise_dist,
+        min_nu=min_nu,
+        max_nu=max_nu,
+    )
+
+    posterior_dict = mcmc.get_samples(group_by_chain=True)
+    return _dlt_idata(posterior_dict, y, noise_dist, regression_scheme, covariates_df, var_name)
+
+
+def _dlt_reg_input(
+    regression_scheme: Optional[RegressionScheme], covariates_df: Optional[pd.DataFrame]
+) -> tuple[Dict[str, Any], List[str]]:
+    """Split the regressors by sign into the ``reg_input`` of :func:`dlt_model`.
+
+    Returns ``(reg_input, var_name)``: ``reg_input`` maps each sign present (``"="``, ``"+"``, ``"-"``) to its
+    ``coef_loc``, ``coef_scale`` and ``covariates``, and ``var_name`` lists the regressors in that order. Both are
+    empty unless ``regression_scheme`` and ``covariates_df`` are both given.
+    """
+    reg_input: Dict[str, Any] = {}
+    var_name: List[str] = []
     if regression_scheme is not None and covariates_df is not None:
         # extract regressors matrix, coef loc and scale
         # separate three groups of regressors with the sign: "=", "+", "-"
-        reg_input = {}
-        var_name = []
         for sign in ["=", "+", "-"]:
             regressors = regression_scheme.scheme.loc[regression_scheme.scheme["sign"] == sign, :].index.to_list()
             if len(regressors) > 0:
@@ -298,35 +332,27 @@ def run_dlt_model(
                 logger.debug(f"covariates shape: {covariates.shape}")
                 logger.debug(f"coef_loc: {coef_loc}")
                 logger.debug(f"coef_scale: {coef_scale}")
-    else:
-        covariates = None
-        reg_input = {}
+    return reg_input, var_name
 
+
+def _check_pos_coef_sum_scale(pos_coef_sum_scale: Optional[float], reg_input: Dict[str, Any]) -> None:
+    """Raise unless ``pos_coef_sum_scale`` is ``None``, or positive with at least one ``"+"`` regressor."""
     if pos_coef_sum_scale is not None:
         if not pos_coef_sum_scale > 0:
             raise ValueError(f"pos_coef_sum_scale must be positive, got {pos_coef_sum_scale}")
         if "+" not in reg_input:
             raise ValueError("pos_coef_sum_scale needs at least one '+' regressor in regression_scheme")
 
-    init_strategy = init_to_median(num_samples=10)
-    kernel = NUTS(dlt_model, init_strategy=init_strategy)
-    mcmc = MCMC(kernel, **mcmc_run_args)
 
-    mcmc.run(
-        rng_key,
-        lev_sm=lev_sm,
-        slp_sm=slp_sm,
-        theta=theta,
-        y=y,
-        reg_input=reg_input,
-        pos_coef_sum_scale=pos_coef_sum_scale,
-        noise_dist=noise_dist,
-        min_nu=min_nu,
-        max_nu=max_nu,
-    )
-
-    posterior_dict = mcmc.get_samples(group_by_chain=True)
-
+def _dlt_idata(
+    posterior_dict: Dict[str, Any],
+    y: np.ndarray,
+    noise_dist: str,
+    regression_scheme: Optional[RegressionScheme],
+    covariates_df: Optional[pd.DataFrame],
+    var_name: List[str],
+) -> xr.Dataset:
+    """Package the chain-grouped samples of :func:`dlt_model` as the ``idata`` :func:`run_dlt_model` returns."""
     # transform them into xr.Dataset
     n_chains, n_draws, n_steps = posterior_dict["dlt_comp"].shape
 
@@ -837,3 +863,164 @@ def get_forecast_decomposition(
         columns[f"{name}_p{lower * 100:02g}"] = quantiles[1]
         columns[f"{name}_p{upper * 100:02g}"] = quantiles[2]
     return pd.DataFrame(columns, index=pd.Index(inference["time"].to_numpy(), name="time"))
+
+
+class DLT(Forecaster):
+    """Damped Local Trend model behind ``fit`` / ``predict``.
+
+    A thin shell over the functions above: :meth:`fit` runs the same NUTS fit as :func:`run_dlt_model` and stores the
+    same ``idata`` on ``idata_``, and :meth:`predict` calls :func:`make_inference` with the hyperparameters the model
+    was fitted with, so a forecast can no longer be made with different ``lev_sm`` / ``slp_sm`` / ``theta`` than the
+    fit. The functions stay public and unchanged.
+
+    Parameters
+    ----------
+    lev_sm : float
+        Level smoothing factor.
+    slp_sm : float
+        Slope smoothing factor.
+    theta : float
+        Damping factor.
+    regression_scheme : RegressionScheme | None
+        Regressor signs and coefficient priors. When given, :meth:`fit` and :meth:`predict` need ``covariates_df``.
+    pos_coef_sum_scale : float | None
+        Scale (``> 0``) of a ``HalfNormal`` constraint on the sum of the positive (``"+"``) coefficients; see
+        :func:`run_dlt_model`.
+    noise_dist : str
+        Observation noise distribution, ``"normal"`` (default) or ``"student_t"``.
+    min_nu, max_nu : float
+        Bounds of the uniform prior on the Student-t degrees of freedom, by default 5 and 40. Used only with
+        ``noise_dist="student_t"``.
+
+    Examples
+    --------
+    >>> model = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8)
+    >>> model.fit(y, mcmc_args={"num_warmup": 200, "num_samples": 200})  # doctest: +SKIP
+    >>> forecast = model.predict(end_step=len(y) + 10)  # doctest: +SKIP
+    """
+
+    def __init__(
+        self,
+        lev_sm: float,
+        slp_sm: float,
+        theta: float,
+        *,
+        regression_scheme: Optional[RegressionScheme] = None,
+        pos_coef_sum_scale: Optional[float] = None,
+        noise_dist: str = "normal",
+        min_nu: float = 5.0,
+        max_nu: float = 40.0,
+    ) -> None:
+        super().__init__()
+        if noise_dist not in NOISE_DISTS:
+            raise ValueError(f"noise_dist must be one of {NOISE_DISTS}, got {noise_dist!r}")
+        if noise_dist == "student_t" and not 0 < min_nu < max_nu:
+            raise ValueError(f"need 0 < min_nu < max_nu, got min_nu={min_nu}, max_nu={max_nu}")
+        if pos_coef_sum_scale is not None and not pos_coef_sum_scale > 0:
+            raise ValueError(f"pos_coef_sum_scale must be positive, got {pos_coef_sum_scale}")
+        self.lev_sm = lev_sm
+        self.slp_sm = slp_sm
+        self.theta = theta
+        self.regression_scheme = regression_scheme
+        self.pos_coef_sum_scale = pos_coef_sum_scale
+        self.noise_dist = noise_dist
+        self.min_nu = min_nu
+        self.max_nu = max_nu
+
+    def _init_strategy(self) -> Callable:
+        return init_to_median(num_samples=10)
+
+    def model(self, y: jnp.ndarray, reg_input: Optional[Dict[str, Any]] = None) -> None:
+        """:func:`dlt_model` with this instance's hyperparameters."""
+        dlt_model(
+            self.lev_sm,
+            self.slp_sm,
+            self.theta,
+            y,
+            reg_input=reg_input,
+            pos_coef_sum_scale=self.pos_coef_sum_scale,
+            noise_dist=self.noise_dist,
+            min_nu=self.min_nu,
+            max_nu=self.max_nu,
+        )
+
+    def fit(
+        self,
+        y: np.ndarray,
+        covariates_df: Optional[pd.DataFrame] = None,
+        *,
+        mcmc_args: Optional[Dict[str, Any]] = None,
+        seed: int = 0,
+    ) -> "DLT":
+        """Fit the model to ``y`` by NUTS and store the posterior on ``idata_``.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observations, shape ``(n_steps,)``.
+        covariates_df : pd.DataFrame | None
+            Covariates, shape ``(n_steps, n_var)``, with a column per regressor of ``regression_scheme``. Required
+            when the model has a ``regression_scheme`` and rejected when it has none.
+        mcmc_args : dict | None
+            Keyword arguments for ``numpyro.infer.MCMC``, on top of
+            :data:`~bunobee.models.base.DEFAULT_MCMC_ARGS`.
+        seed : int
+            Seed of the sampler's ``jax.random.PRNGKey``, by default 0.
+
+        Returns
+        -------
+        DLT
+            ``self``, fitted. ``idata_`` is the dataset :func:`run_dlt_model` returns for the same arguments.
+        """
+        _check_covariates(self.regression_scheme, covariates_df)
+        reg_input, var_name = _dlt_reg_input(self.regression_scheme, covariates_df)
+        _check_pos_coef_sum_scale(self.pos_coef_sum_scale, reg_input)
+        return self._fit(
+            {"y": y, "reg_input": reg_input},
+            mcmc_args=mcmc_args,
+            seed=seed,
+            context={"covariates_df": covariates_df, "var_name": var_name},
+        )
+
+    def _to_idata(self, samples, inputs, context) -> xr.Dataset:
+        return _dlt_idata(
+            samples, inputs["y"], self.noise_dist, self.regression_scheme, context["covariates_df"], context["var_name"]
+        )
+
+    def predict(
+        self,
+        end_step: Optional[int] = None,
+        covariates_df: Optional[pd.DataFrame] = None,
+        *,
+        noise_embed: bool = False,
+        transform_callback: Optional[Callable] = None,
+        conditional_response: Optional[np.ndarray] = None,
+        seed: int = 0,
+    ) -> xr.Dataset:
+        """Forecast with :func:`make_inference` from the fitted posterior.
+
+        ``end_step`` is the total number of steps, in-sample included. With covariates it comes from
+        ``len(covariates_df)`` and must be left out. ``seed`` seeds the ``jax.random.PRNGKey``. See
+        :func:`make_inference` for the other arguments and the returned dataset.
+        """
+        _check_covariates(self.regression_scheme, covariates_df)
+        return make_inference(
+            jax.random.PRNGKey(seed),
+            self.idata_,
+            self.lev_sm,
+            self.slp_sm,
+            self.theta,
+            end_step=end_step,
+            covariates_df=covariates_df,
+            transform_callback=transform_callback,
+            noise_embed=noise_embed,
+            conditional_response=conditional_response,
+        )
+
+
+def _check_covariates(regression_scheme: Optional[RegressionScheme], covariates_df: Optional[pd.DataFrame]) -> None:
+    """Raise unless ``covariates_df`` is given exactly when there is a ``regression_scheme``."""
+    if regression_scheme is not None and covariates_df is None:
+        raise ValueError("the model has a regression_scheme, so covariates_df is required")
+    if regression_scheme is None and covariates_df is not None:
+        raise ValueError("covariates_df was given but the model has no regression_scheme to use it")
