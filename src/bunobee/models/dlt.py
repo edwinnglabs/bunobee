@@ -769,9 +769,7 @@ def make_inference(
         )
 
     rng_key = jax.random.split(rng_key, num=1)[0]
-    dlt_comp_samples = generate_dlt_components(
-        rng_key, idata, end_step, lev_sm, slp_sm, theta, oos_y=oos_y, obs=obs
-    )
+    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta, oos_y=oos_y, obs=obs)
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
     rng_key = jax.random.split(rng_key, num=1)[0]

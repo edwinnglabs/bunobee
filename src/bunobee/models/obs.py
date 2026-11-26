@@ -77,9 +77,7 @@ class ObsFamily(Protocol):
         """The NumPyro distribution of the observations given their ``mean``."""
         ...
 
-    def sample(
-        self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None
-    ) -> np.ndarray:
+    def sample(self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None) -> np.ndarray:
         """Draw observations with NumPy given their ``mean``, broadcasting ``mean`` against ``params``."""
         ...
 
@@ -160,9 +158,7 @@ class Normal:
         """``Normal(gate_mean(mean, gate), sigma)``."""
         return dist.Normal(loc=gate_mean(mean, gate), scale=params["sigma"])
 
-    def sample(
-        self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None
-    ) -> np.ndarray:
+    def sample(self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None) -> np.ndarray:
         """``mean + sigma * z`` with standard normal ``z``, float64."""
         mean, params = _np_params(mean, params, gate)
         shape = np.broadcast_shapes(mean.shape, params["sigma"].shape)
@@ -210,9 +206,7 @@ class StudentT:
         """``StudentT(nu, gate_mean(mean, gate), sigma)``."""
         return dist.StudentT(df=params["nu"], loc=gate_mean(mean, gate), scale=params["sigma"])
 
-    def sample(
-        self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None
-    ) -> np.ndarray:
+    def sample(self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None) -> np.ndarray:
         """``mean + sigma * t`` with standard Student-t ``t`` of ``nu`` degrees of freedom, float64."""
         mean, params = _np_params(mean, params, gate)
         shape = np.broadcast_shapes(mean.shape, params["sigma"].shape, params["nu"].shape)
@@ -241,9 +235,7 @@ class Poisson:
         """``Poisson(gate_mean(mean, gate))``."""
         return dist.Poisson(rate=gate_mean(mean, gate))
 
-    def sample(
-        self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None
-    ) -> np.ndarray:
+    def sample(self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None) -> np.ndarray:
         """Poisson counts of rate ``mean``, as float64."""
         mean, _ = _np_params(mean, params, gate)
         return rng.poisson(mean).astype(np.float64)
@@ -309,9 +301,7 @@ class NegBin2:
         """``NegativeBinomial2(gate_mean(mean, gate), concentration)``."""
         return dist.NegativeBinomial2(mean=gate_mean(mean, gate), concentration=params["concentration"])
 
-    def sample(
-        self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None
-    ) -> np.ndarray:
+    def sample(self, rng: np.random.Generator, mean: Any, params: Mapping[str, Any], gate: Any = None) -> np.ndarray:
         """Negative binomial counts of mean ``mean``, as float64.
 
         Drawn as ``rng.negative_binomial(n=concentration, p=concentration / (concentration + mean))``, which has the

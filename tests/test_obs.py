@@ -144,7 +144,7 @@ class TestSampleParams:
                 pass
             return NegBin2(dispersion_pool_by=level).sample_params("obs", series=series), idx
 
-        (params, idx) = handlers.seed(model, jax.random.PRNGKey(1))()
+        params, idx = handlers.seed(model, jax.random.PRNGKey(1))()
         trace = _trace(model, seed=1)
         log_group = trace["obs/log_concentration"]["value"]
         assert params["concentration"].shape == (3,)
