@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, Optional
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
 from .base import Forecaster
+from .inference import MAP, SVI, Inference
+from .inference import NUTS as NUTSInference
 
 logger = logging.getLogger("bunobee")
 
@@ -868,8 +870,8 @@ def get_forecast_decomposition(
 class DLT(Forecaster):
     """Damped Local Trend model behind ``fit`` / ``predict``.
 
-    A thin shell over the functions above: :meth:`fit` runs the same NUTS fit as :func:`run_dlt_model` and stores the
-    same ``idata`` on ``idata_``, and :meth:`predict` calls :func:`make_inference` with the hyperparameters the model
+    A thin shell over the functions above: by default :meth:`fit` runs the same NUTS fit as :func:`run_dlt_model` and
+    stores the same ``idata`` on ``idata_``, and :meth:`predict` calls :func:`make_inference` with the hyperparameters the model
     was fitted with, so a forecast can no longer be made with different ``lev_sm`` / ``slp_sm`` / ``theta`` than the
     fit. The functions stay public and unchanged.
 
@@ -891,6 +893,9 @@ class DLT(Forecaster):
     min_nu, max_nu : float
         Bounds of the uniform prior on the Student-t degrees of freedom, by default 5 and 40. Used only with
         ``noise_dist="student_t"``.
+    inference : NUTS | SVI | MAP | None
+        How :meth:`fit` fits the model, by default ``NUTS()``; see :mod:`bunobee.models.inference`. The model is
+        one series, so ``SVI`` and ``MAP`` must leave ``subsample=None``.
 
     Examples
     --------
@@ -910,8 +915,9 @@ class DLT(Forecaster):
         noise_dist: str = "normal",
         min_nu: float = 5.0,
         max_nu: float = 40.0,
+        inference: Optional[Inference] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(inference)
         if noise_dist not in NOISE_DISTS:
             raise ValueError(f"noise_dist must be one of {NOISE_DISTS}, got {noise_dist!r}")
         if noise_dist == "student_t" and not 0 < min_nu < max_nu:
@@ -926,6 +932,8 @@ class DLT(Forecaster):
         self.noise_dist = noise_dist
         self.min_nu = min_nu
         self.max_nu = max_nu
+
+    inference_methods = (NUTSInference, SVI, MAP)
 
     def _init_strategy(self) -> Callable:
         return init_to_median(num_samples=10)
@@ -952,7 +960,7 @@ class DLT(Forecaster):
         mcmc_args: Optional[Dict[str, Any]] = None,
         seed: int = 0,
     ) -> "DLT":
-        """Fit the model to ``y`` by NUTS and store the posterior on ``idata_``.
+        """Fit the model to ``y`` with its inference method and store the posterior on ``idata_``.
 
         Parameters
         ----------
@@ -962,15 +970,16 @@ class DLT(Forecaster):
             Covariates, shape ``(n_steps, n_var)``, with a column per regressor of ``regression_scheme``. Required
             when the model has a ``regression_scheme`` and rejected when it has none.
         mcmc_args : dict | None
-            Keyword arguments for ``numpyro.infer.MCMC``, on top of
-            :data:`~bunobee.models.base.DEFAULT_MCMC_ARGS`.
+            Keyword arguments for ``numpyro.infer.MCMC`` for this fit, on top of the model's ``NUTS`` settings
+            (:data:`~bunobee.models.base.DEFAULT_MCMC_ARGS` by default). Only for a model fitted by NUTS.
         seed : int
-            Seed of the sampler's ``jax.random.PRNGKey``, by default 0.
+            Seed of the fit's ``jax.random.PRNGKey``, by default 0.
 
         Returns
         -------
         DLT
-            ``self``, fitted. ``idata_`` is the dataset :func:`run_dlt_model` returns for the same arguments.
+            ``self``, fitted. Under NUTS, ``idata_`` is the dataset :func:`run_dlt_model` returns for the same
+            arguments, plus the ``inference`` attr.
         """
         _check_covariates(self.regression_scheme, covariates_df)
         reg_input, var_name = _dlt_reg_input(self.regression_scheme, covariates_df)

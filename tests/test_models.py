@@ -2,7 +2,8 @@
 
 The classes are shells over functions that have their own tests, so the main checks here are equivalences: ``DLT``
 must reproduce ``run_dlt_model`` / ``make_inference`` exactly, and ``SSP`` must reproduce the NUTS model the
-``ssp_05`` / ``ssp_06`` prototypes write by hand. The fits are tiny on purpose: the point is the wiring.
+``ssp_05`` / ``ssp_06`` prototypes write by hand. The fits are tiny on purpose: the point is the wiring. The
+inference methods themselves are tested in ``test_inference.py``.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from numpyro import distributions as dist
 from numpyro.infer import MCMC, NUTS
 
 from bunobee.models.base import Forecaster, NotFittedError
+from bunobee.models.inference import MAP, SVI
+from bunobee.models.inference import NUTS as NUTSInference
 from bunobee.models.dlt import DLT, make_inference, run_dlt_model
 from bunobee.models.ssp import SSP, transform_to_ekf_st
 from bunobee.models.ssp.forecast import POSITIVITY_FLOOR
@@ -141,7 +144,21 @@ class TestDLT:
     def test_fit_matches_run_dlt_model(self, dlt_y):
         model = DLT(0.5, 0.5, 0.8).fit(dlt_y, mcmc_args=MCMC_ARGS, seed=3)
         expected = run_dlt_model(jax.random.PRNGKey(3), 0.5, 0.5, 0.8, dlt_y, mcmc_run_args=MCMC_ARGS)
-        xr.testing.assert_identical(model.idata_, expected)
+        xr.testing.assert_identical(model.idata_, expected.assign_attrs(inference="NUTS"))
+
+    def test_nuts_inference_matches_mcmc_args(self, dlt_y):
+        by_args = DLT(0.5, 0.5, 0.8).fit(dlt_y, mcmc_args=MCMC_ARGS, seed=3)
+        by_inference = DLT(0.5, 0.5, 0.8, inference=NUTSInference(**MCMC_ARGS)).fit(dlt_y, seed=3)
+        xr.testing.assert_identical(by_inference.idata_, by_args.idata_)
+
+    @pytest.mark.parametrize("inference", [MAP(steps=200), SVI(steps=200, num_draws=20)], ids=["map", "svi"])
+    def test_svi_and_map_fit_and_predict(self, dlt_y, inference):
+        model = DLT(0.5, 0.5, 0.8, inference=inference).fit(dlt_y)
+        assert model.idata_["yhat"].dims == ("chain", "draw", "time")
+        assert model.idata_.sizes["chain"] == 1
+        assert model.idata_.attrs["inference"] == inference.name
+        forecast = model.predict(end_step=len(dlt_y) + 5)
+        assert forecast["forecast_samples"].shape == (inference.num_draws, len(dlt_y) + 5)
 
     def test_fit_with_regression_matches_run_dlt_model(self, dlt_regression):
         y, cov, scheme = dlt_regression
@@ -158,7 +175,7 @@ class TestDLT:
             covariates_df=cov,
             noise_dist="student_t",
         )
-        xr.testing.assert_identical(model.idata_, expected)
+        xr.testing.assert_identical(model.idata_, expected.assign_attrs(inference="NUTS"))
 
     def test_predict_matches_make_inference(self, dlt_y):
         model = DLT(0.5, 0.5, 0.8).fit(dlt_y, mcmc_args=MCMC_ARGS)
@@ -258,7 +275,12 @@ class TestSSPFit:
         assert list(idata["series"].values) == SERIES
         assert list(idata["sigma_q_group"].values) == ["level", "spend"]
         assert len(idata["time"]) == N_STEPS
-        assert idata.attrs == {"exponent": EXPONENT, "link": "exp", "filter": "kalman_filter_1d_ekf_st"}
+        assert idata.attrs == {
+            "exponent": EXPONENT,
+            "link": "exp",
+            "filter": "kalman_filter_1d_ekf_st",
+            "inference": "NUTS",
+        }
         np.testing.assert_array_equal(idata["positivity"].values, [False, True, True])
 
     def test_compressed_sigma_q_is_shared_by_the_later_states(self, ekf_fit):
@@ -325,6 +347,44 @@ class TestSSPPredict:
         _, Z = panel
         with pytest.raises(NotFittedError):
             SSP(_prior()).predict(Z[N_STEPS:])
+
+
+class TestSSPInference:
+    def test_nuts_inference_matches_mcmc_args(self, panel, ekf_fit):
+        y, Z = panel
+        model = SSP(_prior(), exponent=EXPONENT, inference=NUTSInference(**MCMC_ARGS)).fit(y[:N_STEPS], Z[:N_STEPS])
+        xr.testing.assert_identical(model.idata_, ekf_fit.idata_)
+
+    @pytest.mark.parametrize("inference", [MAP(steps=200), SVI(steps=200, num_draws=20)], ids=["map", "svi"])
+    @pytest.mark.parametrize("filter", ["ekf", "linear"])
+    def test_svi_and_map_fit_and_predict(self, panel, inference, filter):
+        y, Z = panel
+        model = SSP(_prior(), filter=filter, exponent=EXPONENT, inference=inference).fit(y[:N_STEPS], Z[:N_STEPS])
+        idata = model.idata_
+        assert idata["at"].dims == ("chain", "draw", "time", "state")
+        assert idata["sigma_h"].dims == ("chain", "draw", "series")
+        assert (idata.sizes["chain"], idata.sizes["draw"]) == (1, inference.num_draws)
+        assert idata.attrs["inference"] == inference.name
+        assert np.isfinite(idata["at"].values).all()
+        forecast = model.predict(Z[N_STEPS:], noise_embed=True)
+        assert forecast["forecast_samples"].shape == (inference.num_draws, HORIZON, N_SERIES)
+        assert np.isfinite(forecast["forecast_samples"].values).all()
+
+    def test_svi_with_subsample_raises_at_construction(self):
+        with pytest.raises(ValueError, match="no series plate"):
+            SSP(_prior(), inference=SVI(subsample=1))
+
+    def test_mcmc_args_under_svi_raise(self, panel):
+        y, Z = panel
+        with pytest.raises(ValueError, match="only applies to NUTS"):
+            SSP(_prior(), inference=MAP(steps=10)).fit(y[:N_STEPS], Z[:N_STEPS], mcmc_args=MCMC_ARGS)
+
+    @pytest.mark.parametrize(
+        "make", [lambda inf: SSP(_prior(), inference=inf), lambda inf: DLT(0.5, 0.5, 0.8, inference=inf)]
+    )
+    def test_unaccepted_method_raises_at_construction(self, make):
+        with pytest.raises(ValueError, match="accepts inference by"):
+            make(object())
 
 
 class TestSSPValidation:
