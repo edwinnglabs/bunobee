@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bunobee.hierarchy` for forecast distributions at every level of a hierarchy (#178). `Hierarchy.from_frame(meta,
+  levels={"store": ["store_id"], "group": ["store_id", "dept_id"]})` builds named `Level`s (a series → group index and
+  the group labels) from a per-series table; a level with no keys is the total. `aggregate_draws(draws, hierarchy,
+  level=None)` sums `(sample, time, series)` draws over each level's groups to `(sample, time, group)`, keeping the
+  correlation the draws carry between series; it takes an array or the dataset `SSP.predict` returns as it is.
+  `draw_quantiles(draws, quantiles)` takes quantiles over `sample`. All four are exported from `bunobee`.
 - Model classes with a shared `fit` / `predict` shape. `bunobee.models.base.Forecaster` is the base: it runs NUTS on
   the subclass's NumPyro model, keeps the posterior on `idata_` and the sampler on `mcmc_`, and raises
   `NotFittedError` before a fit. The filters and the DLT recursion stay plain JAX functions; the classes only call
