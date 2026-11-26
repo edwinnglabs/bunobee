@@ -22,6 +22,7 @@ from bunobee.models.base import Forecaster, NotFittedError
 from bunobee.models.inference import MAP, SVI
 from bunobee.models.inference import NUTS as NUTSInference
 from bunobee.models.dlt import DLT, make_inference, run_dlt_model
+from bunobee.models.obs import NegBin2, Normal, Poisson, StudentT
 from bunobee.models.ssp import SSP, transform_to_ekf_st
 from bunobee.models.ssp.forecast import POSITIVITY_FLOOR
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
@@ -207,6 +208,46 @@ class TestDLT:
     def test_rejects_bad_config_at_construction(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             DLT(0.5, 0.5, 0.8, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("obs", "noise_dist_kwargs"),
+        [
+            (Normal(), {"noise_dist": "normal"}),
+            (StudentT(), {"noise_dist": "student_t"}),
+            (StudentT(min_nu=3.0, max_nu=30.0), {"noise_dist": "student_t", "min_nu": 3.0, "max_nu": 30.0}),
+        ],
+        ids=["normal", "student_t", "student_t_bounds"],
+    )
+    def test_obs_matches_noise_dist(self, dlt_regression, obs, noise_dist_kwargs):
+        y, cov, scheme = dlt_regression
+        by_obs = DLT(0.5, 0.5, 0.8, regression_scheme=scheme, obs=obs).fit(y, cov, mcmc_args=MCMC_ARGS, seed=2)
+        by_name = DLT(0.5, 0.5, 0.8, regression_scheme=scheme, **noise_dist_kwargs)
+        by_name.fit(y, cov, mcmc_args=MCMC_ARGS, seed=2)
+        xr.testing.assert_identical(by_obs.idata_, by_name.idata_)
+        future = pd.concat([cov, cov.iloc[:5]], ignore_index=True)
+        xr.testing.assert_identical(
+            by_obs.predict(covariates_df=future, noise_embed=True, seed=4),
+            by_name.predict(covariates_df=future, noise_embed=True, seed=4),
+        )
+
+    def test_obs_sets_the_priors(self, dlt_y):
+        model = DLT(0.5, 0.5, 0.8, obs=StudentT(min_nu=20.0, max_nu=21.0), inference=MAP(steps=50)).fit(dlt_y)
+        assert 20.0 <= float(model.idata_["nu"].squeeze()) <= 21.0
+        forecast = model.predict(end_step=len(dlt_y) + 3, noise_embed=True)
+        assert np.isfinite(forecast["forecast_samples"]).all()
+
+    @pytest.mark.parametrize("obs", [NegBin2(), Poisson()], ids=["negbin2", "poisson"])
+    def test_rejects_a_count_family(self, obs):
+        with pytest.raises(ValueError, match="real support"):
+            DLT(0.5, 0.5, 0.8, obs=obs)
+
+    def test_rejects_obs_with_noise_dist(self):
+        with pytest.raises(ValueError, match="not both"):
+            DLT(0.5, 0.5, 0.8, obs=StudentT(), noise_dist="student_t")
+
+    def test_rejects_a_non_family(self):
+        with pytest.raises(TypeError, match="observation family"):
+            DLT(0.5, 0.5, 0.8, obs="normal")
 
 
 # ---------------------------------------------------------------------------
