@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bunobee.models.blocks`, NumPyro building blocks for pooled models of many count series (#180), bunobee's own
+  versions of ideas from Juan Orduz's hierarchical M5 state space notebook. `Horizon(n_obs, future)` is the
+  train / forecast split; `block_walk(name, scale, horizon, block_len, n_blocks)` is a random walk over blocks of days
+  that is zero on the last training block and takes one more step for the forecast block; `pooled_effect(name, index,
+  n_levels, group=None, scale=0.3, deviation_scale=None)` is a zero-sum categorical effect (weekday, day of month)
+  shared by a group, with an optional zero-sum deviation per series, or one per series with `group=None`;
+  `group_shocks(name, scale, horizon, groups, period=7)` are daily shocks shared by a group, zero-sum within each
+  period ending at the origin and drawn fresh over the forecast; and `origin_level(y, gate, days=28,
+  fallback_days=None, floor=0.05)` is the log mean over a series' recent listed days, falling back to a longer window
+  and then to `log(floor)`. Groups are an index array or a `hierarchy.Level`; each block names its sites
+  `"<name>/<site>"` under `numpyro.handlers.scope`, so two uses never clash, and takes the model's series plate as
+  `series=` so an `SVI(subsample=k)` guide subsamples its per-series sites.
 - Inference is now a swappable part of the model classes (#179). `bunobee.models.inference` has `NUTS(num_warmup,
   num_samples, num_chains, ...)`, which is what `fit` ran before; `SVI(guide="normal", subsample=None, steps,
   peak_lr, clip_norm, num_draws)`, an `AutoNormal` guide trained by Adam on a one-cycle schedule with gradients clipped
