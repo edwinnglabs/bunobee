@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Inference is now a swappable part of the model classes (#179). `bunobee.models.inference` has `NUTS(num_warmup,
+  num_samples, num_chains, ...)`, which is what `fit` ran before; `SVI(guide="normal", subsample=None, steps,
+  peak_lr, clip_norm, num_draws)`, an `AutoNormal` guide trained by Adam on a one-cycle schedule with gradients clipped
+  to a global norm and then sampled; and `MAP(steps, ...)`, SVI with an `AutoDelta` guide and one draw. Pass one as
+  `SSP(..., inference=SVI())` or `DLT(..., inference=MAP())`; the default `NUTS()` gives the same posterior as before
+  bit for bit, and `fit(mcmc_args=...)` still works on top of it. The posterior keeps its `(chain, draw)` dims under
+  every method (SVI and MAP draws are one chain), `idata_.attrs["inference"]` names the method, and an SVI fit keeps
+  `guide_`, `params_` and `losses_`. Each model declares the methods it accepts (`Forecaster.inference_methods`), so
+  an unsupported one raises `ValueError` at construction. `SVI(subsample=k)` fits `k` series per step from the
+  model's `Forecaster.series_plate`; `SSP` and `DLT` have none (the SSP filter runs over all its series jointly), so
+  they take SVI and MAP without `subsample`. SVI and MAP need the `optim` extra.
 - `bunobee.hierarchy` for forecast distributions at every level of a hierarchy (#178). `Hierarchy.from_frame(meta,
   levels={"store": ["store_id"], "group": ["store_id", "dept_id"]})` builds named `Level`s (a series → group index and
   the group labels) from a per-series table; a level with no keys is the total. `aggregate_draws(draws, hierarchy,

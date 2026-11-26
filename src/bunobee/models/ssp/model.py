@@ -30,6 +30,7 @@ import xarray as xr
 from numpyro import distributions as dist
 
 from bunobee.models.base import Forecaster
+from bunobee.models.inference import MAP, NUTS, SVI, Inference
 from bunobee.models.ssp.forecast import EXP_CLIP, forecast_ssp
 from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
@@ -67,7 +68,7 @@ _SIGMA_Q_VARS: dict[str, tuple[str, ...]] = {
 
 
 class SSP(Forecaster):
-    """Multi-series state-space model: a shared latent state, one Kalman filter, NUTS.
+    """Multi-series state-space model: a shared latent state, one Kalman filter, fitted by NUTS, SVI or MAP.
 
     The model, for ``n_series`` series sharing ``n_states`` states::
 
@@ -99,6 +100,9 @@ class SSP(Forecaster):
     sigma_h_prior : numpyro.distributions.Distribution | None
         Prior of each series' ``sigma_h / sdy``, by default ``Beta(2, 10)``. ``sdy`` is the prior's ``sdy`` when
         it has one, else the standard deviation of each series of ``y``, ignoring NaN.
+    inference : NUTS | SVI | MAP | None
+        How :meth:`fit` fits the model, by default ``NUTS()``; see :mod:`bunobee.models.inference`. The filter
+        runs over all the series jointly, so ``SVI`` and ``MAP`` must leave ``subsample=None``.
 
     Attributes
     ----------
@@ -111,8 +115,12 @@ class SSP(Forecaster):
     >>> model = SSP(prior, filter="ekf", exponent=1.0)  # doctest: +SKIP
     >>> model.fit(y, Z, mcmc_args={"num_warmup": 200, "num_samples": 200})  # doctest: +SKIP
     >>> forecast = model.predict(Z_future, noise_embed=True)  # doctest: +SKIP
+    >>> SSP(prior, inference=SVI(steps=3000)).fit(y, Z).predict(Z_future)  # doctest: +SKIP
     >>> plot_states(model.idata_, dates, state_labels, states_key="at_nat")  # doctest: +SKIP
     """
+
+    #: The filter needs every series at every step, so the series plate is not subsampled.
+    inference_methods = (NUTS, SVI, MAP)
 
     def __init__(
         self,
@@ -122,8 +130,9 @@ class SSP(Forecaster):
         exponent: float = 0.5,
         match: str = "mean",
         sigma_h_prior: dist.Distribution | None = None,
+        inference: Inference | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(inference)
         if filter not in FILTERS:
             raise ValueError(f"filter must be one of {sorted(FILTERS)}, got {filter!r}")
         prior_ds = _unwrap(prior)
@@ -220,7 +229,7 @@ class SSP(Forecaster):
         mcmc_args: Mapping[str, Any] | None = None,
         seed: int = 0,
     ) -> SSP:
-        """Fit the model to ``y`` by NUTS and store the posterior on ``idata_``.
+        """Fit the model to ``y`` with its inference method and store the posterior on ``idata_``.
 
         Parameters
         ----------
@@ -231,16 +240,17 @@ class SSP(Forecaster):
             Design, ``(n_steps, n_series, n_states)``, or ``(n_steps, n_states)`` with a 1-D ``y``. It must be
             finite wherever ``y`` is observed.
         mcmc_args : Mapping | None
-            Keyword arguments for ``numpyro.infer.MCMC``, on top of
-            :data:`~bunobee.models.base.DEFAULT_MCMC_ARGS`.
+            Keyword arguments for ``numpyro.infer.MCMC`` for this fit, on top of the model's ``NUTS`` settings
+            (:data:`~bunobee.models.base.DEFAULT_MCMC_ARGS` by default). Only for a model fitted by NUTS.
         seed : int
-            Seed of the sampler's ``jax.random.PRNGKey``, by default 0.
+            Seed of the fit's ``jax.random.PRNGKey``, by default 0.
 
         Returns
         -------
         SSP
-            ``self``, fitted. ``idata_`` holds every model site with dims ``(chain, draw, ...)``, the
-            ``positivity`` mask, and the ``exponent``, ``link`` and ``filter`` attrs ``forecast_ssp`` reads.
+            ``self``, fitted. ``idata_`` holds every model site with dims ``(chain, draw, ...)`` (one chain under
+            SVI or MAP), the ``positivity`` mask, the ``exponent``, ``link`` and ``filter`` attrs ``forecast_ssp``
+            reads, and the ``inference`` attr.
         """
         y, Z, single = _as_panel(y, Z, self.n_states)
         n_steps, n_series = y.shape

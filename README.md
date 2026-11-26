@@ -211,6 +211,18 @@ print(dlt.predict(end_step=len(y_dlt) + 10)["forecast_samples"].shape)  # (200, 
 `filter="linear"` uses `kalman_filter_1d_st` instead, which keeps the positivity states on the natural scale and
 floors them. NaN entries of `y` become predict-only steps.
 
+Both models fit by NUTS unless told otherwise. `inference=` swaps in variational inference or a point estimate from
+`bunobee.models.inference` (they need the `optim` extra). The posterior keeps its `(chain, draw)` dims either way, so
+`predict` works unchanged:
+
+```python
+from bunobee.models.inference import MAP, SVI
+
+svi = SSP(prior, inference=SVI(steps=3000, num_draws=200)).fit(y, Z)  # AutoNormal guide, 200 draws as one chain
+map_fit = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8, inference=MAP()).fit(y_dlt)  # one draw at the mode
+print(svi.idata_.attrs["inference"], svi.losses_[-1])
+```
+
 ### Fast MAP fits for many series
 
 For hundreds or thousands of non-negative series (sales, counts, demand), `fit_map_batch` fits the linear state-space
