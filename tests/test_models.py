@@ -159,7 +159,7 @@ class TestDLT:
         assert model.idata_.sizes["chain"] == 1
         assert model.idata_.attrs["inference"] == inference.name
         forecast = model.predict(end_step=len(dlt_y) + 5)
-        assert forecast["forecast_samples"].shape == (inference.num_draws, len(dlt_y) + 5)
+        assert forecast["forecast_samples"].shape == (inference.num_draws, 5, 1)
 
     def test_fit_with_regression_matches_run_dlt_model(self, dlt_regression):
         y, cov, scheme = dlt_regression
@@ -178,14 +178,65 @@ class TestDLT:
         )
         xr.testing.assert_identical(model.idata_, expected.assign_attrs(inference="NUTS"))
 
-    def test_predict_matches_make_inference(self, dlt_y):
+    def test_predict_is_the_horizon_of_make_inference(self, dlt_y):
         model = DLT(0.5, 0.5, 0.8).fit(dlt_y, mcmc_args=MCMC_ARGS)
-        forecast = model.predict(end_step=len(dlt_y) + 5, noise_embed=True, seed=7)
+        n_train = len(dlt_y)
+        forecast = model.predict(end_step=n_train + 5, noise_embed=True, seed=7)
         expected = make_inference(
-            jax.random.PRNGKey(7), model.idata_, 0.5, 0.5, 0.8, end_step=len(dlt_y) + 5, noise_embed=True
+            jax.random.PRNGKey(7), model.idata_, 0.5, 0.5, 0.8, end_step=n_train + 5, noise_embed=True
         )
-        xr.testing.assert_identical(forecast, expected)
-        assert forecast["forecast_samples"].shape == (MCMC_ARGS["num_samples"], len(dlt_y) + 5)
+        assert forecast["forecast_samples"].shape == (MCMC_ARGS["num_samples"], 5, 1)
+        np.testing.assert_array_equal(forecast.time, np.arange(5))
+        np.testing.assert_array_equal(forecast.series, [0])
+        for name, source in [
+            ("forecast_samples", "forecast_samples"),
+            ("eps_samples", "eps_samples"),
+            ("mu_samples", "dlt_comp_samples"),
+        ]:
+            np.testing.assert_array_equal(forecast[name].values[..., 0], expected[source].values[:, n_train:])
+
+    def test_predict_with_regression_is_the_horizon_of_make_inference(self, dlt_regression):
+        y, cov, scheme = dlt_regression
+        model = DLT(0.5, 0.5, 0.8, regression_scheme=scheme).fit(y, cov, mcmc_args=MCMC_ARGS)
+        future = pd.concat([cov, cov.iloc[:4]], ignore_index=True)
+        forecast = model.predict(covariates_df=future, transform_callback=np.exp, seed=3)
+        expected = make_inference(
+            jax.random.PRNGKey(3), model.idata_, 0.5, 0.5, 0.8, covariates_df=future, transform_callback=np.exp
+        )
+        assert set(forecast.data_vars) == {"forecast_samples", "mu_samples"}
+        np.testing.assert_array_equal(
+            forecast["forecast_samples"].values[..., 0], expected["forecast_samples"].values[:, len(y) :]
+        )
+        # mu is the untransformed trend plus regression, so the transform maps it onto forecast_samples
+        mu = expected["dlt_comp_samples"].values + expected["reg_comp_samples"].values.sum(axis=-1)
+        np.testing.assert_array_equal(forecast["mu_samples"].values[..., 0], mu[:, len(y) :])
+        np.testing.assert_allclose(np.exp(forecast["mu_samples"]), forecast["forecast_samples"])
+
+    def test_predict_in_sample_covers_every_step(self, dlt_y):
+        model = DLT(0.5, 0.5, 0.8, inference=MAP(steps=50)).fit(dlt_y)
+        forecast = model.predict(end_step=len(dlt_y) + 3, in_sample=True, seed=1)
+        expected = make_inference(jax.random.PRNGKey(1), model.idata_, 0.5, 0.5, 0.8, end_step=len(dlt_y) + 3)
+        assert forecast["forecast_samples"].dims == ("sample", "time", "series")
+        np.testing.assert_array_equal(forecast["forecast_samples"].values[..., 0], expected["forecast_samples"].values)
+        in_sample_only = model.predict(end_step=len(dlt_y), in_sample=True)
+        assert in_sample_only.sizes["time"] == len(dlt_y)
+
+    @pytest.mark.parametrize("extra", [0, -3], ids=["train_end", "before_train_end"])
+    def test_predict_needs_a_horizon(self, dlt_y, extra):
+        model = DLT(0.5, 0.5, 0.8, inference=MAP(steps=50)).fit(dlt_y)
+        with pytest.raises(ValueError, match="past the train end"):
+            model.predict(end_step=len(dlt_y) + extra)
+
+    @pytest.mark.parametrize("noise_embed", [False, True], ids=["mu", "noise"])
+    def test_predict_layout_matches_ssp(self, dlt_y, linear_fit, panel, noise_embed):
+        _, Z = panel
+        dlt = DLT(0.5, 0.5, 0.8, inference=MAP(steps=50)).fit(dlt_y)
+        dlt_forecast = dlt.predict(end_step=len(dlt_y) + HORIZON, noise_embed=noise_embed)
+        ssp_forecast = linear_fit.predict(Z[N_STEPS:], noise_embed=noise_embed)
+        assert list(dlt_forecast.data_vars) == list(ssp_forecast.data_vars)
+        for name in ssp_forecast.data_vars:
+            assert dlt_forecast[name].dims == ssp_forecast[name].dims
+        assert dlt_forecast.sizes["time"] == ssp_forecast.sizes["time"] == HORIZON
 
     def test_regression_needs_covariates(self, dlt_regression):
         y, _, scheme = dlt_regression

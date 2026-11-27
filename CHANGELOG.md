@@ -97,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `bunobee.models.dlt.DLT(lev_sm, slp_sm, theta, ...)`: `fit` gives the same `idata` as `run_dlt_model`, and
     `predict` calls `make_inference` with the fitted `lev_sm` / `slp_sm` / `theta`, so the forecast can't use different
     smoothing values from the fit. `run_dlt_model` now shares its input-building and posterior-packaging steps with
-    `DLT`.
+    `DLT`. `predict` returns the `SSP.predict` layout; see Changed.
 - `plot_states` draws the disclosure uncertainty: each prior anchor gets a whisker spanning `N(a_obs, P_obs)` at the
   same `ci` levels as the posterior ribbons (±1.645 sd for the default 90%), so prior and posterior widths compare
   directly; dense disclosure windows merge into a band. `anchor_ci=False` keeps the old markers-only look. The legend
@@ -148,6 +148,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (since 0.0.7.dev2):** `DLT.predict` returns the layout of `SSP.predict` (#183): `forecast_samples` and
+  `mu_samples` (plus `eps_samples` with `noise_embed`) with dims `(sample, time, series)` over the horizon only, with
+  a `series` dim of size 1 and `time` counted from 0 at the first step after the train end. So `aggregate_draws` and
+  model comparisons take a DLT forecast as they take an SSP one. The values are the horizon of `make_inference`
+  with the same seed; `mu_samples` is the untransformed trend plus regression. `predict(..., in_sample=True)` keeps
+  the training steps in front, and a total that does not go past the train end raises `ValueError` without it.
+  `make_inference` keeps its signature and `(sample, time)` layout, and still gives the trend and regression
+  components.
 - **Breaking:** the MAP fitters and the target transforms left the M5 package and lost their M5 names. Update imports
   and calls as follows:
 
