@@ -223,6 +223,45 @@ map_fit = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8, inference=MAP()).fit(y_dlt)  # 
 print(svi.idata_.attrs["inference"], svi.losses_[-1])
 ```
 
+### Pooled count model for many series
+
+`HierarchicalCount` fits one negative binomial model to thousands of count series at once, by SVI on batches of
+series. It is the general form of Juan Orduz's hierarchical M5 state space model. Each series' log mean is its
+recent mean plus terms that are pooled over the levels of a `Hierarchy`: an intercept and a walk over 28-day blocks,
+a weekday pattern, shocks shared by a store, a covariate such as SNAP, and others. A `gate` of `0` marks the days a
+series cannot sell. `predict` returns `(sample, time, series)` count draws that sum up the hierarchy with
+`aggregate_draws`. It needs the `optim` extra.
+
+```python
+import numpy as np
+import pandas as pd
+
+from bunobee import Hierarchy, aggregate_draws, draw_quantiles
+from bunobee.models.count import BlockWalk, GroupShocks, HierarchicalCount, Level, Regressor, Seasonal
+from bunobee.models.inference import SVI
+
+rng = np.random.default_rng(0)
+n_obs, horizon, n_series = 364, 28, 60
+meta = pd.DataFrame({"store_id": np.arange(n_series) % 3, "dept_id": np.arange(n_series) % 4})
+hierarchy = Hierarchy.from_frame(meta, {"store": ["store_id"], "group": ["store_id", "dept_id"]})
+y = rng.poisson(4.0, size=(n_obs, n_series))  # counts, (n_obs, n_series)
+snap = (np.arange(n_obs + horizon) % 30 < 10).astype(float)  # 1 on the first 10 days of each month
+
+model = HierarchicalCount(
+    level=Level(walk=BlockWalk(block=28, n_blocks=6), shift_by="group"),
+    components=[Seasonal(7, pool_by="group"), GroupShocks("store"), Regressor("snap", pool_by="group")],
+    hierarchy=hierarchy,
+    inference=SVI(subsample=20, steps=1000),  # 20 series per step
+)
+model.fit(y, {"snap": snap[:n_obs]})
+forecast = model.predict({"snap": snap[n_obs:]}, num_draws=200)  # forecast_samples (200, 28, 60)
+store_quantiles = draw_quantiles(aggregate_draws(forecast, hierarchy, "store"), [0.05, 0.5, 0.95])
+```
+
+The other terms are `DayOfMonth`, `Events` and `Fourier`. `pool_by=None`, the default, gives each series its own
+effect. Orduz's M5 model, rebuilt on this class, scores a mean WSPL of 0.16228 (sd 0.0014) on the M5 evaluation
+window over seeds 42 to 46. The previous benchmark scores 0.16272 (sd 0.0006).
+
 ### Fast MAP fits for many series
 
 For hundreds or thousands of non-negative series (sales, counts, demand), `fit_map_batch` fits the linear state-space

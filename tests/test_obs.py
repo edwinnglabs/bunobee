@@ -78,6 +78,9 @@ class TestProtocol:
             (lambda: StudentT(min_nu=0.0), "min_nu"),
             (lambda: NegBin2(log_concentration_scale=-1.0), "log_concentration_scale"),
             (lambda: NegBin2(dispersion_pool_by="store"), "Level"),
+            (lambda: NegBin2(deviation_by=_level()), "needs dispersion_pool_by"),
+            (lambda: NegBin2(dispersion_pool_by=_level(), deviation_by="dept"), "Level"),
+            (lambda: NegBin2(dispersion_pool_by=_level(), deviation_by=_level(), deviation_scale=0.0), "deviation"),
         ],
     )
     def test_rejects_bad_config(self, make, match):
@@ -149,6 +152,34 @@ class TestSampleParams:
         log_group = trace["obs/log_concentration"]["value"]
         assert params["concentration"].shape == (3,)
         np.testing.assert_allclose(params["concentration"], jnp.exp(log_group)[level.group_idx[np.asarray(idx)]])
+
+    def test_negbin2_deviation_by_draws_each_series_around_its_group(self):
+        group = _level()
+        spread = Level("dept", np.array([0, 1, 0, 1, 1]), pd.Index(["x", "y"]))
+        family = NegBin2(dispersion_pool_by=group, deviation_by=spread, deviation_scale=0.5)
+
+        def model():
+            series = numpyro.plate("series", group.n_series, subsample_size=3)
+            return family.sample_params("obs", series=series), series._indices
+
+        (params, idx), trace = handlers.seed(model, jax.random.PRNGKey(2))(), _trace(model, seed=2)
+        idx = np.asarray(idx)
+        site = trace["obs/log_concentration"]
+        assert trace["obs/log_concentration_group"]["value"].shape == (group.n_groups,)
+        assert trace["obs/deviation_scale"]["value"].shape == (spread.n_groups,)
+        assert site["value"].shape == (3,)
+        assert [frame.name for frame in site["cond_indep_stack"]] == ["series"]
+        # Each series is Normal(its group's log-concentration, its department's spread).
+        loc = trace["obs/log_concentration_group"]["value"][group.group_idx[idx]]
+        scale = trace["obs/deviation_scale"]["value"][spread.group_idx[idx]]
+        np.testing.assert_allclose(site["fn"].loc, loc)
+        np.testing.assert_allclose(site["fn"].scale, scale)
+        np.testing.assert_allclose(params["concentration"], jnp.exp(site["value"]))
+
+    def test_negbin2_deviation_by_needs_the_series_plate(self):
+        family = NegBin2(dispersion_pool_by=_level(), deviation_by=_level())
+        with pytest.raises(ValueError, match="series="):
+            _trace(lambda: family.sample_params("obs"))
 
 
 class TestSamplers:

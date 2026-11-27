@@ -252,7 +252,12 @@ class NegBin2:
     - with ``dispersion_pool_by=None``, one log-concentration per series under the ``series`` plate, or one for all
       when no plate is given;
     - with ``dispersion_pool_by`` a :class:`~bunobee.hierarchy.Level`, one per group of that level, under the plate
-      ``"<name>/dispersion_groups"``, shared by the group's series.
+      ``"<name>/dispersion_groups"``, shared by the group's series;
+    - with ``deviation_by`` a level as well, one per series again, ``Normal(group_log_concentration, tau)`` around its
+      group's (the site ``"<name>/log_concentration_group"``), where ``tau ~ HalfNormal(deviation_scale)`` is shared
+      by the series of a group of ``deviation_by`` (the site ``"<name>/deviation_scale"``, under the plate
+      ``"<name>/deviation_groups"``). This is the dispersion of Orduz's M5 model: per item, pooled per store ×
+      department, with a spread per department.
 
     Sites: ``"<name>/log_concentration"`` and the deterministic ``"<name>/concentration"``, the concentration of each
     series of the batch (or the one for all). Call :meth:`sample_params` outside the series plate.
@@ -262,12 +267,20 @@ class NegBin2:
     dispersion_pool_by : Level | None
         The hierarchy level whose groups share a dispersion, e.g. ``hierarchy["store"]``; ``None`` for one per series.
     log_concentration_loc, log_concentration_scale : float
-        Location and scale of the ``Normal`` prior on the log-concentration, by default 0 and 1.
+        Location and scale of the ``Normal`` prior on the log-concentration (of a group, with ``dispersion_pool_by``),
+        by default 0 and 1.
+    deviation_by : Level | None
+        The level whose groups share the spread of the series' log-concentrations around their group's; needs
+        ``dispersion_pool_by`` and the ``series`` plate. By default ``None``, no series-level dispersion.
+    deviation_scale : float
+        Scale of the ``HalfNormal`` prior on that spread, by default 1.
     """
 
     dispersion_pool_by: Level | None = None
     log_concentration_loc: float = 0.0
     log_concentration_scale: float = 1.0
+    deviation_by: Level | None = None
+    deviation_scale: float = 1.0
 
     support: ClassVar[str] = "count"
     param_names: ClassVar[tuple[str, ...]] = ("concentration",)
@@ -275,7 +288,14 @@ class NegBin2:
     def __post_init__(self) -> None:
         if self.dispersion_pool_by is not None and not isinstance(self.dispersion_pool_by, Level):
             raise ValueError(f"dispersion_pool_by must be a hierarchy Level or None, got {self.dispersion_pool_by!r}")
-        _check_positive("NegBin2", log_concentration_scale=self.log_concentration_scale)
+        if self.deviation_by is not None:
+            if not isinstance(self.deviation_by, Level):
+                raise ValueError(f"deviation_by must be a hierarchy Level or None, got {self.deviation_by!r}")
+            if self.dispersion_pool_by is None:
+                raise ValueError("deviation_by needs dispersion_pool_by, the groups the series deviate from")
+        _check_positive(
+            "NegBin2", log_concentration_scale=self.log_concentration_scale, deviation_scale=self.deviation_scale
+        )
 
     def sample_params(self, name: str | None, series: numpyro.plate | None = None) -> dict[str, Any]:
         """Sample the log-concentration and return the ``concentration`` of each series of the ``series`` batch.
@@ -284,7 +304,20 @@ class NegBin2:
         """
         prior = dist.Normal(self.log_concentration_loc, self.log_concentration_scale)
         site = _site(name, "log_concentration")
-        if self.dispersion_pool_by is not None:
+        if self.deviation_by is not None:
+            if series is None:
+                raise ValueError("NegBin2 with deviation_by samples one log-concentration per series; pass series=")
+            group_idx, n_groups = _group_index(self.dispersion_pool_by)
+            dev_idx, n_dev = _group_index(self.deviation_by)
+            with numpyro.plate(_site(name, "dispersion_groups"), n_groups):
+                log_group = numpyro.sample(_site(name, "log_concentration_group"), prior)
+            with numpyro.plate(_site(name, "deviation_groups"), n_dev):
+                tau = numpyro.sample(_site(name, "deviation_scale"), dist.HalfNormal(self.deviation_scale))
+            loc = log_group[_batch(group_idx, series)]
+            scale = tau[_batch(dev_idx, series)]
+            with series:
+                log_concentration = numpyro.sample(site, dist.Normal(loc, scale))
+        elif self.dispersion_pool_by is not None:
             group_idx, n_groups = _group_index(self.dispersion_pool_by)
             with numpyro.plate(_site(name, "dispersion_groups"), n_groups):
                 log_group = numpyro.sample(site, prior)
