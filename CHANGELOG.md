@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bunobee.models.obs`, pluggable observation families (#181). The `ObsFamily` protocol has `sample_params(name,
+  series=None)`, which registers the family's priors as `"<name>/<param>"` sites (bare names with `name=None`) and
+  returns the parameters; `dist(mean, params, gate=None)`, the NumPyro likelihood; `sample(rng, mean, params,
+  gate=None)`, a NumPy forecast sampler; `support` (`"real"`, `"positive"` or `"count"`); and `param_names`. The
+  families are `Normal(sigma_scale=5)`, `StudentT(min_nu=5, max_nu=40, sigma_scale=5)`, `Poisson()` and
+  `NegBin2(dispersion_pool_by=None, log_concentration_loc=0, log_concentration_scale=1)`, whose log-concentration is
+  one per series, or one per group of a `hierarchy.Level` when `dispersion_pool_by` is set. `Normal` and `StudentT`
+  also draw additive JAX noise with `noise(key, params, shape)` (the `RealObsFamily` protocol). A `gate` (`0` where
+  the mean is structurally zero, e.g. no listed price or a closed store) multiplies the mean and adds `GATE_FLOOR`,
+  so a gated step contributes the likelihood of a zero under the floored mean (`gate_mean`); this differs from the
+  NaN mask of `y`, which skips a missing step.
+- `DLT(..., obs=Normal())` takes an observation family; `noise_dist="student_t"` is now shorthand for
+  `StudentT(min_nu, max_nu)`, with posteriors and forecasts bitwise identical to before. `DLT` accepts only families
+  with real support and raises `ValueError` at construction for `NegBin2()` or `Poisson()`. `dlt_model`,
+  `make_inference`, `generate_dlt_components` and `generate_noise_components` take an optional `obs` as well, and
+  `obs_from_noise_dist` maps a `noise_dist` name to its family.
 - `bunobee.models.blocks`, NumPyro building blocks for pooled models of many count series (#180), bunobee's own
   versions of ideas from Juan Orduz's hierarchical M5 state space notebook. `Horizon(n_obs, future)` is the
   train / forecast split; `block_walk(name, scale, horizon, block_len, n_blocks)` is a random walk over blocks of days
