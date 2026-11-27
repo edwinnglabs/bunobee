@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SSP(filter=FilterSpec(...))` fits with a filter of your own without editing the global `FILTERS` (#175). The
+  filter's call is written down as the `SspFilter` protocol. The optional `FilterSpec.forecast`, an `SspForecast`,
+  replaces `forecast_ssp` in `SSP.predict`, so a filter with other state dynamics or another observation model is
+  forecast by the model it was fitted with. The optional `FilterSpec.name` goes in `idata.attrs["filter"]`, so a
+  `functools.partial` filter works. `SSP` checks the spec when it is built: `fn` must be callable, and `link` must
+  be a `forecast_ssp` link unless `forecast` is given. `FilterSpec`, `SspFilter` and `SspForecast` are exported from
+  `bunobee.models.ssp`. The `"ekf"` and `"linear"` filters are unchanged.
 - `bunobee.models.count.HierarchicalCount`, a pooled count model of many series (#182), the general form of Juan
   Orduz's hierarchical M5 state space model built from `bunobee.models.blocks`, `bunobee.models.obs`,
   `bunobee.models.inference` and `bunobee.hierarchy`. `HierarchicalCount(level, components, obs, hierarchy,
