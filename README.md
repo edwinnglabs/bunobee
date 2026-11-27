@@ -259,8 +259,8 @@ store_quantiles = draw_quantiles(aggregate_draws(forecast, hierarchy, "store"), 
 ```
 
 The other terms are `DayOfMonth`, `Events` and `Fourier`. `pool_by=None`, the default, gives each series its own
-effect. wunkui's `m5_orduz_state_space_bunobee.py` rebuilds Orduz's model on this class. On the M5 evaluation window,
-over seeds 42 to 46, it scores a mean WSPL of 0.16228 (sd 0.0014). The published script scores 0.16272 (sd 0.0006).
+effect. Orduz's M5 model, rebuilt on this class, scores a mean WSPL of 0.16228 (sd 0.0014) on the M5 evaluation
+window over seeds 42 to 46. The previous benchmark scores 0.16272 (sd 0.0006).
 
 ### Fast MAP fits for many series
 

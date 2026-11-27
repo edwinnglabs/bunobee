@@ -29,8 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family's NumPy sampler draws the counts. It returns `forecast_samples` as `(sample, time, series)`, which
   `aggregate_draws` and `draw_quantiles` take as they are. The default is `NegBin2()` fitted by
   `SVI(subsample=1500, steps=3000)` on Orduz's `LinearOneCycle` schedule from `init_to_median`; a panel of at most
-  1,500 series is fitted whole. Rebuilt on the class in wunkui with Orduz's terms, the M5 evaluation window scores a
-  mean WSPL of 0.16228 over seeds 42 to 46 (the script's 0.16272); at seed 42 it is 0.16049 (the script's 0.16302).
+  1,500 series is fitted whole. Rebuilt on the class with Orduz's terms, the M5 evaluation window scores a mean
+  WSPL of 0.16228 over seeds 42 to 46 (the previous benchmark's 0.16272); at seed 42 it is 0.16049 (the previous
+  benchmark's 0.16302).
 - `SVI(schedule=...)` and `MAP(schedule=...)` take an `optax` learning rate schedule in place of the one-cycle cosine
   (#182). `NegBin2(dispersion_pool_by, deviation_by=..., deviation_scale=1)` gives every series its own
   log-concentration around its group's, with a `HalfNormal(deviation_scale)` spread shared by the groups of

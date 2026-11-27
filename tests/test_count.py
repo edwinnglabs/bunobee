@@ -3,8 +3,8 @@
 A synthetic panel of negative binomial counts, with a constant level per series and a weekday pattern shared by the
 series of a group, is fitted once by SVI: the fit must recover both. The forecast must be counts laid out ``(sample,
 time, series)`` that ``aggregate_draws`` and ``draw_quantiles`` take as they are. A smaller panel runs every component
-at once, as Orduz's M5 model does, with a short MAP fit. The full M5 check (WSPL within 0.0002 of 0.16302) runs in
-wunkui, not here.
+at once, as Orduz's M5 model does, with a short MAP fit. The full M5 check against the previous benchmark (WSPL
+within 0.0002 of 0.16302) runs outside this repository.
 """
 
 from __future__ import annotations
