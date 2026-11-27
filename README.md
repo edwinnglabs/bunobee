@@ -176,7 +176,9 @@ A worked example on a real multi-series panel — fan chart, state path, and per
 above for you from a natural-scale prior. It puts `Beta(2, 10) * sdy` on each series' `sigma_h` and reads `sigma_q`'s
 prior from the prior's `sigma_q` block. The filter name fixes the positivity mechanism and the matching
 `forecast_ssp` link. `DLT` gives the same posterior as `run_dlt_model` and forecasts with the hyperparameters it was
-fitted with. The posterior is on `idata_` and the sampler on `mcmc_`:
+fitted with. Both `predict`s return `forecast_samples` and `mu_samples` (plus `eps_samples` with `noise_embed`) as
+`(sample, time, series)` over the horizon; a `DLT` forecast is one series, and `in_sample=True` adds the training
+steps. The posterior is on `idata_` and the sampler on `mcmc_`:
 
 ```python
 import numpy as np
@@ -205,7 +207,8 @@ forecast = model.predict(Z_future, noise_embed=True)
 print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, n_series)
 
 dlt = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8).fit(y_dlt, mcmc_args={"num_warmup": 200, "num_samples": 200})
-print(dlt.predict(end_step=len(y_dlt) + 10)["forecast_samples"].shape)  # (200, 30) for the 20-step y_dlt
+print(dlt.predict(end_step=len(y_dlt) + 10)["forecast_samples"].shape)  # (200, 10, 1) = (n_sample, horizon, 1)
+print(dlt.predict(end_step=len(y_dlt) + 10, in_sample=True)["forecast_samples"].shape)  # (200, 30, 1) for 20 steps
 ```
 
 `filter="linear"` uses `kalman_filter_1d_st` instead, which keeps the positivity states on the natural scale and

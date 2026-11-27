@@ -895,7 +895,9 @@ class DLT(Forecaster):
     A thin shell over the functions above: by default :meth:`fit` runs the same NUTS fit as :func:`run_dlt_model` and
     stores the same ``idata`` on ``idata_``, and :meth:`predict` calls :func:`make_inference` with the hyperparameters
     the model was fitted with, so a forecast can no longer be made with different ``lev_sm`` / ``slp_sm`` / ``theta``
-    than the fit. The functions stay public, and their ``noise_dist`` calls work as before.
+    than the fit. :meth:`predict` returns the ``(sample, time, series)`` layout of ``SSP.predict`` over the horizon,
+    so ``aggregate_draws`` and model comparisons take both models the same way. The functions stay public, and their
+    ``noise_dist`` calls work as before.
 
     Parameters
     ----------
@@ -929,6 +931,8 @@ class DLT(Forecaster):
     >>> model = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8)
     >>> model.fit(y, mcmc_args={"num_warmup": 200, "num_samples": 200})  # doctest: +SKIP
     >>> forecast = model.predict(end_step=len(y) + 10)  # doctest: +SKIP
+    >>> forecast["forecast_samples"].dims  # doctest: +SKIP
+    ('sample', 'time', 'series')
 
     Raises
     ------
@@ -1037,16 +1041,56 @@ class DLT(Forecaster):
         noise_embed: bool = False,
         transform_callback: Optional[Callable] = None,
         conditional_response: Optional[np.ndarray] = None,
+        in_sample: bool = False,
         seed: int = 0,
     ) -> xr.Dataset:
-        """Forecast with :func:`make_inference` from the fitted posterior.
+        """Forecast with :func:`make_inference` from the fitted posterior, in the layout of ``SSP.predict``.
 
-        ``end_step`` is the total number of steps, in-sample included. With covariates it comes from
-        ``len(covariates_df)`` and must be left out. ``seed`` seeds the ``jax.random.PRNGKey``. See
-        :func:`make_inference` for the other arguments and the returned dataset.
+        Parameters
+        ----------
+        end_step : int | None
+            Total number of steps, the training steps included. With covariates it comes from
+            ``len(covariates_df)`` and must be left out.
+        covariates_df : pd.DataFrame | None
+            Covariates over all ``end_step`` steps, the training steps included. Required when the model has a
+            ``regression_scheme`` and rejected when it has none.
+        noise_embed : bool
+            Add the observation noise to ``forecast_samples`` and return it as ``eps_samples``, by default ``False``.
+        transform_callback : Callable | None
+            Applied to ``forecast_samples`` only, e.g. to reverse a log transform.
+        conditional_response : np.ndarray | None
+            Actuals past the train end that update the latent states; see :func:`make_inference`.
+        in_sample : bool
+            Return every step from the first training step, so the in-sample fit comes with the forecast. By default
+            ``False``: only the steps after the train end.
+        seed : int
+            Seed of the ``jax.random.PRNGKey``, by default 0.
+
+        Returns
+        -------
+        xr.Dataset
+            ``forecast_samples`` and ``mu_samples`` (plus ``eps_samples`` with ``noise_embed``), dims
+            ``(sample, time, series)`` with integer-range coords and a ``series`` dim of size 1, as ``SSP.predict``
+            returns. ``time`` 0 is the first step after the train end, or the first training step with
+            ``in_sample=True``. The values are the matching steps of :func:`make_inference` with the same seed:
+            ``mu_samples`` is ``dlt_comp_samples`` plus the summed ``reg_comp_samples`` and is left untransformed.
+            Call :func:`make_inference` for the trend and regression components.
+
+        Raises
+        ------
+        ValueError
+            If ``covariates_df`` is missing or unexpected for the ``regression_scheme``, or, without ``in_sample``,
+            the total number of steps does not go past the train end.
         """
         _check_covariates(self.regression_scheme, covariates_df)
-        return make_inference(
+        n_train = self.idata_["dlt_comp"].shape[-1]
+        n_total = len(covariates_df) if covariates_df is not None else end_step
+        if not in_sample and n_total is not None and n_total <= n_train:
+            raise ValueError(
+                f"the forecast needs steps past the train end ({n_train}), got {n_total} steps in total; "
+                "pass in_sample=True for the in-sample fit"
+            )
+        inference = make_inference(
             jax.random.PRNGKey(seed),
             self.idata_,
             self.lev_sm,
@@ -1059,6 +1103,28 @@ class DLT(Forecaster):
             conditional_response=conditional_response,
             obs=self.obs,
         )
+        return _as_panel(inference, start=0 if in_sample else n_train, noise_embed=noise_embed)
+
+
+def _as_panel(inference: xr.Dataset, start: int, noise_embed: bool) -> xr.Dataset:
+    """The steps of a :func:`make_inference` dataset from ``start`` on, as one series in the ``SSP.predict`` layout."""
+    # (n_samples, n_steps)
+    mu_samples = inference["dlt_comp_samples"].to_numpy()
+    if "reg_comp_samples" in inference:
+        mu_samples = mu_samples + np.sum(inference["reg_comp_samples"].to_numpy(), axis=-1)
+    samples = {"mu_samples": mu_samples}
+    if noise_embed:
+        samples["eps_samples"] = inference["eps_samples"].to_numpy()
+    samples["forecast_samples"] = inference["forecast_samples"].to_numpy()
+    dims = ["sample", "time", "series"]
+    # (n_samples, n_steps - start, 1)
+    data_vars = {name: (dims, values[:, start:, None]) for name, values in samples.items()}
+    coords = {
+        "sample": np.arange(inference.sizes["sample"]),
+        "time": np.arange(inference.sizes["time"] - start),
+        "series": np.arange(1),
+    }
+    return xr.Dataset(data_vars=data_vars, coords=coords)
 
 
 def _check_obs(obs: Any) -> None:
