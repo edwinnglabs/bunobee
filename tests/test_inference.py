@@ -157,11 +157,32 @@ class TestSVI:
             ({"num_draws": 0}, "num_draws"),
             ({"peak_lr": 0.0}, "peak_lr"),
             ({"clip_norm": -1.0}, "clip_norm"),
+            ({"schedule": 0.01}, "schedule"),
         ],
     )
     def test_rejects_bad_settings(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             SVI(**kwargs)
+
+    def test_schedule_replaces_the_cosine_one_cycle(self, pooled_y):
+        rates = []
+
+        def schedule(count):
+            rates.append(count)
+            return 0.05
+
+        model = Pooled(MAP(steps=200, schedule=schedule)).fit(pooled_y)
+        # The optimiser asked the schedule for its rate, and a constant rate still fits.
+        assert rates
+        np.testing.assert_allclose(model.idata_["level"].values[0, 0], pooled_y.mean(axis=0), atol=0.3)
+
+    def test_schedule_none_is_the_cosine_one_cycle(self, pooled_y):
+        import optax
+
+        cosine = optax.cosine_onecycle_schedule(transition_steps=300, peak_value=0.03)
+        by_default = Pooled(SVI(steps=300, num_draws=5)).fit(pooled_y, seed=2)
+        explicit = Pooled(SVI(steps=300, num_draws=5, schedule=cosine)).fit(pooled_y, seed=2)
+        np.testing.assert_allclose(by_default.losses_, explicit.losses_, rtol=1e-6)
 
 
 class TestAccepts:

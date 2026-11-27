@@ -13,6 +13,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bunobee.models.count.HierarchicalCount`, a pooled count model of many series (#182), the general form of Juan
+  Orduz's hierarchical M5 state space model built from `bunobee.models.blocks`, `bunobee.models.obs`,
+  `bunobee.models.inference` and `bunobee.hierarchy`. `HierarchicalCount(level, components, obs, hierarchy,
+  inference)` adds terms on the log scale: `Level(anchor=RecentMean(days), walk=BlockWalk(block, n_blocks),
+  scale_by, shift_by)`, the recent mean at the origin plus an intercept, a shift per group and a walk over blocks that
+  is zero on the last training block; `Seasonal(period, pool_by=None, deviation=None, index=None)`, a zero-sum
+  pattern per series by default, or pooled per group with series deviations; `DayOfMonth(pool_by)`;
+  `Events(pool_by, keys, n_events=None)`; `Fourier(period, order, pool_by)`; `GroupShocks(by, period)`; and
+  `Regressor(name, pool_by)` for a covariate such as SNAP. `pool_by` names a level of the hierarchy whose groups share
+  an effect, `None` for one per series. Each component's sites are `"<name>/<site>"`, and any object with `name`,
+  `keys` and `contribute(ctx)` is a component. `fit(y, covariates, gate=...)` takes `(n_obs, n_series)` counts
+  (NaN is a gated day). `predict(covariates_future, gate_future=..., num_draws=...)` takes the posterior draws in
+  chunks. Each chunk gets a forecast-only pass for the mean and the observation parameters over the horizon, then the
+  family's NumPy sampler draws the counts. It returns `forecast_samples` as `(sample, time, series)`, which
+  `aggregate_draws` and `draw_quantiles` take as they are. The default is `NegBin2()` fitted by
+  `SVI(subsample=1500, steps=3000)` on Orduz's `LinearOneCycle` schedule from `init_to_median`; a panel of at most
+  1,500 series is fitted whole. Rebuilt on the class in wunkui with Orduz's terms, the M5 evaluation window scores a
+  mean WSPL of 0.16228 over seeds 42 to 46 (the script's 0.16272); at seed 42 it is 0.16049 (the script's 0.16302).
+- `SVI(schedule=...)` and `MAP(schedule=...)` take an `optax` learning rate schedule in place of the one-cycle cosine
+  (#182). `NegBin2(dispersion_pool_by, deviation_by=..., deviation_scale=1)` gives every series its own
+  log-concentration around its group's, with a `HalfNormal(deviation_scale)` spread shared by the groups of
+  `deviation_by`: the dispersion of Orduz's M5 model.
 - `bunobee.models.obs`, pluggable observation families (#181). The `ObsFamily` protocol has `sample_params(name,
   series=None)`, which registers the family's priors as `"<name>/<param>"` sites (bare names with `name=None`) and
   returns the parameters; `dist(mean, params, gate=None)`, the NumPyro likelihood; `sample(rng, mean, params,

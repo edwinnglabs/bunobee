@@ -134,8 +134,8 @@ class NUTS:
 class SVI:
     """Stochastic variational inference with an autoguide, then posterior draws from the guide.
 
-    The ELBO is minimised by Adam on a one-cycle cosine schedule that peaks at ``peak_lr``, with gradients clipped to
-    a global norm of ``clip_norm``. The guide starts from the model's ``_init_strategy()``.
+    The ELBO is minimised by Adam on a one-cycle cosine schedule that peaks at ``peak_lr`` (or on ``schedule``), with
+    gradients clipped to a global norm of ``clip_norm``. The guide starts from the model's ``_init_strategy()``.
 
     Parameters
     ----------
@@ -156,6 +156,9 @@ class SVI:
         Posterior draws taken from the fitted guide, by default 500. They come back as one chain.
     progress_bar : bool
         Show the optimiser's progress bar, by default ``False``.
+    schedule : Callable | None
+        The learning rate of each step, an ``optax`` schedule such as ``optax.linear_onecycle_schedule(steps, 0.03)``.
+        By default ``None``, ``optax.cosine_onecycle_schedule(steps, peak_lr)``; ``peak_lr`` is not used otherwise.
 
     Examples
     --------
@@ -175,6 +178,7 @@ class SVI:
         num_draws: int = 500,
         *,
         progress_bar: bool = False,
+        schedule: Callable[[Any], Any] | None = None,
     ) -> None:
         if guide not in GUIDES:
             raise ValueError(f"guide must be one of {sorted(GUIDES)}, got {guide!r}")
@@ -188,6 +192,8 @@ class SVI:
             raise ValueError(f"peak_lr must be positive, got {peak_lr}")
         if not clip_norm > 0:
             raise ValueError(f"clip_norm must be positive, got {clip_norm}")
+        if schedule is not None and not callable(schedule):
+            raise ValueError(f"schedule must be an optax schedule (a callable of the step) or None, got {schedule!r}")
         self.guide = guide
         self.subsample = subsample
         self.steps = steps
@@ -195,6 +201,7 @@ class SVI:
         self.clip_norm = float(clip_norm)
         self.num_draws = num_draws
         self.progress_bar = progress_bar
+        self.schedule = schedule
 
     def run(self, model: Forecaster, inputs: Mapping[str, Any], key: jax.Array) -> Posterior:
         """Fit the guide to ``model.model``, then draw the posterior from it.
@@ -239,7 +246,9 @@ class SVI:
                 f"{type(self).__name__} requires the optional 'optim' extra (missing: {exc.name}). "
                 "Install it with: pip install 'bunobee[optim]'"
             ) from exc
-        schedule = optax.cosine_onecycle_schedule(transition_steps=self.steps, peak_value=self.peak_lr)
+        schedule = self.schedule
+        if schedule is None:
+            schedule = optax.cosine_onecycle_schedule(transition_steps=self.steps, peak_value=self.peak_lr)
         return optax_to_numpyro(optax.chain(optax.clip_by_global_norm(self.clip_norm), optax.adam(schedule)))
 
     def __repr__(self) -> str:
@@ -257,7 +266,7 @@ class MAP(SVI):
 
     Parameters
     ----------
-    steps, peak_lr, clip_norm, subsample, progress_bar
+    steps, peak_lr, clip_norm, subsample, progress_bar, schedule
         As for :class:`SVI`.
 
     Examples
@@ -276,6 +285,7 @@ class MAP(SVI):
         subsample: int | None = None,
         *,
         progress_bar: bool = False,
+        schedule: Callable[[Any], Any] | None = None,
     ) -> None:
         super().__init__(
             guide="delta",
@@ -285,6 +295,7 @@ class MAP(SVI):
             clip_norm=clip_norm,
             num_draws=1,
             progress_bar=progress_bar,
+            schedule=schedule,
         )
 
     def __repr__(self) -> str:
