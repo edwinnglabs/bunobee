@@ -170,6 +170,129 @@ print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, 
 
 A worked example on a real multi-series panel — fan chart, state path, and per-series small multiples — is in [`playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb`](playground/statespace_prototype/ssp_06_multi_series_forecast.ipynb).
 
+### Model classes
+
+`SSP` and `DLT` wrap the same models behind one shape: configure, `fit`, `predict`. `SSP` writes the NumPyro model
+above for you from a natural-scale prior. It puts `Beta(2, 10) * sdy` on each series' `sigma_h` and reads `sigma_q`'s
+prior from the prior's `sigma_q` block. The filter name fixes the positivity mechanism and the matching
+`forecast_ssp` link. `DLT` gives the same posterior as `run_dlt_model` and forecasts with the hyperparameters it was
+fitted with. Both `predict`s return `forecast_samples` and `mu_samples` (plus `eps_samples` with `noise_embed`) as
+`(sample, time, series)` over the horizon; a `DLT` forecast is one series, and `in_sample=True` adds the training
+steps. The posterior is on `idata_` and the sampler on `mcmc_`:
+
+```python
+import numpy as np
+import xarray as xr
+
+from bunobee.models.dlt import DLT
+from bunobee.models.ssp import SSP, build_forecast_design
+
+# Natural-scale prior: a free level and a spend effect kept positive, with Beta(2, 10) * scale on each drift
+prior = xr.Dataset(
+    {
+        "a0": (("state",), np.array([1.0, 0.3])),
+        "P0": (("state",), np.array([0.5, 0.1])),
+        "positivity": (("state",), np.array([False, True])),
+        "sigma_q_alpha_prior": (("state",), np.array([2.0, 2.0])),
+        "sigma_q_beta_prior": (("state",), np.array([10.0, 10.0])),
+        "sigma_q_scale_prior": (("state",), np.array([0.05, 0.02])),
+    },
+    coords={"state": ["level", "spend"]},
+).assign_attrs(sigma_q_family="beta")
+
+# y, Z, horizon and rng as in the SSP example above
+model = SSP(prior, filter="ekf", exponent=1.0).fit(y, Z, mcmc_args={"num_warmup": 200, "num_samples": 200})
+Z_future = build_forecast_design(Z, horizon, covariates_future=rng.uniform(0.5, 1.5, size=(horizon, n_series, 1)))
+forecast = model.predict(Z_future, noise_embed=True)
+print(forecast["forecast_samples"].shape)  # (200, 10, 3) = (n_sample, horizon, n_series)
+
+dlt = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8).fit(y_dlt, mcmc_args={"num_warmup": 200, "num_samples": 200})
+print(dlt.predict(end_step=len(y_dlt) + 10)["forecast_samples"].shape)  # (200, 10, 1) = (n_sample, horizon, 1)
+print(dlt.predict(end_step=len(y_dlt) + 10, in_sample=True)["forecast_samples"].shape)  # (200, 30, 1) for 20 steps
+```
+
+`filter="linear"` uses `kalman_filter_1d_st` instead, which keeps the positivity states on the natural scale and
+floors them. NaN entries of `y` become predict-only steps.
+
+To fit with a filter of your own, pass a `FilterSpec` instead of a name. The global `FILTERS` dict is left alone.
+`fn` is called with the keywords `SspFilter` lists (plus `exponent` when `nonlinear=True`) and returns
+`(lp, at, ...)`. Without a `forecast`, `predict` runs `forecast_ssp` with the spec's `link`. That is only right for
+a random-walk state with Gaussian observation noise. A filter with other dynamics or another observation model
+needs its own `forecast` (see `SspForecast`), so the forecast follows the model that was fitted. `name` is what goes
+in `idata_.attrs["filter"]`:
+
+```python
+import functools
+
+from bunobee.models.ssp import FilterSpec
+from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
+
+phi = 0.9  # a damped state, a_t = phi * a_{t-1} + eta_t, rather than a random walk
+damped = functools.partial(kalman_filter_1d_st, T=phi * np.eye(2))
+
+
+def damped_forecast(idata, Z_future, *, method, noise_embed, transform_callback, seed):
+    ...  # return forecast_samples / mu_samples over (sample, time, series), as forecast_ssp does
+
+
+spec = FilterSpec(fn=damped, link="identity", nonlinear=False, forecast=damped_forecast, name="damped")
+forecast = SSP(prior, filter=spec).fit(y, Z).predict(Z_future)  # calls damped_forecast, not forecast_ssp
+```
+
+`SSP` checks the spec when it is built. It raises `ValueError` if `fn` is not callable, or if `link` is not one of
+`forecast_ssp`'s links and no `forecast` is given.
+
+Both models fit by NUTS unless told otherwise. `inference=` swaps in variational inference or a point estimate from
+`bunobee.models.inference` (they need the `optim` extra). The posterior keeps its `(chain, draw)` dims either way, so
+`predict` works unchanged:
+
+```python
+from bunobee.models.inference import MAP, SVI
+
+svi = SSP(prior, inference=SVI(steps=3000, num_draws=200)).fit(y, Z)  # AutoNormal guide, 200 draws as one chain
+map_fit = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8, inference=MAP()).fit(y_dlt)  # one draw at the mode
+print(svi.idata_.attrs["inference"], svi.losses_[-1])
+```
+
+### Pooled count model for many series
+
+`HierarchicalCount` fits one negative binomial model to thousands of count series at once, by SVI on batches of
+series. It is the general form of Juan Orduz's hierarchical M5 state space model. Each series' log mean is its
+recent mean plus terms that are pooled over the levels of a `Hierarchy`: an intercept and a walk over 28-day blocks,
+a weekday pattern, shocks shared by a store, a covariate such as SNAP, and others. A `gate` of `0` marks the days a
+series cannot sell. `predict` returns `(sample, time, series)` count draws that sum up the hierarchy with
+`aggregate_draws`. It needs the `optim` extra.
+
+```python
+import numpy as np
+import pandas as pd
+
+from bunobee import Hierarchy, aggregate_draws, draw_quantiles
+from bunobee.models.count import BlockWalk, GroupShocks, HierarchicalCount, Level, Regressor, Seasonal
+from bunobee.models.inference import SVI
+
+rng = np.random.default_rng(0)
+n_obs, horizon, n_series = 364, 28, 60
+meta = pd.DataFrame({"store_id": np.arange(n_series) % 3, "dept_id": np.arange(n_series) % 4})
+hierarchy = Hierarchy.from_frame(meta, {"store": ["store_id"], "group": ["store_id", "dept_id"]})
+y = rng.poisson(4.0, size=(n_obs, n_series))  # counts, (n_obs, n_series)
+snap = (np.arange(n_obs + horizon) % 30 < 10).astype(float)  # 1 on the first 10 days of each month
+
+model = HierarchicalCount(
+    level=Level(walk=BlockWalk(block=28, n_blocks=6), shift_by="group"),
+    components=[Seasonal(7, pool_by="group"), GroupShocks("store"), Regressor("snap", pool_by="group")],
+    hierarchy=hierarchy,
+    inference=SVI(subsample=20, steps=1000),  # 20 series per step
+)
+model.fit(y, {"snap": snap[:n_obs]})
+forecast = model.predict({"snap": snap[n_obs:]}, num_draws=200)  # forecast_samples (200, 28, 60)
+store_quantiles = draw_quantiles(aggregate_draws(forecast, hierarchy, "store"), [0.05, 0.5, 0.95])
+```
+
+The other terms are `DayOfMonth`, `Events` and `Fourier`. `pool_by=None`, the default, gives each series its own
+effect. Orduz's M5 model, rebuilt on this class, scores a mean WSPL of 0.16228 (sd 0.0014) on the M5 evaluation
+window over seeds 42 to 46. The previous benchmark scores 0.16272 (sd 0.0006).
+
 ### Fast MAP fits for many series
 
 For hundreds or thousands of non-negative series (sales, counts, demand), `fit_map_batch` fits the linear state-space

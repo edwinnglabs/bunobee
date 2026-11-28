@@ -13,6 +13,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SSP(filter=FilterSpec(...))` fits with a filter of your own without editing the global `FILTERS` (#175). The
+  filter's call is written down as the `SspFilter` protocol. The optional `FilterSpec.forecast`, an `SspForecast`,
+  replaces `forecast_ssp` in `SSP.predict`, so a filter with other state dynamics or another observation model is
+  forecast by the model it was fitted with. The optional `FilterSpec.name` goes in `idata.attrs["filter"]`, so a
+  `functools.partial` filter works. `SSP` checks the spec when it is built: `fn` must be callable, and `link` must
+  be a `forecast_ssp` link unless `forecast` is given. `FilterSpec`, `SspFilter` and `SspForecast` are exported from
+  `bunobee.models.ssp`. The `"ekf"` and `"linear"` filters are unchanged.
+- `bunobee.models.count.HierarchicalCount`, a pooled count model of many series (#182), the general form of Juan
+  Orduz's hierarchical M5 state space model built from `bunobee.models.blocks`, `bunobee.models.obs`,
+  `bunobee.models.inference` and `bunobee.hierarchy`. `HierarchicalCount(level, components, obs, hierarchy,
+  inference)` adds terms on the log scale: `Level(anchor=RecentMean(days), walk=BlockWalk(block, n_blocks),
+  scale_by, shift_by)`, the recent mean at the origin plus an intercept, a shift per group and a walk over blocks that
+  is zero on the last training block; `Seasonal(period, pool_by=None, deviation=None, index=None)`, a zero-sum
+  pattern per series by default, or pooled per group with series deviations; `DayOfMonth(pool_by)`;
+  `Events(pool_by, keys, n_events=None)`; `Fourier(period, order, pool_by)`; `GroupShocks(by, period)`; and
+  `Regressor(name, pool_by)` for a covariate such as SNAP. `pool_by` names a level of the hierarchy whose groups share
+  an effect, `None` for one per series. Each component's sites are `"<name>/<site>"`, and any object with `name`,
+  `keys` and `contribute(ctx)` is a component. `fit(y, covariates, gate=...)` takes `(n_obs, n_series)` counts
+  (NaN is a gated day). `predict(covariates_future, gate_future=..., num_draws=...)` takes the posterior draws in
+  chunks. Each chunk gets a forecast-only pass for the mean and the observation parameters over the horizon, then the
+  family's NumPy sampler draws the counts. It returns `forecast_samples` as `(sample, time, series)`, which
+  `aggregate_draws` and `draw_quantiles` take as they are. The default is `NegBin2()` fitted by
+  `SVI(subsample=1500, steps=3000)` on Orduz's `LinearOneCycle` schedule from `init_to_median`; a panel of at most
+  1,500 series is fitted whole. Rebuilt on the class with Orduz's terms, the M5 evaluation window scores a mean
+  WSPL of 0.16228 over seeds 42 to 46 (the previous benchmark's 0.16272); at seed 42 it is 0.16049 (the previous
+  benchmark's 0.16302).
+- `SVI(schedule=...)` and `MAP(schedule=...)` take an `optax` learning rate schedule in place of the one-cycle cosine
+  (#182). `NegBin2(dispersion_pool_by, deviation_by=..., deviation_scale=1)` gives every series its own
+  log-concentration around its group's, with a `HalfNormal(deviation_scale)` spread shared by the groups of
+  `deviation_by`: the dispersion of Orduz's M5 model.
+- `bunobee.models.obs`, pluggable observation families (#181). The `ObsFamily` protocol has `sample_params(name,
+  series=None)`, which registers the family's priors as `"<name>/<param>"` sites (bare names with `name=None`) and
+  returns the parameters; `dist(mean, params, gate=None)`, the NumPyro likelihood; `sample(rng, mean, params,
+  gate=None)`, a NumPy forecast sampler; `support` (`"real"`, `"positive"` or `"count"`); and `param_names`. The
+  families are `Normal(sigma_scale=5)`, `StudentT(min_nu=5, max_nu=40, sigma_scale=5)`, `Poisson()` and
+  `NegBin2(dispersion_pool_by=None, log_concentration_loc=0, log_concentration_scale=1)`, whose log-concentration is
+  one per series, or one per group of a `hierarchy.Level` when `dispersion_pool_by` is set. `Normal` and `StudentT`
+  also draw additive JAX noise with `noise(key, params, shape)` (the `RealObsFamily` protocol). A `gate` (`0` where
+  the mean is structurally zero, e.g. no listed price or a closed store) multiplies the mean and adds `GATE_FLOOR`,
+  so a gated step contributes the likelihood of a zero under the floored mean (`gate_mean`); this differs from the
+  NaN mask of `y`, which skips a missing step.
+- `DLT(..., obs=Normal())` takes an observation family; `noise_dist="student_t"` is now shorthand for
+  `StudentT(min_nu, max_nu)`, with posteriors and forecasts bitwise identical to before. `DLT` accepts only families
+  with real support and raises `ValueError` at construction for `NegBin2()` or `Poisson()`. `dlt_model`,
+  `make_inference`, `generate_dlt_components` and `generate_noise_components` take an optional `obs` as well, and
+  `obs_from_noise_dist` maps a `noise_dist` name to its family.
+- `bunobee.models.blocks`, NumPyro building blocks for pooled models of many count series (#180), bunobee's own
+  versions of ideas from Juan Orduz's hierarchical M5 state space notebook. `Horizon(n_obs, future)` is the
+  train / forecast split; `block_walk(name, scale, horizon, block_len, n_blocks)` is a random walk over blocks of days
+  that is zero on the last training block and takes one more step for the forecast block; `pooled_effect(name, index,
+  n_levels, group=None, scale=0.3, deviation_scale=None)` is a zero-sum categorical effect (weekday, day of month)
+  shared by a group, with an optional zero-sum deviation per series, or one per series with `group=None`;
+  `group_shocks(name, scale, horizon, groups, period=7)` are daily shocks shared by a group, zero-sum within each
+  period ending at the origin and drawn fresh over the forecast; and `origin_level(y, gate, days=28,
+  fallback_days=None, floor=0.05)` is the log mean over a series' recent listed days, falling back to a longer window
+  and then to `log(floor)`. Groups are an index array or a `hierarchy.Level`; each block names its sites
+  `"<name>/<site>"` under `numpyro.handlers.scope`, so two uses never clash, and takes the model's series plate as
+  `series=` so an `SVI(subsample=k)` guide subsamples its per-series sites.
+- Inference is now a swappable part of the model classes (#179). `bunobee.models.inference` has `NUTS(num_warmup,
+  num_samples, num_chains, ...)`, which is what `fit` ran before; `SVI(guide="normal", subsample=None, steps,
+  peak_lr, clip_norm, num_draws)`, an `AutoNormal` guide trained by Adam on a one-cycle schedule with gradients clipped
+  to a global norm and then sampled; and `MAP(steps, ...)`, SVI with an `AutoDelta` guide and one draw. Pass one as
+  `SSP(..., inference=SVI())` or `DLT(..., inference=MAP())`; the default `NUTS()` gives the same posterior as before
+  bit for bit, and `fit(mcmc_args=...)` still works on top of it. The posterior keeps its `(chain, draw)` dims under
+  every method (SVI and MAP draws are one chain), `idata_.attrs["inference"]` names the method, and an SVI fit keeps
+  `guide_`, `params_` and `losses_`. Each model declares the methods it accepts (`Forecaster.inference_methods`), so
+  an unsupported one raises `ValueError` at construction. `SVI(subsample=k)` fits `k` series per step from the
+  model's `Forecaster.series_plate`; `SSP` and `DLT` have none (the SSP filter runs over all its series jointly), so
+  they take SVI and MAP without `subsample`. SVI and MAP need the `optim` extra.
+- `bunobee.hierarchy` for forecast distributions at every level of a hierarchy (#178). `Hierarchy.from_frame(meta,
+  levels={"store": ["store_id"], "group": ["store_id", "dept_id"]})` builds named `Level`s (a series → group index and
+  the group labels) from a per-series table; a level with no keys is the total. `aggregate_draws(draws, hierarchy,
+  level=None)` sums `(sample, time, series)` draws over each level's groups to `(sample, time, group)`, keeping the
+  correlation the draws carry between series; it takes an array or the dataset `SSP.predict` returns as it is.
+  `draw_quantiles(draws, quantiles)` takes quantiles over `sample`. All four are exported from `bunobee`.
+- Model classes with a shared `fit` / `predict` shape. `bunobee.models.base.Forecaster` is the base: it runs NUTS on
+  the subclass's NumPyro model, keeps the posterior on `idata_` and the sampler on `mcmc_`, and raises
+  `NotFittedError` before a fit. The filters and the DLT recursion stay plain JAX functions; the classes only call
+  them, and every existing function stays public and unchanged.
+  - `bunobee.models.ssp.SSP(prior, filter="ekf" | "linear", exponent=..., sigma_h_prior=...)` packages the
+    multi-series NUTS model the `ssp_04` to `ssp_06` notebooks wrote by hand: `sigma_h = sigma_h_raw * sdy` per
+    series, `sigma_q` from the prior's Beta or truncated-normal block (per state, or compressed to
+    `[first state, shared]`), and the filter's log likelihood, with the `a_obs` / `P_obs` anchors fused in. Under
+    `"ekf"` the natural-scale prior goes through `transform_to_ekf_st` for you. The filter name also fixes the
+    `forecast_ssp` link, so a posterior can't be forecast under the wrong positivity mechanism. `fit(y, Z)` takes a
+    `(n_steps, n_series)` panel or one 1-D series, treats NaN in `y` as missing (predict-only steps), and stores
+    `at`, `at_nat` (EKF), `mu`, `sigma_h`, `sigma_q` with the labels from the prior; `predict(Z_future)` calls
+    `forecast_ssp`.
+  - `bunobee.models.dlt.DLT(lev_sm, slp_sm, theta, ...)`: `fit` gives the same `idata` as `run_dlt_model`, and
+    `predict` calls `make_inference` with the fitted `lev_sm` / `slp_sm` / `theta`, so the forecast can't use different
+    smoothing values from the fit. `run_dlt_model` now shares its input-building and posterior-packaging steps with
+    `DLT`. `predict` returns the `SSP.predict` layout; see Changed.
 - `plot_states` draws the disclosure uncertainty: each prior anchor gets a whisker spanning `N(a_obs, P_obs)` at the
   same `ci` levels as the posterior ribbons (±1.645 sd for the default 90%), so prior and posterior widths compare
   directly; dense disclosure windows merge into a band. `anchor_ci=False` keeps the old markers-only look. The legend
@@ -63,6 +155,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (since 0.0.7.dev2):** `DLT.predict` returns the layout of `SSP.predict` (#183): `forecast_samples` and
+  `mu_samples` (plus `eps_samples` with `noise_embed`) with dims `(sample, time, series)` over the horizon only, with
+  a `series` dim of size 1 and `time` counted from 0 at the first step after the train end. So `aggregate_draws` and
+  model comparisons take a DLT forecast as they take an SSP one. The values are the horizon of `make_inference`
+  with the same seed; `mu_samples` is the untransformed trend plus regression. `predict(..., in_sample=True)` keeps
+  the training steps in front, and a total that does not go past the train end raises `ValueError` without it.
+  `make_inference` keeps its signature and `(sample, time)` layout, and still gives the trend and regression
+  components.
 - **Breaking:** the MAP fitters and the target transforms left the M5 package and lost their M5 names. Update imports
   and calls as follows:
 

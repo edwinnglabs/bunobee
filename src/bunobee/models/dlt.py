@@ -15,10 +15,36 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..utils import flatten_front_dim
 from ..regression import RegressionScheme
+from .base import Forecaster
+from .inference import MAP, SVI, Inference
+from .inference import NUTS as NUTSInference
+from .obs import Normal, ObsFamily, RealObsFamily, StudentT
 
 logger = logging.getLogger("bunobee")
 
 NOISE_DISTS = ("normal", "student_t")
+
+
+def obs_from_noise_dist(noise_dist: str = "normal", min_nu: float = 5.0, max_nu: float = 40.0) -> RealObsFamily:
+    """The observation family a ``noise_dist`` name stands for: ``Normal()`` or ``StudentT(min_nu, max_nu)``.
+
+    Raises
+    ------
+    ValueError
+        If ``noise_dist`` is not one of ``"normal"`` / ``"student_t"``, or if it is ``"student_t"`` and not
+        ``0 < min_nu < max_nu``.
+    """
+    if noise_dist not in NOISE_DISTS:
+        raise ValueError(f"noise_dist must be one of {NOISE_DISTS}, got {noise_dist!r}")
+    return StudentT(min_nu=min_nu, max_nu=max_nu) if noise_dist == "student_t" else Normal()
+
+
+def _obs_in_idata(idata: xr.Dataset) -> RealObsFamily:
+    """The family of a ``run_dlt_model`` posterior fitted by ``noise_dist``: ``StudentT`` when it holds ``nu``.
+
+    Only the parameters stored in ``idata`` are used to draw noise, so the priors of the family returned do not matter.
+    """
+    return StudentT() if "nu" in idata else Normal()
 
 
 def dlt_transition_step(carry, inputs, lev_sm: float, slp_sm: float, theta: float):
@@ -86,13 +112,15 @@ def dlt_model(
     noise_dist: str = "normal",
     min_nu: float = 5.0,
     max_nu: float = 40.0,
+    obs: Optional[ObsFamily] = None,
 ):
     """NumPyro probabilistic model for Damped Local Trend (DLT) time series.
 
-    Samples ``sigma`` from a ``HalfNormal`` prior, optionally adds a regression
-    component (neutral / negative-constrained / positive-constrained coefficients),
-    runs the DLT recursion via ``lax.scan``, and registers a Normal likelihood, or a
-    Student-t likelihood with ``noise_dist="student_t"``.
+    Samples the family's parameters (``sigma`` from a ``HalfNormal`` prior, and ``nu`` for
+    Student-t), optionally adds a regression component (neutral / negative-constrained /
+    positive-constrained coefficients),
+    runs the DLT recursion via ``lax.scan``, and registers the likelihood of the observation
+    family ``obs``: Normal by default, Student-t with ``noise_dist="student_t"``.
 
     Deterministic sites registered: ``yhat``, ``dlt_comp``, ``reg_comp``,
     ``last_lev``, ``last_slp``, and ``coef`` (when regression is used).
@@ -115,11 +143,13 @@ def dlt_model(
         ``Uniform(min_nu, max_nu)`` and the likelihood is ``StudentT(nu, yhat, sigma)``.
     min_nu: Lower bound of the ``nu`` prior; used only with ``"student_t"``.
     max_nu: Upper bound of the ``nu`` prior; used only with ``"student_t"``.
+    obs: Observation family (see :mod:`bunobee.models.obs`), sampled with bare site names
+        (``sigma``, ``nu``). Overrides ``noise_dist`` / ``min_nu`` / ``max_nu`` when given.
     """
     y = jnp.asarray(y, dtype=y.dtype)
-    sigma = numpyro.sample("sigma", dist.HalfNormal(5.0))
-    if noise_dist == "student_t":
-        nu = numpyro.sample("nu", dist.Uniform(min_nu, max_nu))
+    if obs is None:
+        obs = obs_from_noise_dist(noise_dist, min_nu, max_nu)
+    obs_params = obs.sample_params(None)
 
     if reg_input is not None:
         coefs = []
@@ -193,11 +223,7 @@ def dlt_model(
     numpyro.deterministic("last_slp", last_slp)
 
     # likelihood
-    if noise_dist == "student_t":
-        noise = dist.StudentT(df=nu, loc=yhat, scale=sigma)
-    else:
-        noise = dist.Normal(loc=yhat, scale=sigma)
-    numpyro.sample("observations", noise, obs=y, obs_mask=jnp.isfinite(y))
+    numpyro.sample("observations", obs.dist(yhat, obs_params), obs=y, obs_mask=jnp.isfinite(y))
 
 
 def run_dlt_model(
@@ -268,16 +294,44 @@ def run_dlt_model(
         If ``pos_coef_sum_scale`` is not positive, or is given without any ``"+"`` regressor; if ``noise_dist`` is
         not one of ``"normal"`` / ``"student_t"``; or if ``noise_dist="student_t"`` and not ``0 < min_nu < max_nu``.
     """
-    if noise_dist not in NOISE_DISTS:
-        raise ValueError(f"noise_dist must be one of {NOISE_DISTS}, got {noise_dist!r}")
-    if noise_dist == "student_t" and not 0 < min_nu < max_nu:
-        raise ValueError(f"need 0 < min_nu < max_nu, got min_nu={min_nu}, max_nu={max_nu}")
+    obs = obs_from_noise_dist(noise_dist, min_nu, max_nu)
 
+    reg_input, var_name = _dlt_reg_input(regression_scheme, covariates_df)
+    _check_pos_coef_sum_scale(pos_coef_sum_scale, reg_input)
+
+    init_strategy = init_to_median(num_samples=10)
+    kernel = NUTS(dlt_model, init_strategy=init_strategy)
+    mcmc = MCMC(kernel, **mcmc_run_args)
+
+    mcmc.run(
+        rng_key,
+        lev_sm=lev_sm,
+        slp_sm=slp_sm,
+        theta=theta,
+        y=y,
+        reg_input=reg_input,
+        pos_coef_sum_scale=pos_coef_sum_scale,
+        obs=obs,
+    )
+
+    posterior_dict = mcmc.get_samples(group_by_chain=True)
+    return _dlt_idata(posterior_dict, y, obs, regression_scheme, covariates_df, var_name)
+
+
+def _dlt_reg_input(
+    regression_scheme: Optional[RegressionScheme], covariates_df: Optional[pd.DataFrame]
+) -> tuple[Dict[str, Any], List[str]]:
+    """Split the regressors by sign into the ``reg_input`` of :func:`dlt_model`.
+
+    Returns ``(reg_input, var_name)``: ``reg_input`` maps each sign present (``"="``, ``"+"``, ``"-"``) to its
+    ``coef_loc``, ``coef_scale`` and ``covariates``, and ``var_name`` lists the regressors in that order. Both are
+    empty unless ``regression_scheme`` and ``covariates_df`` are both given.
+    """
+    reg_input: Dict[str, Any] = {}
+    var_name: List[str] = []
     if regression_scheme is not None and covariates_df is not None:
         # extract regressors matrix, coef loc and scale
         # separate three groups of regressors with the sign: "=", "+", "-"
-        reg_input = {}
-        var_name = []
         for sign in ["=", "+", "-"]:
             regressors = regression_scheme.scheme.loc[regression_scheme.scheme["sign"] == sign, :].index.to_list()
             if len(regressors) > 0:
@@ -298,35 +352,30 @@ def run_dlt_model(
                 logger.debug(f"covariates shape: {covariates.shape}")
                 logger.debug(f"coef_loc: {coef_loc}")
                 logger.debug(f"coef_scale: {coef_scale}")
-    else:
-        covariates = None
-        reg_input = {}
+    return reg_input, var_name
 
+
+def _check_pos_coef_sum_scale(pos_coef_sum_scale: Optional[float], reg_input: Dict[str, Any]) -> None:
+    """Raise unless ``pos_coef_sum_scale`` is ``None``, or positive with at least one ``"+"`` regressor."""
     if pos_coef_sum_scale is not None:
         if not pos_coef_sum_scale > 0:
             raise ValueError(f"pos_coef_sum_scale must be positive, got {pos_coef_sum_scale}")
         if "+" not in reg_input:
             raise ValueError("pos_coef_sum_scale needs at least one '+' regressor in regression_scheme")
 
-    init_strategy = init_to_median(num_samples=10)
-    kernel = NUTS(dlt_model, init_strategy=init_strategy)
-    mcmc = MCMC(kernel, **mcmc_run_args)
 
-    mcmc.run(
-        rng_key,
-        lev_sm=lev_sm,
-        slp_sm=slp_sm,
-        theta=theta,
-        y=y,
-        reg_input=reg_input,
-        pos_coef_sum_scale=pos_coef_sum_scale,
-        noise_dist=noise_dist,
-        min_nu=min_nu,
-        max_nu=max_nu,
-    )
+def _dlt_idata(
+    posterior_dict: Dict[str, Any],
+    y: np.ndarray,
+    obs: ObsFamily,
+    regression_scheme: Optional[RegressionScheme],
+    covariates_df: Optional[pd.DataFrame],
+    var_name: List[str],
+) -> xr.Dataset:
+    """Package the chain-grouped samples of :func:`dlt_model` as the ``idata`` :func:`run_dlt_model` returns.
 
-    posterior_dict = mcmc.get_samples(group_by_chain=True)
-
+    Each parameter of ``obs`` (``sigma``, and ``nu`` for Student-t) is kept with dims ``(chain, draw)``.
+    """
     # transform them into xr.Dataset
     n_chains, n_draws, n_steps = posterior_dict["dlt_comp"].shape
 
@@ -339,12 +388,10 @@ def run_dlt_model(
         "yhat": (["chain", "draw", "time"], posterior_dict["yhat"]),
         "resid": (["chain", "draw", "time"], y - posterior_dict["yhat"]),
         "reg_comp": (["chain", "draw", "time"], posterior_dict["reg_comp"]),
-        "sigma": (["chain", "draw"], posterior_dict["sigma"]),
+        **{param: (["chain", "draw"], posterior_dict[param]) for param in obs.param_names},
         "last_lev": (["chain", "draw"], posterior_dict["last_lev"]),
         "last_slp": (["chain", "draw"], posterior_dict["last_slp"]),
     }
-    if noise_dist == "student_t":
-        data_vars["nu"] = (["chain", "draw"], posterior_dict["nu"])
     coords = {
         "draw": np.arange(n_draws),
         "chain": np.arange(n_chains),
@@ -487,6 +534,7 @@ def generate_dlt_components(
     slp_sm: float,
     theta: float,
     oos_y: Optional[jnp.ndarray] = None,
+    obs: Optional[RealObsFamily] = None,
 ) -> jnp.ndarray:
     """Generate DLT component samples for in-sample and (optionally) out-of-sample steps.
 
@@ -514,6 +562,8 @@ def generate_dlt_components(
         actual observations replace the NaN pseudo-observations so the state
         updates are conditioned on them (useful for out-of-sample evaluation).  Defaults to
         all-NaN, meaning fully generative OOS simulation.
+    obs: Observation family of the fit, which draws the state noise; see
+        :func:`generate_noise_components`.
 
     Returns
     -------
@@ -552,7 +602,7 @@ def generate_dlt_components(
 
         oos_steps = end_step - n_train_steps
         # (n_oos_steps, n_samples)
-        eps_samples = generate_noise_components(rng_key, idata, oos_steps).transpose()
+        eps_samples = generate_noise_components(rng_key, idata, oos_steps, obs=obs).transpose()
 
         # scan with the partial function
         _, all_states = lax.scan(
@@ -580,8 +630,9 @@ def generate_noise_components(
     rng_key: jnp.ndarray,
     idata: xr.Dataset,
     steps: int,
+    obs: Optional[RealObsFamily] = None,
 ) -> jnp.ndarray:
-    """Draw observation-noise samples scaled by posterior ``sigma``.
+    """Draw observation-noise samples from the posterior parameters of the observation family.
 
     Args
     ----
@@ -590,25 +641,21 @@ def generate_noise_components(
         ``sigma`` with dimensions ``(chain, draw)``, and ``nu`` when fitted
         with ``noise_dist="student_t"``.
     steps: Number of time steps to generate noise for.
+    obs: Observation family of the fit, whose ``noise`` draws the samples from the
+        parameters stored in ``idata``. By default ``StudentT`` when ``idata`` holds
+        ``nu`` and ``Normal`` otherwise, the families ``noise_dist`` fits.
 
     Returns
     -------
     jnp.ndarray of shape ``(n_samples, steps)`` where each row is an
     independent draw from ``Normal(0, sigma_i)`` for posterior sample ``i``,
-    or from ``StudentT(nu_i, 0, sigma_i)`` when ``idata`` holds ``nu``.
+    or from ``StudentT(nu_i, 0, sigma_i)`` for Student-t.
     """
-    # (n_samples, )
-    sigma = flatten_front_dim(idata["sigma"].to_numpy(), n=2)
-    shape = (sigma.shape[0], steps)
-    if "nu" in idata:
-        # (n_samples, 1) degrees of freedom, broadcast over steps
-        nu = flatten_front_dim(idata["nu"].to_numpy(), n=2)[:, None]
-        std_samples = jax.random.t(rng_key, df=nu, shape=shape)
-    else:
-        std_samples = jax.random.normal(rng_key, shape=shape)
-    # samples with broadcasting sigma from (n_samples, ) to (n_samples, steps)
-    eps_samples = std_samples * sigma[:, None]
-    return eps_samples
+    if obs is None:
+        obs = _obs_in_idata(idata)
+    # (n_samples, 1) per parameter, broadcast over steps
+    params = {param: flatten_front_dim(idata[param].to_numpy(), n=2)[:, None] for param in obs.param_names}
+    return obs.noise(rng_key, params, (idata.sizes["chain"] * idata.sizes["draw"], steps))
 
 
 def make_inference(
@@ -622,6 +669,7 @@ def make_inference(
     transform_callback: Optional[Callable] = None,
     noise_embed: bool = False,
     conditional_response: Optional[np.ndarray] = None,
+    obs: Optional[RealObsFamily] = None,
 ) -> xr.Dataset:
     """Generate full forecast samples by combining DLT and regression components.
 
@@ -663,6 +711,8 @@ def make_inference(
         one-step-ahead forecast made before seeing that actual; later steps start from
         the updated states.  Regression effects are removed from the actuals per
         posterior sample before the update, consistent with ``dlt_model``.
+    obs: Observation family of the fit, which draws the noise; by default the family
+        ``noise_dist`` fitted (see :func:`generate_noise_components`).
 
     Returns
     -------
@@ -719,11 +769,11 @@ def make_inference(
         )
 
     rng_key = jax.random.split(rng_key, num=1)[0]
-    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta, oos_y=oos_y)
+    dlt_comp_samples = generate_dlt_components(rng_key, idata, end_step, lev_sm, slp_sm, theta, oos_y=oos_y, obs=obs)
     logger.debug(f"dlt_comp_samples shape: {dlt_comp_samples.shape}")
 
     rng_key = jax.random.split(rng_key, num=1)[0]
-    eps_samples = generate_noise_components(rng_key, idata, end_step)
+    eps_samples = generate_noise_components(rng_key, idata, end_step, obs=obs)
 
     forecast_samples = dlt_comp_samples + reg_comp_samples_total
     if noise_embed:
@@ -837,3 +887,261 @@ def get_forecast_decomposition(
         columns[f"{name}_p{lower * 100:02g}"] = quantiles[1]
         columns[f"{name}_p{upper * 100:02g}"] = quantiles[2]
     return pd.DataFrame(columns, index=pd.Index(inference["time"].to_numpy(), name="time"))
+
+
+class DLT(Forecaster):
+    """Damped Local Trend model behind ``fit`` / ``predict``.
+
+    A thin shell over the functions above: by default :meth:`fit` runs the same NUTS fit as :func:`run_dlt_model` and
+    stores the same ``idata`` on ``idata_``, and :meth:`predict` calls :func:`make_inference` with the hyperparameters
+    the model was fitted with, so a forecast can no longer be made with different ``lev_sm`` / ``slp_sm`` / ``theta``
+    than the fit. :meth:`predict` returns the ``(sample, time, series)`` layout of ``SSP.predict`` over the horizon,
+    so ``aggregate_draws`` and model comparisons take both models the same way. The functions stay public, and their
+    ``noise_dist`` calls work as before.
+
+    Parameters
+    ----------
+    lev_sm : float
+        Level smoothing factor.
+    slp_sm : float
+        Slope smoothing factor.
+    theta : float
+        Damping factor.
+    regression_scheme : RegressionScheme | None
+        Regressor signs and coefficient priors. When given, :meth:`fit` and :meth:`predict` need ``covariates_df``.
+    pos_coef_sum_scale : float | None
+        Scale (``> 0``) of a ``HalfNormal`` constraint on the sum of the positive (``"+"``) coefficients; see
+        :func:`run_dlt_model`.
+    obs : ObsFamily | None
+        Observation family of the likelihood and the forecast noise, by default ``Normal()``; see
+        :mod:`bunobee.models.obs`. ``DLT`` models real-valued ``y``, so the family must have real support and draw
+        additive noise (:class:`~bunobee.models.obs.RealObsFamily`), e.g. ``Normal()`` or ``StudentT()``.
+    noise_dist : str
+        Shorthand for ``obs``: ``"normal"`` (default) is ``Normal()`` and ``"student_t"`` is
+        ``StudentT(min_nu, max_nu)``. Leave it at ``"normal"`` when giving ``obs``.
+    min_nu, max_nu : float
+        Bounds of the uniform prior on the Student-t degrees of freedom, by default 5 and 40. Used only with
+        ``noise_dist="student_t"``.
+    inference : NUTS | SVI | MAP | None
+        How :meth:`fit` fits the model, by default ``NUTS()``; see :mod:`bunobee.models.inference`. The model is
+        one series, so ``SVI`` and ``MAP`` must leave ``subsample=None``.
+
+    Examples
+    --------
+    >>> model = DLT(lev_sm=0.5, slp_sm=0.5, theta=0.8)
+    >>> model.fit(y, mcmc_args={"num_warmup": 200, "num_samples": 200})  # doctest: +SKIP
+    >>> forecast = model.predict(end_step=len(y) + 10)  # doctest: +SKIP
+    >>> forecast["forecast_samples"].dims  # doctest: +SKIP
+    ('sample', 'time', 'series')
+
+    Raises
+    ------
+    ValueError
+        If ``noise_dist`` / ``min_nu`` / ``max_nu`` or ``pos_coef_sum_scale`` are invalid, ``obs`` is given with
+        ``noise_dist="student_t"``, or ``obs`` does not have real support (e.g. ``NegBin2()``).
+    TypeError
+        If ``obs`` is not an observation family that draws additive noise.
+    """
+
+    def __init__(
+        self,
+        lev_sm: float,
+        slp_sm: float,
+        theta: float,
+        *,
+        regression_scheme: Optional[RegressionScheme] = None,
+        pos_coef_sum_scale: Optional[float] = None,
+        noise_dist: str = "normal",
+        min_nu: float = 5.0,
+        max_nu: float = 40.0,
+        inference: Optional[Inference] = None,
+        obs: Optional[ObsFamily] = None,
+    ) -> None:
+        super().__init__(inference)
+        if obs is None:
+            obs = obs_from_noise_dist(noise_dist, min_nu, max_nu)
+        elif noise_dist != "normal":
+            raise ValueError(f"give obs or noise_dist, not both; got obs={obs!r} and noise_dist={noise_dist!r}")
+        _check_obs(obs)
+        if pos_coef_sum_scale is not None and not pos_coef_sum_scale > 0:
+            raise ValueError(f"pos_coef_sum_scale must be positive, got {pos_coef_sum_scale}")
+        self.lev_sm = lev_sm
+        self.slp_sm = slp_sm
+        self.theta = theta
+        self.regression_scheme = regression_scheme
+        self.pos_coef_sum_scale = pos_coef_sum_scale
+        self.obs = obs
+
+    inference_methods = (NUTSInference, SVI, MAP)
+
+    def _init_strategy(self) -> Callable:
+        return init_to_median(num_samples=10)
+
+    def model(self, y: jnp.ndarray, reg_input: Optional[Dict[str, Any]] = None) -> None:
+        """:func:`dlt_model` with this instance's hyperparameters."""
+        dlt_model(
+            self.lev_sm,
+            self.slp_sm,
+            self.theta,
+            y,
+            reg_input=reg_input,
+            pos_coef_sum_scale=self.pos_coef_sum_scale,
+            obs=self.obs,
+        )
+
+    def fit(
+        self,
+        y: np.ndarray,
+        covariates_df: Optional[pd.DataFrame] = None,
+        *,
+        mcmc_args: Optional[Dict[str, Any]] = None,
+        seed: int = 0,
+    ) -> "DLT":
+        """Fit the model to ``y`` with its inference method and store the posterior on ``idata_``.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observations, shape ``(n_steps,)``.
+        covariates_df : pd.DataFrame | None
+            Covariates, shape ``(n_steps, n_var)``, with a column per regressor of ``regression_scheme``. Required
+            when the model has a ``regression_scheme`` and rejected when it has none.
+        mcmc_args : dict | None
+            Keyword arguments for ``numpyro.infer.MCMC`` for this fit, on top of the model's ``NUTS`` settings
+            (:data:`~bunobee.models.base.DEFAULT_MCMC_ARGS` by default). Only for a model fitted by NUTS.
+        seed : int
+            Seed of the fit's ``jax.random.PRNGKey``, by default 0.
+
+        Returns
+        -------
+        DLT
+            ``self``, fitted. Under NUTS, ``idata_`` is the dataset :func:`run_dlt_model` returns for the same
+            arguments, plus the ``inference`` attr.
+        """
+        _check_covariates(self.regression_scheme, covariates_df)
+        reg_input, var_name = _dlt_reg_input(self.regression_scheme, covariates_df)
+        _check_pos_coef_sum_scale(self.pos_coef_sum_scale, reg_input)
+        return self._fit(
+            {"y": y, "reg_input": reg_input},
+            mcmc_args=mcmc_args,
+            seed=seed,
+            context={"covariates_df": covariates_df, "var_name": var_name},
+        )
+
+    def _to_idata(self, samples, inputs, context) -> xr.Dataset:
+        return _dlt_idata(
+            samples, inputs["y"], self.obs, self.regression_scheme, context["covariates_df"], context["var_name"]
+        )
+
+    def predict(
+        self,
+        end_step: Optional[int] = None,
+        covariates_df: Optional[pd.DataFrame] = None,
+        *,
+        noise_embed: bool = False,
+        transform_callback: Optional[Callable] = None,
+        conditional_response: Optional[np.ndarray] = None,
+        in_sample: bool = False,
+        seed: int = 0,
+    ) -> xr.Dataset:
+        """Forecast with :func:`make_inference` from the fitted posterior, in the layout of ``SSP.predict``.
+
+        Parameters
+        ----------
+        end_step : int | None
+            Total number of steps, the training steps included. With covariates it comes from
+            ``len(covariates_df)`` and must be left out.
+        covariates_df : pd.DataFrame | None
+            Covariates over all ``end_step`` steps, the training steps included. Required when the model has a
+            ``regression_scheme`` and rejected when it has none.
+        noise_embed : bool
+            Add the observation noise to ``forecast_samples`` and return it as ``eps_samples``, by default ``False``.
+        transform_callback : Callable | None
+            Applied to ``forecast_samples`` only, e.g. to reverse a log transform.
+        conditional_response : np.ndarray | None
+            Actuals past the train end that update the latent states; see :func:`make_inference`.
+        in_sample : bool
+            Return every step from the first training step, so the in-sample fit comes with the forecast. By default
+            ``False``: only the steps after the train end.
+        seed : int
+            Seed of the ``jax.random.PRNGKey``, by default 0.
+
+        Returns
+        -------
+        xr.Dataset
+            ``forecast_samples`` and ``mu_samples`` (plus ``eps_samples`` with ``noise_embed``), dims
+            ``(sample, time, series)`` with integer-range coords and a ``series`` dim of size 1, as ``SSP.predict``
+            returns. ``time`` 0 is the first step after the train end, or the first training step with
+            ``in_sample=True``. The values are the matching steps of :func:`make_inference` with the same seed:
+            ``mu_samples`` is ``dlt_comp_samples`` plus the summed ``reg_comp_samples`` and is left untransformed.
+            Call :func:`make_inference` for the trend and regression components.
+
+        Raises
+        ------
+        ValueError
+            If ``covariates_df`` is missing or unexpected for the ``regression_scheme``, or, without ``in_sample``,
+            the total number of steps does not go past the train end.
+        """
+        _check_covariates(self.regression_scheme, covariates_df)
+        n_train = self.idata_["dlt_comp"].shape[-1]
+        n_total = len(covariates_df) if covariates_df is not None else end_step
+        if not in_sample and n_total is not None and n_total <= n_train:
+            raise ValueError(
+                f"the forecast needs steps past the train end ({n_train}), got {n_total} steps in total; "
+                "pass in_sample=True for the in-sample fit"
+            )
+        inference = make_inference(
+            jax.random.PRNGKey(seed),
+            self.idata_,
+            self.lev_sm,
+            self.slp_sm,
+            self.theta,
+            end_step=end_step,
+            covariates_df=covariates_df,
+            transform_callback=transform_callback,
+            noise_embed=noise_embed,
+            conditional_response=conditional_response,
+            obs=self.obs,
+        )
+        return _as_panel(inference, start=0 if in_sample else n_train, noise_embed=noise_embed)
+
+
+def _as_panel(inference: xr.Dataset, start: int, noise_embed: bool) -> xr.Dataset:
+    """The steps of a :func:`make_inference` dataset from ``start`` on, as one series in the ``SSP.predict`` layout."""
+    # (n_samples, n_steps)
+    mu_samples = inference["dlt_comp_samples"].to_numpy()
+    if "reg_comp_samples" in inference:
+        mu_samples = mu_samples + np.sum(inference["reg_comp_samples"].to_numpy(), axis=-1)
+    samples = {"mu_samples": mu_samples}
+    if noise_embed:
+        samples["eps_samples"] = inference["eps_samples"].to_numpy()
+    samples["forecast_samples"] = inference["forecast_samples"].to_numpy()
+    dims = ["sample", "time", "series"]
+    # (n_samples, n_steps - start, 1)
+    data_vars = {name: (dims, values[:, start:, None]) for name, values in samples.items()}
+    coords = {
+        "sample": np.arange(inference.sizes["sample"]),
+        "time": np.arange(inference.sizes["time"] - start),
+        "series": np.arange(1),
+    }
+    return xr.Dataset(data_vars=data_vars, coords=coords)
+
+
+def _check_obs(obs: Any) -> None:
+    """Raise unless ``obs`` is an observation family with real support that draws additive noise."""
+    if not isinstance(obs, ObsFamily):
+        raise TypeError(f"obs must be an observation family (see bunobee.models.obs), got {obs!r}")
+    if obs.support != "real":
+        raise ValueError(
+            f"DLT models real-valued y, so obs needs real support; {type(obs).__name__} has support {obs.support!r}"
+        )
+    if not isinstance(obs, RealObsFamily):
+        raise TypeError(f"DLT draws its state noise with obs.noise(key, params, shape), which {obs!r} lacks")
+
+
+def _check_covariates(regression_scheme: Optional[RegressionScheme], covariates_df: Optional[pd.DataFrame]) -> None:
+    """Raise unless ``covariates_df`` is given exactly when there is a ``regression_scheme``."""
+    if regression_scheme is not None and covariates_df is None:
+        raise ValueError("the model has a regression_scheme, so covariates_df is required")
+    if regression_scheme is None and covariates_df is not None:
+        raise ValueError("covariates_df was given but the model has no regression_scheme to use it")
