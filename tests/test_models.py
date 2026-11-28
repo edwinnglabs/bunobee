@@ -8,6 +8,8 @@ inference methods themselves are tested in ``test_inference.py``.
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,8 +25,9 @@ from bunobee.models.inference import MAP, SVI
 from bunobee.models.inference import NUTS as NUTSInference
 from bunobee.models.dlt import DLT, make_inference, run_dlt_model
 from bunobee.models.obs import NegBin2, Normal, Poisson, StudentT
-from bunobee.models.ssp import SSP, transform_to_ekf_st
+from bunobee.models.ssp import FILTERS, SSP, FilterSpec, transform_to_ekf_st
 from bunobee.models.ssp.forecast import POSITIVITY_FLOOR
+from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.regression import RegressionScheme
 
@@ -525,3 +528,93 @@ class TestSSPValidation:
         Z_bad[3, 0, 1] = np.nan
         with pytest.raises(ValueError, match="finite"):
             SSP(_prior()).fit(y[:N_STEPS], Z_bad)
+
+
+# ---------------------------------------------------------------------------
+# SSP with a user filter
+# ---------------------------------------------------------------------------
+
+#: The damping of the custom filter's AR(1) state, ``a_t = PHI * a_{t-1} + eta_t``: not a random walk.
+PHI = 0.5
+
+
+def _damped_forecast(idata, Z_future, *, method, noise_embed, transform_callback, seed):
+    """The mean forecast of the damped state, ``a_{T+h} = PHI**h * a_T``, in the ``forecast_ssp`` layout."""
+    at = idata["at"].values
+    a_last = at[:, :, -1, :].reshape(-1, at.shape[-1])
+    decay = PHI ** np.arange(1, Z_future.shape[0] + 1)
+    mu = np.einsum("hjk,shk->shj", Z_future, decay[None, :, None] * a_last[:, None, :])
+    dims = ("sample", "time", "series")
+    return xr.Dataset({"forecast_samples": (dims, mu), "mu_samples": (dims, mu)})
+
+
+def _damped_spec(forecast=_damped_forecast) -> FilterSpec:
+    damped = functools.partial(kalman_filter_1d_st, T=jnp.asarray(PHI * np.eye(len(STATES))))
+    return FilterSpec(fn=damped, link="identity", nonlinear=False, forecast=forecast, name="damped")
+
+
+class TestSSPUserFilter:
+    def test_spec_instance_fits_without_touching_filters(self, panel):
+        y, Z = panel
+        before = dict(FILTERS)
+        spec = FilterSpec(fn=kalman_filter_1d_st, link="identity", nonlinear=False, name="mine")
+        by_spec = SSP(_prior(), filter=spec, inference=MAP(steps=50)).fit(y[:N_STEPS], Z[:N_STEPS])
+        by_name = SSP(_prior(), filter="linear", inference=MAP(steps=50)).fit(y[:N_STEPS], Z[:N_STEPS])
+        assert FILTERS == before
+        assert by_spec.filter_spec is spec
+        xr.testing.assert_identical(by_spec.idata_, by_name.idata_.assign_attrs(filter="mine"))
+        xr.testing.assert_identical(by_spec.predict(Z[N_STEPS:], seed=2), by_name.predict(Z[N_STEPS:], seed=2))
+
+    def test_spec_forecast_replaces_forecast_ssp(self, panel, monkeypatch):
+        from bunobee.models.ssp import forecast_ssp
+
+        y, Z = panel
+        calls = []
+
+        def recording(idata, Z_future, **kwargs):
+            calls.append(kwargs)
+            return _damped_forecast(idata, Z_future, **kwargs)
+
+        model = SSP(_prior(), filter=_damped_spec(recording), inference=MAP(steps=50)).fit(y[:N_STEPS], Z[:N_STEPS])
+        assert model.idata_.attrs["filter"] == "damped"
+
+        def _not_called(*args, **kwargs):
+            raise AssertionError("predict must not fall back to forecast_ssp when the spec has a forecast")
+
+        monkeypatch.setattr("bunobee.models.ssp.model.forecast_ssp", _not_called)
+        forecast = model.predict(Z[N_STEPS:], method="filter", noise_embed=True, seed=3)
+        assert calls == [{"method": "filter", "noise_embed": True, "transform_callback": None, "seed": 3}]
+        xr.testing.assert_identical(forecast, _damped_forecast(model.idata_, Z[N_STEPS:], **calls[0]))
+        # The damped mean decays toward zero; the random walk forecast_ssp would run holds the last state.
+        random_walk = forecast_ssp(model.idata_, Z[N_STEPS:])
+        assert not np.allclose(forecast["mu_samples"].values, random_walk["mu_samples"].values)
+
+    def test_name_defaults_to_the_wrapped_function(self):
+        assert FILTERS["ekf"].label == "kalman_filter_1d_ekf_st"
+        assert FILTERS["linear"].label == "kalman_filter_1d_st"
+        partial = functools.partial(kalman_filter_1d_st, T=None)
+        assert FilterSpec(fn=partial, link="identity", nonlinear=False).label == "kalman_filter_1d_st"
+
+    def test_any_link_with_a_forecast(self):
+        spec = FilterSpec(fn=kalman_filter_1d_st, link="damped", nonlinear=False, forecast=_damped_forecast)
+        assert SSP(_prior(), filter=spec).filter_spec is spec
+
+    @pytest.mark.parametrize(
+        ("spec", "match"),
+        [
+            (FilterSpec(fn=kalman_filter_1d_st, link="log", nonlinear=False), "link must be one of"),
+            (FilterSpec(fn="kalman_filter_1d_st", link="identity", nonlinear=False), "fn must be callable"),
+            (
+                FilterSpec(fn=kalman_filter_1d_st, link="identity", nonlinear=False, forecast="replay"),
+                "forecast must be callable",
+            ),
+        ],
+        ids=["unknown_link", "fn", "forecast"],
+    )
+    def test_bad_spec_raises_at_construction(self, spec, match):
+        with pytest.raises(ValueError, match=match):
+            SSP(_prior(), filter=spec)
+
+    def test_filter_of_another_type_raises(self):
+        with pytest.raises(TypeError, match="FilterSpec"):
+            SSP(_prior(), filter=kalman_filter_1d_st)

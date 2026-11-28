@@ -214,6 +214,34 @@ print(dlt.predict(end_step=len(y_dlt) + 10, in_sample=True)["forecast_samples"].
 `filter="linear"` uses `kalman_filter_1d_st` instead, which keeps the positivity states on the natural scale and
 floors them. NaN entries of `y` become predict-only steps.
 
+To fit with a filter of your own, pass a `FilterSpec` instead of a name. The global `FILTERS` dict is left alone.
+`fn` is called with the keywords `SspFilter` lists (plus `exponent` when `nonlinear=True`) and returns
+`(lp, at, ...)`. Without a `forecast`, `predict` runs `forecast_ssp` with the spec's `link`. That is only right for
+a random-walk state with Gaussian observation noise. A filter with other dynamics or another observation model
+needs its own `forecast` (see `SspForecast`), so the forecast follows the model that was fitted. `name` is what goes
+in `idata_.attrs["filter"]`:
+
+```python
+import functools
+
+from bunobee.models.ssp import FilterSpec
+from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
+
+phi = 0.9  # a damped state, a_t = phi * a_{t-1} + eta_t, rather than a random walk
+damped = functools.partial(kalman_filter_1d_st, T=phi * np.eye(2))
+
+
+def damped_forecast(idata, Z_future, *, method, noise_embed, transform_callback, seed):
+    ...  # return forecast_samples / mu_samples over (sample, time, series), as forecast_ssp does
+
+
+spec = FilterSpec(fn=damped, link="identity", nonlinear=False, forecast=damped_forecast, name="damped")
+forecast = SSP(prior, filter=spec).fit(y, Z).predict(Z_future)  # calls damped_forecast, not forecast_ssp
+```
+
+`SSP` checks the spec when it is built. It raises `ValueError` if `fn` is not callable, or if `link` is not one of
+`forecast_ssp`'s links and no `forecast` is given.
+
 Both models fit by NUTS unless told otherwise. `inference=` swaps in variational inference or a point estimate from
 `bunobee.models.inference` (they need the `optim` extra). The posterior keeps its `(chain, draw)` dims either way, so
 `predict` works unchanged:

@@ -15,13 +15,19 @@ The filter is picked by name (see :data:`FILTERS`), and the name fixes everythin
 
 So a posterior can no longer be forecast under the wrong positivity mechanism, the mistake ``forecast_ssp``'s
 ``link`` argument exists to catch.
+
+A filter of your own is passed as a :class:`FilterSpec` instance, ``SSP(prior, filter=FilterSpec(...))``, without
+touching :data:`FILTERS`. Its ``fn`` must follow :class:`SspFilter`. Give it a ``forecast`` (see
+:class:`SspForecast`) whenever its state dynamics or observation noise differ from the random walk with Gaussian
+noise that :func:`~bunobee.models.ssp.forecast.forecast_ssp` assumes, so the forecast follows the model that was
+fitted.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -31,7 +37,7 @@ from numpyro import distributions as dist
 
 from bunobee.models.base import Forecaster
 from bunobee.models.inference import MAP, NUTS, SVI, Inference
-from bunobee.models.ssp.forecast import EXP_CLIP, forecast_ssp
+from bunobee.models.ssp.forecast import EXP_CLIP, FORECAST_LINKS, forecast_ssp
 from bunobee.models.ssp.kalman_1d_st import kalman_filter_1d_st
 from bunobee.models.ssp.kalman_1d_st_ekf import kalman_filter_1d_ekf_st
 from bunobee.models.ssp.posterior import posterior_to_xarray
@@ -39,16 +45,132 @@ from bunobee.models.ssp.prior import SspPrior
 from bunobee.models.ssp.transforms import _unwrap, transform_to_ekf_st, validate_prior
 
 
+class SspFilter(Protocol):
+    """The call :class:`SSP` makes to a filter inside its NumPyro model.
+
+    Every argument is passed by keyword. A filter whose spec has ``nonlinear=True`` is also passed
+    ``exponent=<float>``, the ``k`` of ``exp(k * a)``, so it must accept that keyword too.
+
+    Parameters
+    ----------
+    a0 : jnp.ndarray
+        Initial state mean, ``(n_states,)``, on the filter's scale (a-space for a nonlinear spec).
+    P0 : jnp.ndarray
+        Initial state covariance, ``(n_states, n_states)``.
+    Z : jnp.ndarray
+        Design, ``(n_steps, n_series, n_states)``.
+    sigma_h : jnp.ndarray
+        Observation noise scale per series, ``(n_series,)``.
+    sigma_q : jnp.ndarray
+        Process noise scale per state, ``(n_states,)``.
+    y : jnp.ndarray
+        Observations, ``(n_steps, n_series)``; NaN where ``mask`` is ``False``.
+    logp : bool
+        Always ``True``: the filter must return its log likelihood first.
+    positivity : jnp.ndarray
+        Boolean mask of the positivity states, ``(n_states,)``.
+    a_obs, P_obs : jnp.ndarray | None
+        The prior's disclosed states and their variances, ``(n_steps, n_states)``, or ``None``.
+    mask : jnp.ndarray | None
+        ``(n_steps, n_series)``, ``True`` where ``y`` is observed, or ``None`` when every entry is.
+
+    Returns
+    -------
+    tuple
+        ``(lp, at, ...)``: the scalar log likelihood, then the filtered states ``(n_steps, n_states)``. Anything
+        after them is ignored.
+    """
+
+    def __call__(
+        self,
+        *,
+        a0: jnp.ndarray,
+        P0: jnp.ndarray,
+        Z: jnp.ndarray,
+        sigma_h: jnp.ndarray,
+        sigma_q: jnp.ndarray,
+        y: jnp.ndarray,
+        logp: bool,
+        positivity: jnp.ndarray,
+        a_obs: jnp.ndarray | None,
+        P_obs: jnp.ndarray | None,
+        mask: jnp.ndarray | None,
+    ) -> tuple[Any, ...]: ...
+
+
+class SspForecast(Protocol):
+    """The call :meth:`SSP.predict` makes to a :class:`FilterSpec`'s ``forecast``.
+
+    Parameters
+    ----------
+    idata : xr.Dataset
+        The fitted posterior, ``SSP.idata_``: every model site over ``(chain, draw, ...)``, the ``positivity``
+        mask, and the ``exponent``, ``link``, ``filter`` and ``inference`` attrs.
+    Z_future : np.ndarray
+        Future design, ``(horizon, n_series, n_states)``.
+    method : str
+        ``predict``'s ``method``, passed through as given; the forecast decides which values it supports.
+    noise_embed : bool
+        Whether ``forecast_samples`` should include the observation noise.
+    transform_callback : Callable | None
+        To apply to ``forecast_samples`` only.
+    seed : int
+        Seed of the forecast's random draws.
+
+    Returns
+    -------
+    xr.Dataset
+        What ``predict`` returns, by convention ``forecast_samples`` and ``mu_samples`` (plus ``eps_samples`` with
+        ``noise_embed``) over ``(sample, time, series)``, as :func:`~bunobee.models.ssp.forecast.forecast_ssp` does.
+    """
+
+    def __call__(
+        self,
+        idata: xr.Dataset,
+        Z_future: np.ndarray,
+        *,
+        method: str,
+        noise_embed: bool,
+        transform_callback: Callable | None,
+        seed: int,
+    ) -> xr.Dataset: ...
+
+
 @dataclass(frozen=True)
 class FilterSpec:
-    """One filter :class:`SSP` can fit with, and how its positivity states are read."""
+    """One filter :class:`SSP` can fit with, how its positivity states are read, and how it is forecast.
 
-    #: The multi-series filter, called with ``logp=True`` as the likelihood.
-    fn: Callable
-    #: The ``forecast_ssp`` link of its posterior: ``"exp"`` or ``"identity"``.
+    Without a ``forecast``, :meth:`SSP.predict` uses :func:`~bunobee.models.ssp.forecast.forecast_ssp` with
+    ``link``. That is only valid for a filter whose state is a driftless random walk with ``N(0, sigma_q**2)``
+    steps and whose observation noise is ``N(0, sigma_h**2)``: a filter with other dynamics (a transition matrix,
+    seasonality) or another observation model needs its own ``forecast``, or it is fitted with one model and
+    forecast with another.
+
+    Examples
+    --------
+    >>> damped = functools.partial(kalman_filter_1d_st, T=0.9 * np.eye(3))  # doctest: +SKIP
+    >>> spec = FilterSpec(damped, "identity", False, forecast=damped_forecast, name="damped")  # doctest: +SKIP
+    >>> SSP(prior, filter=spec).fit(y, Z).predict(Z_future)  # doctest: +SKIP
+    """
+
+    #: The multi-series filter, called with ``logp=True`` as the likelihood; see :class:`SspFilter`.
+    fn: SspFilter
+    #: The ``forecast_ssp`` link of its posterior: ``"exp"`` or ``"identity"``. Any label when ``forecast`` is set.
     link: str
     #: Whether positivity states are log-intensities mapped by ``exp(exponent * a)``.
     nonlinear: bool
+    #: Forecasts the fitted posterior in place of ``forecast_ssp``; see :class:`SspForecast`.
+    forecast: SspForecast | None = None
+    #: The filter's name in ``idata.attrs["filter"]``; by default the ``__name__`` of ``fn``.
+    name: str | None = None
+
+    @property
+    def label(self) -> str:
+        """The name recorded in ``idata.attrs["filter"]``: ``name``, else the name of ``fn``."""
+        if self.name is not None:
+            return self.name
+        fn = getattr(self.fn, "func", self.fn)  # a functools.partial has no __name__ of its own
+        return str(getattr(fn, "__name__", type(fn).__name__))
 
 
 #: The filters :class:`SSP` accepts, by name.
@@ -91,8 +213,9 @@ class SSP(Forecaster):
         compressed, ``(2,)``: the first state's drift and one drift the other states share. Under ``filter="ekf"``
         it is moved to a-space with :func:`~bunobee.models.ssp.transforms.transform_to_ekf_st`, so a positivity
         state's ``a0`` must be positive.
-    filter : {"ekf", "linear"}
-        The filter, by default ``"ekf"``; see the module docstring.
+    filter : {"ekf", "linear"} | FilterSpec
+        The filter, by default ``"ekf"``: a name in :data:`FILTERS` (see the module docstring), or a
+        :class:`FilterSpec` of your own. The spec is resolved once, here, and kept on ``filter_spec``.
     exponent : float
         ``k`` in the EKF's ``exp(k * a)``, by default 0.5. Unused under ``filter="linear"``.
     match : {"mean", "median", "linearize"}
@@ -106,6 +229,8 @@ class SSP(Forecaster):
 
     Attributes
     ----------
+    filter_spec : FilterSpec
+        The filter the model fits with and how it is forecast.
     filter_prior : xr.Dataset
         The prior the filter runs on: ``prior`` itself under ``filter="linear"``, its a-space transform under
         ``filter="ekf"``.
@@ -126,15 +251,14 @@ class SSP(Forecaster):
         self,
         prior: SspPrior | xr.Dataset,
         *,
-        filter: str = "ekf",
+        filter: str | FilterSpec = "ekf",
         exponent: float = 0.5,
         match: str = "mean",
         sigma_h_prior: dist.Distribution | None = None,
         inference: Inference | None = None,
     ) -> None:
         super().__init__(inference)
-        if filter not in FILTERS:
-            raise ValueError(f"filter must be one of {sorted(FILTERS)}, got {filter!r}")
+        self.filter_spec = _resolve_filter(filter)
         prior_ds = _unwrap(prior)
         validate_prior(prior_ds, require_init=True, require_sigma_q=True)
         prior_ds = _with_full_P0(prior_ds)
@@ -145,13 +269,10 @@ class SSP(Forecaster):
         self.match = match
         self.sigma_h_prior = dist.Beta(2.0, 10.0) if sigma_h_prior is None else sigma_h_prior
         self.sigma_q_family = str(prior_ds.attrs.get("sigma_q_family", "truncated_normal"))
-        self.filter_prior = transform_to_ekf_st(prior_ds, self.exponent, match) if self._spec.nonlinear else prior_ds
+        nonlinear = self.filter_spec.nonlinear
+        self.filter_prior = transform_to_ekf_st(prior_ds, self.exponent, match) if nonlinear else prior_ds
         self._sigma_q_prior_dim = _check_sigma_q_block(self.filter_prior, self.sigma_q_family)
         self._single_series = False
-
-    @property
-    def _spec(self) -> FilterSpec:
-        return FILTERS[self.filter]
 
     @property
     def n_states(self) -> int:
@@ -174,7 +295,7 @@ class SSP(Forecaster):
         """The NumPyro model. Sampled sites: ``sigma_h_raw`` and ``sigma_q_raw``; the rest is deterministic.
 
         Deterministic sites: ``sigma_h`` ``(series,)``, ``sigma_q`` ``(state,)``, ``at`` ``(time, state)``, ``mu``
-        ``(time, series)`` and, under ``filter="ekf"``, ``at_nat``, the states on the natural scale.
+        ``(time, series)`` and, for a nonlinear filter (``filter="ekf"``), ``at_nat``, the states on the natural scale.
         """
         n_states = a0.shape[0]
         with numpyro.plate("series", y.shape[1]):
@@ -182,7 +303,7 @@ class SSP(Forecaster):
         sigma_h = numpyro.deterministic("sigma_h", sigma_h_raw * sdy)
         sigma_q = numpyro.deterministic("sigma_q", _expand_sigma_q(self._sample_sigma_q(sigma_q_params), n_states))
 
-        spec = self._spec
+        spec = self.filter_spec
         kwargs: dict[str, Any] = {"exponent": self.exponent} if spec.nonlinear else {}
         lp, at, *_ = spec.fn(
             a0=a0,
@@ -315,7 +436,7 @@ class SSP(Forecaster):
         idata = posterior_to_xarray(samples, dims=dims, coords=coords)
         positivity = np.asarray(self.filter_prior["positivity"].values, dtype=bool)
         return idata.assign(positivity=(("state",), positivity)).assign_attrs(
-            exponent=self.exponent, link=self._spec.link, filter=self._spec.fn.__name__
+            exponent=self.exponent, link=self.filter_spec.link, filter=self.filter_spec.label
         )
 
     def predict(
@@ -327,7 +448,12 @@ class SSP(Forecaster):
         transform_callback: Callable | None = None,
         seed: int = 0,
     ) -> xr.Dataset:
-        """Forecast with :func:`~bunobee.models.ssp.forecast.forecast_ssp` from the fitted posterior.
+        """Forecast the fitted posterior with the filter spec's ``forecast``, else ``forecast_ssp``.
+
+        With ``filter_spec.forecast`` set, ``predict`` returns what that callable returns for
+        ``(idata_, Z_future, method=..., noise_embed=..., transform_callback=..., seed=...)``; see
+        :class:`SspForecast`. Otherwise it is :func:`~bunobee.models.ssp.forecast.forecast_ssp` with the spec's
+        ``link``, a random-walk state with Gaussian observation noise.
 
         Parameters
         ----------
@@ -352,16 +478,58 @@ class SSP(Forecaster):
         Z_future = np.asarray(Z_future, dtype=float)
         if self._single_series and Z_future.ndim == 2:
             Z_future = Z_future[:, None, :]
+        spec = self.filter_spec
+        if spec.forecast is not None:
+            return spec.forecast(
+                self.idata_,
+                Z_future,
+                method=method,
+                noise_embed=noise_embed,
+                transform_callback=transform_callback,
+                seed=seed,
+            )
         return forecast_ssp(
             self.idata_,
             Z_future,
             method=method,
-            link=self._spec.link,
+            link=spec.link,
             exponent=self.exponent,
             noise_embed=noise_embed,
             transform_callback=transform_callback,
             seed=seed,
         )
+
+
+def _resolve_filter(filter: str | FilterSpec) -> FilterSpec:
+    """Return the :class:`FilterSpec` of ``filter``, a name in :data:`FILTERS` or a spec, after checking it.
+
+    Raises
+    ------
+    ValueError
+        If the name is not in :data:`FILTERS`, ``fn`` or a given ``forecast`` is not callable, or ``link`` is not in
+        ``FORECAST_LINKS`` while ``forecast`` is left out.
+    TypeError
+        If ``filter`` is neither a name nor a :class:`FilterSpec`.
+    """
+    if isinstance(filter, str):
+        if filter not in FILTERS:
+            raise ValueError(f"filter must be one of {sorted(FILTERS)} or a FilterSpec, got {filter!r}")
+        spec = FILTERS[filter]
+    elif isinstance(filter, FilterSpec):
+        spec = filter
+    else:
+        raise TypeError(f"filter must be a name in FILTERS or a FilterSpec, got {type(filter).__name__}")
+    if not callable(spec.fn):
+        raise ValueError(f"FilterSpec.fn must be callable, got {type(spec.fn).__name__}")
+    if spec.forecast is None:
+        if spec.link not in FORECAST_LINKS:
+            raise ValueError(
+                f"FilterSpec.link must be one of {FORECAST_LINKS} when no forecast is given, got {spec.link!r}; "
+                "pass FilterSpec.forecast to forecast a filter forecast_ssp does not cover"
+            )
+    elif not callable(spec.forecast):
+        raise ValueError(f"FilterSpec.forecast must be callable, got {type(spec.forecast).__name__}")
+    return spec
 
 
 def _with_full_P0(prior: xr.Dataset) -> xr.Dataset:
